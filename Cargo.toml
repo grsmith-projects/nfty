@@ -1,0 +1,24 @@
+[package]
+name = "nfty"
+version = "0.1.0"
+edition = "2021"
+description = "Caddy-style L4 Service Load Balancer & Port Router shell for nftables"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+colored = "2.1"
+crossterm = "0.28"
+libc = "0.2"
+rand = "0.8"
+ratatui = "0.29"
+russh = "0.46"
+russh-keys = "0.46"
+rustyline = { version = "14.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+similar = "2.6"
+tokio = { version = "1.40", features = ["full"] }
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }

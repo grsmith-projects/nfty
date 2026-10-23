@@ -1,0 +1,15 @@
+[Unit]
+Description=nfty — Caddy-style L4 Service Load Balancer & Port Router for nftables
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nfty --file /etc/nfty/Nftyfile --api-bind 127.0.0.1:9090 daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+{
+  "Args": [
+    "--unikernel",
+    "--file",
+    "/Nftyfile",
+    "--api-bind",
+    "0.0.0.0:9090",
+    "daemon"
+  ],
+  "Files": [
+    "Nftyfile.example:/Nftyfile"
+  ],
+  "RunConfig": {
+    "Ports": [
+      "9090",
+      "9000",
+      "443"
+    ],
+    "Memory": "128M"
+  }
+}
