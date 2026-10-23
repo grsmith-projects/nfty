@@ -586,4 +586,34 @@ gateway mullvad {
         assert_eq!(routes[0].1, "sonarr.example.com");
         assert_eq!(routes[0].2, "http://192.168.2.215:8989");
     }
+
+    #[tokio::test]
+    async fn test_gateway_port_forward_compilation() {
+        let raw = r#"
+gateway 169.254.10.20 {
+    balance round-robin
+    killswitch on
+    forward 51413 to 169.254.20.15:51413
+    tunnels {
+        wg-exit-01.conf
+        wg-exit-02.conf
+    }
+}
+"#;
+        let cfg = parse_nftyfile(raw).expect("parse gateway port forward");
+        let gw = &cfg.gateways["169.254.10.20"];
+        assert_eq!(gw.forwards.len(), 1);
+        assert_eq!(gw.forwards[0].listen_port, 51413);
+        assert_eq!(gw.forwards[0].backend.ip, Ipv4Addr::new(169, 254, 20, 15));
+        assert_eq!(gw.forwards[0].backend.port, 51413);
+
+        let nft = compile_nft_ruleset(&cfg, None);
+        assert!(nft.contains("iifname \"wg0\" ct state new ct mark set 0x101 accept"));
+        assert!(nft.contains("iifname \"wg1\" ct state new ct mark set 0x102 accept"));
+        assert!(nft.contains("iifname { \"wg0\", \"wg1\" } tcp dport 51413 counter dnat to 169.254.20.15:51413"));
+        assert!(nft.contains("iifname { \"wg0\", \"wg1\" } udp dport 51413 counter dnat to 169.254.20.15:51413"));
+
+        let roundtrip = parse_nftyfile(&cfg.format_nftyfile()).expect("roundtrip gateway forward");
+        assert_eq!(roundtrip.gateways["169.254.10.20"].forwards.len(), 1);
+    }
 }

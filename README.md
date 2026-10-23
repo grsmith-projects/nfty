@@ -144,7 +144,7 @@ vip 169.254.10.15/24 {
 
 ### 4. WireGuard Multi-Tunnel Egress Gateway
 
-A `gateway` block binds a virtual gateway IP (`169.254.10.20`) and distributes outbound traffic across one or more WireGuard configurations stored in `/data/wg/`. Other machines or containers on the LAN can either set `169.254.10.20` as their default IPv4 gateway or use the built-in `privoxy` (HTTP/CONNECT) and `socks5` proxies bound to the gateway IP:
+A `gateway` block binds a virtual gateway IP (`169.254.10.20`) and distributes outbound traffic across one or more WireGuard configurations stored in `/data/wg/`. Other machines or containers on the LAN can either set `169.254.10.20` as their default IPv4 gateway or use the built-in `privoxy` (HTTP/CONNECT) and `socks5` proxies bound to the gateway IP. Inbound ports on the WireGuard tunnel interfaces can also be forwarded to LAN hosts with `forward <port> to <host:port>` (with per-tunnel `ct mark` return-path pinning):
 
 ```hcl
 gateway 169.254.10.20 {
@@ -153,6 +153,7 @@ gateway 169.254.10.20 {
     check ping 5s
     privoxy:8118
     socks5:1080
+    forward 51413 to 169.254.20.15:51413
     tunnels {
         wg-exit-01.conf weight 2
         wg-exit-02.conf weight 1
@@ -160,7 +161,7 @@ gateway 169.254.10.20 {
 }
 ```
 
-Adding WireGuard tunnel configs from the CLI:
+Adding WireGuard tunnel configs and port forwards from the CLI:
 
 ```text
 nfty# wg paste wg-exit-01
@@ -169,6 +170,7 @@ nfty(config)# gateway 169.254.10.20
 nfty(config-gw:169.254.10.20)# killswitch on
 nfty(config-gw:169.254.10.20)# privoxy:8118
 nfty(config-gw:169.254.10.20)# socks5:1080
+nfty(config-gw:169.254.10.20)# forward 51413 to 169.254.20.15:51413
 nfty(config-gw:169.254.10.20)# tunnels
 nfty(config-gw-tunnels:169.254.10.20)# wg-exit-01.conf
 nfty(config-gw-tunnels:169.254.10.20)# commit

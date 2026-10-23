@@ -289,6 +289,13 @@ pub async fn refresh_allowlist_hosts(shared: &SharedState) {
                 }
             }
         }
+        for gw in st.running.gateways.values().chain(st.candidate.gateways.values()) {
+            for fwd in &gw.forwards {
+                if let Some(h) = &fwd.backend.host {
+                    set.insert(h.to_ascii_lowercase());
+                }
+            }
+        }
         set
     };
 
@@ -345,9 +352,29 @@ pub async fn refresh_allowlist_hosts(shared: &SharedState) {
         }
     }
 
+    for gw in st_ref
+        .running
+        .gateways
+        .values_mut()
+        .chain(st_ref.candidate.gateways.values_mut())
+    {
+        for fwd in &mut gw.forwards {
+            if let Some(h) = &fwd.backend.host {
+                if let Some(ips) = resolved_map.get(&h.to_ascii_lowercase()) {
+                    if let Some(&first_ip) = ips.first() {
+                        if fwd.backend.ip != first_ip {
+                            fwd.backend.ip = first_ip;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if changed {
         st.sync_runtime_entries();
-        if !st.running.services.is_empty() {
+        if !st.running.services.is_empty() || !st.running.gateways.is_empty() {
             let _ = reload_kernel_from_state(&mut st);
         }
     }

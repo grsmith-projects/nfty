@@ -398,6 +398,10 @@ pub fn print_context_help(level: &ShellLevel) {
                 "ssh:22 (or 'ssh')".yellow()
             );
             println!(
+                "  {:<32} Forward inbound tunnel port (TCP+UDP) to LAN host",
+                "forward <port> to <host:port>".yellow()
+            );
+            println!(
                 "  {:<32} Enter optional WireGuard tunnels sub-level",
                 "tunnels".yellow()
             );

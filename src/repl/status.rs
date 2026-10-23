@@ -299,11 +299,14 @@ pub fn print_status_table(shared: &SharedState) {
             None => format!("-/{}", mode_suffix),
         };
         let gw_title = format!("gw:{}", gw.key);
-        let svcs_label = if gw.services.is_empty() {
+        let mut gw_badges: Vec<String> = gw.services.iter().map(|s| s.to_string()).collect();
+        for fwd in &gw.forwards {
+            gw_badges.push(format!("fwd:{}->{}", fwd.listen_port, fwd.backend));
+        }
+        let svcs_label = if gw_badges.is_empty() {
             String::new()
         } else {
-            let names: Vec<String> = gw.services.iter().map(|s| s.to_string()).collect();
-            format!(" [{}]", names.join(","))
+            format!(" [{}]", gw_badges.join(","))
         };
         if gw.tunnels.is_empty() {
             println!(

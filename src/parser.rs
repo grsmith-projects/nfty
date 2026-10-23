@@ -1,6 +1,7 @@
 use crate::ast::{
-    Backend, BalanceStrategy, Config, ForwardMode, Gateway, GatewayService, GatewayServiceKind,
-    HealthCheckConfig, HealthCheckKind, Proto, RateLimit, RateUnit, Service, VipConfig, WgTunnel,
+    Backend, BalanceStrategy, Config, ForwardMode, Gateway, GatewayPortForward, GatewayService,
+    GatewayServiceKind, HealthCheckConfig, HealthCheckKind, Proto, RateLimit, RateUnit, Service,
+    VipConfig, WgTunnel,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::net::Ipv4Addr;
@@ -1742,6 +1743,18 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                 }
             }
         }
+        "forward" | "port-forward" | "fwd" => {
+            let fwd = parse_gateway_forward(&tokens[1..])?;
+            if let Some(existing) = gw
+                .forwards
+                .iter_mut()
+                .find(|x| x.listen_port == fwd.listen_port && x.proto == fwd.proto)
+            {
+                *existing = fwd;
+            } else {
+                gw.forwards.push(fwd);
+            }
+        }
         "no" | "delete" | "remove" => {
             apply_gateway_no_directive(gw, &tokens[1..])?;
         }
@@ -1752,15 +1765,71 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                 } else {
                     gw.services.push(gs);
                 }
+            } else if let Ok(fwd) = parse_gateway_forward(&tokens) {
+                if let Some(existing) = gw
+                    .forwards
+                    .iter_mut()
+                    .find(|x| x.listen_port == fwd.listen_port && x.proto == fwd.proto)
+                {
+                    *existing = fwd;
+                } else {
+                    gw.forwards.push(fwd);
+                }
             } else {
                 bail!(
-                    "Unknown gateway directive '{}'. Valid directives: vip, hostname, balance, killswitch, check, privoxy:8118, socks5:1080, ssh:22, tunnel, allow, no",
+                    "Unknown gateway directive '{}'. Valid directives: vip, hostname, balance, killswitch, check, forward, privoxy:8118, socks5:1080, ssh:22, tunnel, allow, no",
                     other
                 );
             }
         }
     }
     Ok(())
+}
+
+pub fn parse_gateway_forward(tokens: &[&str]) -> Result<GatewayPortForward> {
+    if tokens.is_empty() {
+        bail!("Expected port forward spec (e.g. 'forward 51413 to peer-node:51413' or 'forward peer-node:51413')");
+    }
+    if tokens.len() >= 3 && tokens[1].eq_ignore_ascii_case("to") {
+        let (port_str, proto) = if let Some((l, r)) = tokens[0].split_once('/') {
+            let p = match r.to_ascii_lowercase().as_str() {
+                "tcp" => Proto::Tcp,
+                "udp" => Proto::Udp,
+                "both" | "tcp+udp" | "all" => Proto::Both,
+                other => bail!("Unknown protocol '{}' (expected tcp, udp, or both)", other),
+            };
+            (l, p)
+        } else {
+            (tokens[0], Proto::Both)
+        };
+        let listen_port: u16 = port_str
+            .parse()
+            .with_context(|| format!("Invalid forward port '{}'", port_str))?;
+        if listen_port == 0 {
+            bail!("Port cannot be 0");
+        }
+        let backend = parse_backend(&tokens[2..], listen_port)?;
+        Ok(GatewayPortForward {
+            listen_port,
+            proto,
+            backend,
+        })
+    } else if tokens.len() == 1 && tokens[0].contains(':') {
+        let backend = parse_backend(tokens, 0)?;
+        if backend.port == 0 {
+            bail!("Expected port in gateway forward '{}'", tokens[0]);
+        }
+        Ok(GatewayPortForward {
+            listen_port: backend.port,
+            proto: Proto::Both,
+            backend,
+        })
+    } else {
+        bail!(
+            "Invalid gateway forward '{}'. Expected 'forward <port[/tcp|/udp|/both]> to <host_or_ip[:port]>'",
+            tokens.join(" ")
+        )
+    }
 }
 
 pub fn parse_gateway_service(raw: &str) -> Result<GatewayService> {
@@ -1816,6 +1885,21 @@ pub fn apply_gateway_no_directive(gw: &mut Gateway, tokens: &[&str]) -> Result<(
                 gw.services.clear();
             } else if let Ok(gs) = parse_gateway_service(tokens[1]) {
                 gw.services.retain(|s| s.kind != gs.kind);
+            }
+        }
+        "forward" | "port-forward" | "fwd" => {
+            if tokens.len() == 1 {
+                gw.forwards.clear();
+            } else {
+                let target = tokens[1].split('/').next().unwrap_or(tokens[1]);
+                if let Ok(port) = target.parse::<u16>() {
+                    gw.forwards.retain(|f| f.listen_port != port);
+                } else {
+                    gw.forwards.retain(|f| {
+                        !f.backend.to_string().eq_ignore_ascii_case(tokens[1])
+                            && f.backend.host.as_deref() != Some(tokens[1])
+                    });
+                }
             }
         }
         "allow" => {

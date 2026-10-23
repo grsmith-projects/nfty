@@ -95,6 +95,24 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
 
         out.push_str("    chain mangle_prerouting {\n");
         out.push_str("        type filter hook prerouting priority mangle; policy accept;\n");
+        let mut inbound_wg_idx = 0usize;
+        for gw in config.gateways.values() {
+            for t in &gw.tunnels {
+                let iface = if t.iface.is_empty() {
+                    format!("wg{}", inbound_wg_idx)
+                } else {
+                    t.iface.clone()
+                };
+                let fwmark = 0x101 + inbound_wg_idx;
+                inbound_wg_idx += 1;
+                if !gw.forwards.is_empty() {
+                    out.push_str(&format!(
+                        "        iifname \"{}\" ct state new ct mark set 0x{:x} accept\n",
+                        iface, fwmark
+                    ));
+                }
+            }
+        }
         out.push_str("        iifname \"wg*\" accept\n");
         out.push_str("        ip daddr { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } accept\n");
         out.push_str("        ct mark != 0x0 meta mark set ct mark accept\n");
@@ -233,16 +251,66 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
         }
     }
 
+    let mut gw_tunnel_offset = 0usize;
     for gw in config.gateways.values() {
-        if gw.listen_ip.is_unspecified() {
-            continue;
+        let tunnel_ifaces: Vec<String> = gw
+            .tunnels
+            .iter()
+            .enumerate()
+            .map(|(local_i, t)| {
+                let idx = gw_tunnel_offset + local_i;
+                if t.iface.is_empty() {
+                    format!("\"wg{}\"", idx)
+                } else {
+                    format!("\"{}\"", t.iface)
+                }
+            })
+            .collect();
+        gw_tunnel_offset += gw.tunnels.len();
+
+        if !gw.listen_ip.is_unspecified() {
+            for gs in &gw.services {
+                if gs.kind == GatewayServiceKind::Ssh {
+                    out.push_str(&format!(
+                        "\n        # --- gateway {} service ssh:{} ---\n        ip daddr {} tcp dport {} counter redirect to :22 comment \"nfty:gw-ssh={}\"\n",
+                        gw.key, gs.port, gw.listen_ip, gs.port, gw.key
+                    ));
+                }
+            }
         }
-        for gs in &gw.services {
-            if gs.kind == GatewayServiceKind::Ssh {
+
+        if !gw.forwards.is_empty() {
+            let iif_match = if tunnel_ifaces.len() == 1 {
+                format!("iifname {}", tunnel_ifaces[0])
+            } else if tunnel_ifaces.len() > 1 {
+                format!("iifname {{ {} }}", tunnel_ifaces.join(", "))
+            } else {
+                "iifname \"wg*\"".to_string()
+            };
+            for fwd in &gw.forwards {
+                if fwd.backend.ip.is_unspecified() {
+                    out.push_str(&format!(
+                        "\n        # gateway {} forward {} -> {} (waiting for DNS resolution)\n",
+                        gw.key, fwd.listen_port, fwd.backend
+                    ));
+                    continue;
+                }
                 out.push_str(&format!(
-                    "\n        # --- gateway {} service ssh:{} ---\n        ip daddr {} tcp dport {} counter redirect to :22 comment \"nfty:gw-ssh={}\"\n",
-                    gw.key, gs.port, gw.listen_ip, gs.port, gw.key
+                    "\n        # --- gateway {} forward {} -> {}:{} ---\n",
+                    gw.key, fwd.listen_port, fwd.backend.ip, fwd.backend.port
                 ));
+                for proto_str in expand_protos(fwd.proto) {
+                    out.push_str(&format!(
+                        "        {} {} dport {} counter dnat to {}:{} comment \"nfty:gw-fwd={}:{}\"\n",
+                        iif_match,
+                        proto_str,
+                        fwd.listen_port,
+                        fwd.backend.ip,
+                        fwd.backend.port,
+                        gw.key,
+                        fwd.listen_port
+                    ));
+                }
             }
         }
     }
@@ -315,6 +383,21 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                     b.port,
                     b.endpoint()
                 ));
+            }
+        }
+    }
+    for gw in config.gateways.values() {
+        for fwd in &gw.forwards {
+            if !fwd.backend.ip.is_unspecified() {
+                for proto_str in expand_protos(fwd.proto) {
+                    out.push_str(&format!(
+                        "        ip daddr {} {} dport {} counter accept comment \"nfty:backend={}\"\n",
+                        fwd.backend.ip,
+                        proto_str,
+                        fwd.backend.port,
+                        fwd.backend.endpoint()
+                    ));
+                }
             }
         }
     }

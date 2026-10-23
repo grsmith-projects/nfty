@@ -595,6 +595,32 @@ impl fmt::Display for GatewayService {
     }
 }
 
+fn default_forward_proto() -> Proto {
+    Proto::Both
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayPortForward {
+    pub listen_port: u16,
+    #[serde(default = "default_forward_proto")]
+    pub proto: Proto,
+    pub backend: Backend,
+}
+
+impl fmt::Display for GatewayPortForward {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.proto == Proto::Both {
+            write!(f, "forward {} to {}", self.listen_port, self.backend)
+        } else {
+            write!(
+                f,
+                "forward {}/{} to {}",
+                self.listen_port, self.proto, self.backend
+            )
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gateway {
     /// Virtual Gateway IPv4 address (e.g. "192.168.1.5")
@@ -611,6 +637,9 @@ pub struct Gateway {
     /// Gateway-attached local services (e.g. `privoxy:8118`, `socks5:1080`, `ssh:22`)
     #[serde(default)]
     pub services: Vec<GatewayService>,
+    /// Inbound port forwards from the gateway's WireGuard tunnel interfaces to LAN backends (e.g. `forward 51413 to 169.254.20.10:51413`)
+    #[serde(default)]
+    pub forwards: Vec<GatewayPortForward>,
     pub tunnels: Vec<WgTunnel>,
 }
 
@@ -629,6 +658,7 @@ impl Gateway {
             }),
             allow: Vec::new(),
             services: Vec::new(),
+            forwards: Vec::new(),
             tunnels: Vec::new(),
         }
     }
@@ -647,6 +677,7 @@ impl Gateway {
             }),
             allow: Vec::new(),
             services: Vec::new(),
+            forwards: Vec::new(),
             tunnels: Vec::new(),
         }
     }
@@ -688,6 +719,9 @@ impl Gateway {
         }
         for s in &self.services {
             out.push_str(&format!("    {}\n", s));
+        }
+        for fwd in &self.forwards {
+            out.push_str(&format!("    {}\n", fwd));
         }
         if !self.tunnels.is_empty() {
             out.push_str("    tunnels {\n");
