@@ -111,6 +111,82 @@ extern "C" fn pid1_shutdown_signal(_sig: libc::c_int) {
     std::process::exit(0);
 }
 
+fn collect_modalias_recursive(dir: &Path, out: &mut std::collections::BTreeSet<String>, depth: usize) {
+    if depth > 7 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_modalias_recursive(&path, out, depth + 1);
+        } else if ft.is_file() && entry.file_name() == "modalias" {
+            if let Ok(content) = fs::read_to_string(&path) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    out.insert(trimmed.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn load_sysfs_modalias_modules() {
+    for pass in 0..2 {
+        let mut aliases = std::collections::BTreeSet::new();
+        collect_modalias_recursive(Path::new("/sys/devices"), &mut aliases, 0);
+        for chunk in aliases.into_iter().collect::<Vec<_>>().chunks(32) {
+            let mut cmd = Command::new("modprobe");
+            cmd.arg("-a").arg("-q");
+            for a in chunk {
+                cmd.arg(a);
+            }
+            let _ = cmd.status();
+        }
+        if pass == 0 {
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+}
+
+fn ensure_primary_eth0_up() {
+    let mut candidate_ifaces = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "lo" || name.starts_with("wg") || name.starts_with("sit") || name.starts_with("ip6tnl") {
+                continue;
+            }
+            candidate_ifaces.push(name);
+        }
+    }
+    candidate_ifaces.sort();
+
+    if !candidate_ifaces.iter().any(|n| n == "eth0") {
+        if let Some(first) = candidate_ifaces.first() {
+            let _ = Command::new("ip")
+                .args(["link", "set", first, "down"])
+                .status();
+            let _ = Command::new("ip")
+                .args(["link", "set", first, "name", "eth0"])
+                .status();
+        }
+    }
+
+    for iface in ["eth0", "eth1", "enp5s0"] {
+        if Path::new(&format!("/sys/class/net/{}", iface)).exists() {
+            let _ = Command::new("ip")
+                .args(["link", "set", iface, "up"])
+                .status();
+        }
+    }
+}
+
 pub fn init_unikernel_appliance() -> Option<PathBuf> {
     let is_pid1 = std::process::id() == 1;
     if is_pid1 {
@@ -139,16 +215,67 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
             let _ = fs::create_dir_all("/dev/pts");
             let _ = sys_mount("devpts", "/dev/pts", "devpts", 0);
 
-            std::thread::sleep(Duration::from_millis(250));
+            if Path::new("/lib/modules").exists() {
+                let core_mods = [
+                    "ext4",
+                    "mmc_block",
+                    "dw_mmc-rockchip",
+                    "sdhci-of-dwcmshc",
+                    "phy-rockchip-naneng-combphy",
+                    "phy-rockchip-snps-pcie3",
+                    "nvme",
+                    "dwmac-rk",
+                    "stmmac-platform",
+                    "stmmac",
+                    "motorcomm",
+                    "realtek",
+                    "r8169",
+                    "r8152",
+                    "nf_tables",
+                    "nf_conntrack",
+                    "nft_ct",
+                    "nft_nat",
+                    "nft_masq",
+                    "nft_chain_nat",
+                    "nft_counter",
+                    "nft_limit",
+                    "nft_numgen",
+                    "nft_hash",
+                    "wireguard",
+                    "8021q",
+                    "macvlan",
+                ];
+                for m in core_mods {
+                    let _ = Command::new("modprobe").args(["-q", m]).status();
+                }
+                load_sysfs_modalias_modules();
+            }
 
-            for dev in ["/dev/vda2", "/dev/sda2"] {
-                if Path::new(dev).exists() && sys_mount(dev, "/data", "ext4", 0) {
-                    eprintln!(
-                        "[nfty-unikernel] Mounted VM persistent storage {} at /data (ext4)",
-                        dev
-                    );
+            let data_devs = [
+                "/dev/vda2",
+                "/dev/sda2",
+                "/dev/nvme0n1p2",
+                "/dev/mmcblk0p2",
+                "/dev/mmcblk1p2",
+                "/dev/mmcblk2p2",
+                "/dev/sdb2",
+            ];
+            let mut mounted = false;
+            for _ in 0..8 {
+                for dev in data_devs {
+                    if Path::new(dev).exists() && sys_mount(dev, "/data", "ext4", 0) {
+                        eprintln!(
+                            "[nfty-unikernel] Mounted persistent storage {} at /data (ext4)",
+                            dev
+                        );
+                        mounted = true;
+                        break;
+                    }
+                }
+                if mounted {
                     break;
                 }
+                std::thread::sleep(Duration::from_millis(250));
             }
         }
 
@@ -156,14 +283,10 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
         let _ = Command::new("ip")
             .args(["addr", "replace", "127.0.0.1/8", "dev", "lo"])
             .status();
-        let _ = Command::new("ip")
-            .args(["link", "set", "eth0", "up"])
-            .status();
-        let _ = Command::new("ip")
-            .args(["link", "set", "enp5s0", "up"])
-            .status();
 
-        // Automatically acquire IPv4 address via DHCP on eth0 / enp5s0
+        ensure_primary_eth0_up();
+
+        // Automatically acquire IPv4 address via DHCP on eth0
         if Path::new("/bin/udhcpc").exists() {
             let _ = Command::new("/bin/udhcpc")
                 .args(["-i", "eth0", "-s", "/bin/udhcpc-hook", "-b", "-q"])

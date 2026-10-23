@@ -297,6 +297,21 @@ sudo ./dist/standalone/nfty --file /etc/nfty/Nftyfile --api-bind 127.0.0.1:9090
 sudo ./dist/standalone/nfty --file /etc/nfty/Nftyfile --apply --daemon
 ```
 
+### 4. Build and Flash a Bare-Metal RK3588S / ARM64 Unikernel Image
+
+`packaging/rk3588s/build-rk3588s.sh` cross-compiles `nfty` to `aarch64-unknown-linux-musl` and builds a bootable GPT disk image (`dist/rk3588s/nfty-rk3588s.img.gz`) containing Rockchip U-Boot (`idbloader` + `u-boot.itb` at sector 64), a hybrid U-Boot (`extlinux.conf`) + UEFI (`BOOTAA64.EFI`) boot partition with Linux 6.18 LTS and all mainline `rk3588s-*.dtb` / `rk3588-*.dtb` device trees, the ARM64 `nfty` PID-1 initramfs, and a 128 MiB `ext4` `/data` partition.
+
+```bash
+# Build universal RK3588S / RK3588 disk image and ARM64 LXD container image
+./packaging/rk3588s/build-rk3588s.sh
+
+# Or build with board-specific edk2-rk3588 UEFI firmware embedded at sector 64:
+./packaging/rk3588s/build-rk3588s.sh orangepi-5   # or rock-5a, nanopi-r6s, nanopi-r6c, edge2
+
+# Flash directly to MicroSD, eMMC, or NVMe:
+zcat dist/rk3588s/nfty-rk3588s.img.gz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+```
+
 ---
 
 ## Codebase Layout

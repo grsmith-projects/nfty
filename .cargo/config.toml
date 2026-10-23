@@ -1,2 +1,7 @@
 [env]
 CC_x86_64_unknown_linux_musl = "gcc"
+CC_aarch64_unknown_linux_musl = "clang"
+AR_aarch64_unknown_linux_musl = "llvm-ar"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
