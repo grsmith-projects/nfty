@@ -1,6 +1,6 @@
 # nfty
 
-`nfty` is a Linux L4/L7 load balancer, virtual IP (VIP) appliance, and WireGuard policy-routing gateway written in Rust. It compiles a declarative configuration file (`Nftyfile`) or interactive router-style CLI session into atomic kernel `nftables` rulesets (`table ip nfty`), manages static and DHCP `macvlan` virtual IPs (including 802.1Q VLAN sub-interfaces), runs active backend health checks, and boots directly as PID 1 inside a minimal LXD container or UEFI unikernel VM.
+`nfty` is a Linux L4/L7 load balancer, virtual IP (VIP) appliance, and policy-routing egress gateway (direct Internet NAT or multi-tunnel WireGuard) written in Rust. It compiles a declarative configuration file (`Nftyfile`) or interactive router-style CLI session into atomic kernel `nftables` rulesets (`table ip nfty`), manages static and DHCP `macvlan` virtual IPs (including 802.1Q VLAN sub-interfaces), runs active backend health checks, and boots directly as PID 1 inside a minimal LXD container, UEFI unikernel VM, or bare-metal ARM64 SBC.
 
 ## Architecture and Capabilities
 
@@ -11,10 +11,10 @@
 - **Static, VLAN, and DHCP Virtual IPs**:
   - Binds static VIPs (`vip 169.254.10.10/24`) to host interfaces or 802.1Q VLAN sub-interfaces (`vlan 20`).
   - Provisions dedicated `macvlan` interfaces with deterministic MAC addresses and `udhcpc` leases for hostname-based DHCP VIPs (`vip web-frontend { dhcp eth0 }`), registering the hostname directly with upstream router DNS.
-- **WireGuard Egress Gateways**:
-  - Aggregates one or more WireGuard `.conf` tunnels under a single LAN gateway IP (`gateway 169.254.10.20`) using kernel `fwmark` policy routing (`ip rule` + per-tunnel routing tables) and `ct mark` connection pinning.
-  - Supports `killswitch on` to drop non-tunnel egress if all WireGuard peers go down.
-  - Exposes gateway-bound `privoxy:<port>` (HTTP/HTTPS `CONNECT`) and `socks5:<port>` listeners pinned to active WireGuard interfaces via `SO_BINDTODEVICE` and `SO_MARK`.
+- **Internet NAT and WireGuard Egress Gateways**:
+  - Binds static or DHCP virtual gateway IPs (`gateway 169.254.10.20` or `gateway lan-exit dhcp eth0`) that LAN machines or containers can use as their default IPv4 gateway (`ip route replace default via ...`).
+  - **Direct Internet Gateway Mode**: When configured without WireGuard tunnels, `nfty` masquerades forwarded LAN traffic directly out the primary WAN/LAN interface (`eth0`), enforces optional source `allow` ACLs, and exposes built-in `privoxy:<port>` (HTTP/HTTPS `CONNECT`) and `socks5:<port>` proxies.
+  - **WireGuard Multi-Tunnel Mode**: Aggregates one or more WireGuard `.conf` tunnels under the gateway IP using kernel `fwmark` policy routing (`ip rule` + per-tunnel routing tables), `ct mark` connection pinning, `killswitch on`, and inbound tunnel port forwarding (`forward <port> to <host:port>`).
 - **Cloudflare Tunnel and Authentication**:
   - `cloudflare-dns <fqdn>` provisions a remotely-managed Cloudflare Tunnel, ingress rule, and proxied CNAME record via the Cloudflare API and supervises `cloudflared`.
   - `cloudflare-auth <email...>` configures Cloudflare Zero Trust Access self-hosted applications and email/domain allow policies (`user@example.com`, `*@example.com`).
@@ -142,9 +142,28 @@ vip 169.254.10.15/24 {
 }
 ```
 
-### 4. WireGuard Multi-Tunnel Egress Gateway
+### 4. Internet NAT and WireGuard Egress Gateways
 
-A `gateway` block binds a virtual gateway IP (`169.254.10.20`) and distributes outbound traffic across one or more WireGuard configurations stored in `/data/wg/`. Other machines or containers on the LAN can either set `169.254.10.20` as their default IPv4 gateway or use the built-in `privoxy` (HTTP/CONNECT) and `socks5` proxies bound to the gateway IP. Inbound ports on the WireGuard tunnel interfaces can also be forwarded to LAN hosts with `forward <port> to <host:port>` (with per-tunnel `ct mark` return-path pinning):
+A `gateway` block binds a virtual gateway IP (`169.254.10.20` or a DHCP `macvlan` hostname) that other machines, VMs, or containers on the LAN can set as their default IPv4 gateway or reach via the built-in `privoxy` (HTTP/CONNECT) and `socks5` proxies.
+
+**Direct Internet / LAN NAT Gateway (no VPN tunnels):**
+
+When no `tunnels` block is configured, `nfty` enables IPv4 forwarding and kernel `nftables` masquerading (`oifname "eth0" masquerade`) so isolated containers, VLANs, or lab hosts can route outbound Internet traffic or proxy connections through `nfty`:
+
+```hcl
+gateway 169.254.10.19 {
+    check ping 5s
+    privoxy:8118
+    socks5:1080
+    allow {
+        169.254.0.0/16
+    }
+}
+```
+
+**WireGuard Multi-Tunnel Egress Gateway:**
+
+When one or more WireGuard configurations stored in `/data/wg/` are attached, `nfty` policy-routes traffic from the gateway across the tunnels (`round-robin` or `sticky`), optionally drops non-tunnel leaks with `killswitch on`, and forwards inbound ports from the WireGuard interfaces to LAN hosts with `forward <port> to <host:port>` (using per-tunnel `ct mark` return-path pinning):
 
 ```hcl
 gateway 169.254.10.20 {
@@ -161,7 +180,7 @@ gateway 169.254.10.20 {
 }
 ```
 
-Adding WireGuard tunnel configs and port forwards from the CLI:
+Configuring a gateway from the CLI:
 
 ```text
 nfty# wg paste wg-exit-01
