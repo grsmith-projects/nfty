@@ -731,6 +731,13 @@ impl Config {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.vips.is_empty()
+            && self.services.is_empty()
+            && self.gateways.is_empty()
+            && self.global_allow.is_empty()
+    }
+
     pub fn format_vip_block(&self, vip_ip: Ipv4Addr) -> String {
         self.format_vip_block_by_key(&vip_ip.to_string())
     }
@@ -777,11 +784,7 @@ impl Config {
     }
 
     pub fn format_nftyfile(&self) -> String {
-        if self.vips.is_empty()
-            && self.services.is_empty()
-            && self.gateways.is_empty()
-            && self.global_allow.is_empty()
-        {
+        if self.is_empty() {
             return "# Empty Nftyfile\n".to_string();
         }
         let mut blocks = Vec::new();

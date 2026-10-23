@@ -131,14 +131,7 @@ pub async fn route_api_request(
             let flows = crate::features::read_active_flows(shared);
             let wg_configs = crate::features::list_saved_wg_configs();
             let st = shared.read().unwrap();
-            let cfg = if !st.running.services.is_empty()
-                || !st.running.gateways.is_empty()
-                || !st.running.global_allow.is_empty()
-            {
-                &st.running
-            } else {
-                &st.candidate
-            };
+            let cfg = st.active_config();
             let nft = compile_nft_ruleset(cfg, Some(&st));
             let mut active_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for (k, svc) in &cfg.services {
@@ -184,12 +177,7 @@ pub async fn route_api_request(
             let cf = crate::features::load_cloudflare_config();
             let routes = {
                 let st = shared.read().unwrap();
-                let cfg = if !st.running.services.is_empty() {
-                    &st.running
-                } else {
-                    &st.candidate
-                };
-                crate::features::collect_cloudflare_routes(cfg)
+                crate::features::collect_cloudflare_routes(st.active_config())
             };
             (
                 200,
@@ -227,14 +215,7 @@ pub async fn route_api_request(
             if let Err(e) = crate::features::save_cloudflare_config(&cf) {
                 return (500, json!({"ok": false, "error": e.to_string()}));
             }
-            let cfg = {
-                let st = shared.read().unwrap();
-                if !st.running.services.is_empty() {
-                    st.running.clone()
-                } else {
-                    st.candidate.clone()
-                }
-            };
+            let cfg = shared.read().unwrap().active_config().clone();
             let logs = crate::features::reconcile_cloudflare_tunnel(&cfg);
             (200, json!({"ok": true, "logs": logs}))
         }
@@ -295,11 +276,7 @@ pub async fn route_api_request(
         },
         ("GET", "/api/v1/nft") => {
             let st = shared.read().unwrap();
-            let cfg = if !st.running.services.is_empty() {
-                &st.running
-            } else {
-                &st.candidate
-            };
+            let cfg = st.active_config();
             (
                 200,
                 json!({
@@ -309,11 +286,7 @@ pub async fn route_api_request(
         }
         ("GET", "/api/v1/allow") => {
             let st = shared.read().unwrap();
-            let cfg = if !st.running.services.is_empty() {
-                &st.running
-            } else {
-                &st.candidate
-            };
+            let cfg = st.active_config();
             let mut service_allow = BTreeMap::new();
             let mut expanded_service_sets = BTreeMap::new();
             for (k, svc) in &cfg.services {

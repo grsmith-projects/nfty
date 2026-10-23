@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
         if !kernel_nft_active {
             spawn_unikernel_dataplane(shared.clone());
         }
-        crate::features::spawn_mdns_and_sni_router(shared.clone());
+        crate::features::spawn_advanced_feature_daemons(shared.clone());
     }
     spawn_background_tasks(shared.clone());
     spawn_api_server(shared.clone(), cli.api_bind.clone());

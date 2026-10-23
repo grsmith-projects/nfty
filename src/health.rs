@@ -155,11 +155,7 @@ pub async fn run_all_probes_once(shared: &SharedState) -> Vec<ProbeOutcome> {
         Vec<(String, String)>,
     ) = {
         let st = shared.read().unwrap();
-        let cfg = if !st.running.services.is_empty() || !st.running.gateways.is_empty() {
-            &st.running
-        } else {
-            &st.candidate
-        };
+        let cfg = st.active_config();
         let mut list = Vec::new();
         for svc in cfg.services.values() {
             for b in &svc.backends {
@@ -226,11 +222,7 @@ pub async fn run_all_probes_once(shared: &SharedState) -> Vec<ProbeOutcome> {
                 }
             }
         }
-        if health_changed
-            && (!st.running.services.is_empty()
-                || !st.running.gateways.is_empty()
-                || !st.running.vips.is_empty())
-        {
+        if health_changed && !st.running.is_empty() {
             let _ = reload_kernel_from_state(&mut st);
         }
     }

@@ -10,11 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 fn find_hostname_ip(shared: &SharedState, qname: &str) -> Option<Ipv4Addr> {
     let q = qname.trim_end_matches('.').to_ascii_lowercase();
     let st = shared.read().ok()?;
-    let cfg = if !st.running.services.is_empty() || !st.running.gateways.is_empty() {
-        &st.running
-    } else {
-        &st.candidate
-    };
+    let cfg = st.active_config();
 
     for (vip_key, vip_cfg) in &cfg.vips {
         if let Some(ip) = vip_cfg.leased_ip.or_else(|| vip_key.parse::<Ipv4Addr>().ok()) {
@@ -327,11 +323,7 @@ pub(crate) async fn run_l7_virtual_host_listener(shared: SharedState, listen_por
 
             let target_info: Option<(String, String, Vec<String>)> = {
                 let st = shared_conn.read().unwrap();
-                let cfg = if !st.running.services.is_empty() {
-                    &st.running
-                } else {
-                    &st.candidate
-                };
+                let cfg = st.active_config();
                 // Prefer a service whose listen_ip matches the destination VIP IP, falling back to any service with that hostname
                 let mut candidates: Vec<&crate::ast::Service> = cfg
                     .services

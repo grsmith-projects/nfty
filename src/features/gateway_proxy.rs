@@ -24,11 +24,7 @@ pub async fn run_gateway_proxy_supervisor(shared: SharedState) {
         {
             if let Ok(mut st) = shared.write() {
                 st.sync_from_disk_if_changed();
-                let cfg = if !st.running.gateways.is_empty() || !st.running.services.is_empty() {
-                    &st.running
-                } else {
-                    &st.candidate
-                };
+                let cfg = st.active_config();
                 for gw in cfg.gateways.values() {
                     for gs in &gw.services {
                         if matches!(
@@ -92,11 +88,7 @@ fn select_gateway_tunnel(shared: &SharedState, gw_key: &str) -> GatewayRouteDeci
     let Ok(st) = shared.read() else {
         return GatewayRouteDecision::DirectHost;
     };
-    let cfg = if !st.running.gateways.is_empty() {
-        &st.running
-    } else {
-        &st.candidate
-    };
+    let cfg = st.active_config();
 
     let mut base_idx = 0usize;
     for (k, gw) in &cfg.gateways {

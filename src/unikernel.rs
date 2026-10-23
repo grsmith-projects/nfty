@@ -194,10 +194,7 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
 pub fn persist_to_storage(shared: &SharedState) {
     let (cfg_txt, is_empty_cfg, config_path, resolved_hosts) = {
         let mut st = shared.write().unwrap();
-        let is_empty = st.running.vips.is_empty()
-            && st.running.services.is_empty()
-            && st.running.gateways.is_empty()
-            && st.running.global_allow.is_empty();
+        let is_empty = st.running.is_empty();
         let txt = st.running.format_nftyfile();
         st.last_disk_nftyfile = txt.clone();
         (txt, is_empty, st.config_path.clone(), st.resolved_hosts.clone())
@@ -281,12 +278,7 @@ pub fn spawn_unikernel_dataplane(shared: SharedState) {
         loop {
             let services_snapshot = {
                 let st = shared.read().unwrap();
-                let cfg = if !st.running.services.is_empty() {
-                    &st.running
-                } else {
-                    &st.candidate
-                };
-                cfg.services.clone()
+                st.active_config().services.clone()
             };
 
             active_listeners.retain(|k, handle| {
@@ -330,11 +322,7 @@ pub fn spawn_unikernel_dataplane(shared: SharedState) {
 
                             let selection = {
                                 let st = st_clone.read().unwrap();
-                                let cfg = if !st.running.services.is_empty() {
-                                    &st.running
-                                } else {
-                                    &st.candidate
-                                };
+                                let cfg = st.active_config();
                                 let Some(cur_svc) = cfg.services.get(&svc_key) else {
                                     continue;
                                 };

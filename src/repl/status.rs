@@ -10,8 +10,8 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
     if let Some(first) = args.first() {
         match first.to_ascii_lowercase().as_str() {
             "nft" | "nftables" | "rules" => {
-                let cfg = if *level == ShellLevel::Operational && !st.running.services.is_empty() {
-                    &st.running
+                let cfg = if *level == ShellLevel::Operational {
+                    st.active_config()
                 } else {
                     &st.candidate
                 };
@@ -62,14 +62,7 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
 
     match level {
         ShellLevel::Operational => {
-            if !st.running.services.is_empty()
-                || !st.running.gateways.is_empty()
-                || !st.running.global_allow.is_empty()
-            {
-                print!("{}", st.running.format_nftyfile());
-            } else {
-                print!("{}", st.candidate.format_nftyfile());
-            }
+            print!("{}", st.active_config().format_nftyfile());
         }
         ShellLevel::ConfigRoot | ShellLevel::GlobalAllow => {
             print!("{}", st.candidate.format_nftyfile());
@@ -149,14 +142,7 @@ pub fn print_config_diff(shared: &SharedState) {
 
 pub fn print_status_table(shared: &SharedState) {
     let st = shared.read().unwrap();
-    let cfg = if !st.running.vips.is_empty()
-        || !st.running.services.is_empty()
-        || !st.running.gateways.is_empty()
-    {
-        &st.running
-    } else {
-        &st.candidate
-    };
+    let cfg = st.active_config();
 
     if cfg.vips.is_empty() && cfg.services.is_empty() && cfg.gateways.is_empty() {
         println!(

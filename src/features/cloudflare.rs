@@ -345,11 +345,7 @@ pub(crate) async fn run_cf_auth_proxy_listener(shared: SharedState) {
 
             let route_match: Option<(String, Vec<String>, String)> = {
                 let st = shared_conn.read().unwrap();
-                let cfg = if !st.running.services.is_empty() {
-                    &st.running
-                } else {
-                    &st.candidate
-                };
+                let cfg = st.active_config();
                 cfg.services.values().find_map(|svc| {
                     let cf_host = svc.cloudflare.as_ref()?;
                     if cf_host.eq_ignore_ascii_case(&host) {
@@ -1021,11 +1017,7 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
         None | Some("status") | Some("list") | Some("show") => {
             let cf_cfg = load_cloudflare_config();
             let st = shared.read().unwrap();
-            let cfg = if !st.running.services.is_empty() {
-                &st.running
-            } else {
-                &st.candidate
-            };
+            let cfg = st.active_config();
             let routes = collect_cloudflare_routes(cfg);
             let pid_opt = cloudflared_running_pid();
 
@@ -1127,14 +1119,7 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
                 cf_cfg.account_id.as_deref().unwrap_or("pending"),
                 zones.keys().collect::<Vec<_>>()
             );
-            let cfg_clone = {
-                let st = shared.read().unwrap();
-                if !st.running.services.is_empty() {
-                    st.running.clone()
-                } else {
-                    st.candidate.clone()
-                }
-            };
+            let cfg_clone = shared.read().unwrap().active_config().clone();
             for log in reconcile_cloudflare_tunnel(&cfg_clone) {
                 println!("  {} {}", "→".cyan(), log);
             }
@@ -1156,14 +1141,7 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
             Ok(())
         }
         Some("sync") | Some("apply") => {
-            let cfg_clone = {
-                let st = shared.read().unwrap();
-                if !st.running.services.is_empty() {
-                    st.running.clone()
-                } else {
-                    st.candidate.clone()
-                }
-            };
+            let cfg_clone = shared.read().unwrap().active_config().clone();
             let logs = reconcile_cloudflare_tunnel(&cfg_clone);
             if logs.is_empty() {
                 println!("  (No Cloudflare Tunnel routes configured)");

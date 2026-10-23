@@ -139,6 +139,16 @@ impl AppState {
         s
     }
 
+    /// Returns the active configuration (`&self.running` if any VIPs, services, gateways, or allow rules
+    /// have been committed, otherwise `&self.candidate`).
+    pub fn active_config(&self) -> &Config {
+        if !self.running.is_empty() {
+            &self.running
+        } else {
+            &self.candidate
+        }
+    }
+
     /// Reloads `/data/Nftyfile` (or `self.config_path`) if another session or API call updated it on disk.
     pub fn sync_from_disk_if_changed(&mut self) {
         let path = if self.config_path.exists() {

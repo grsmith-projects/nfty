@@ -267,11 +267,7 @@ pub async fn run_watch_dashboard(shared: SharedState) -> Result<()> {
 
 fn build_dashboard_data(shared: &SharedState) -> (Vec<FlatBackendRow>, String, String) {
     let st = shared.read().unwrap();
-    let cfg = if !st.running.services.is_empty() {
-        &st.running
-    } else {
-        &st.candidate
-    };
+    let cfg = st.active_config();
 
     let mut rows = Vec::new();
     let mut up_count = 0;

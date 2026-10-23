@@ -27,11 +27,7 @@ pub fn read_active_flows(shared: &SharedState) -> Vec<ConntrackFlow> {
 
     let (vip_ips, backend_ips) = {
         let st = shared.read().unwrap();
-        let cfg = if !st.running.services.is_empty() || !st.running.gateways.is_empty() {
-            &st.running
-        } else {
-            &st.candidate
-        };
+        let cfg = st.active_config();
         let mut vips = Vec::new();
         let mut bips = Vec::new();
         for svc in cfg.services.values() {
