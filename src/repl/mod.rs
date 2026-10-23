@@ -1,6 +1,14 @@
-use crate::ast::{Config, Gateway, Service};
+pub mod completer;
+pub mod help;
+pub mod status;
+
+pub use completer::NftyHelper;
+pub use help::print_context_help;
+pub use status::{handle_show, print_config_diff, print_status, print_status_table};
+
+use crate::ast::{Gateway, Service};
 use crate::compiler::{
-    apply_vip_commands, compile_nft_ruleset, generate_vip_commands, reconcile_dhcp_and_vlan_vips,
+    apply_vip_commands, generate_vip_commands, reconcile_dhcp_and_vlan_vips,
     reload_kernel_from_state, validate_config,
 };
 use crate::health::{refresh_allowlist_hosts, run_all_probes_once};
@@ -14,13 +22,8 @@ use crate::state::{HealthState, PendingConfirm, SharedState};
 use crate::tui::run_watch_dashboard;
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
-use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::validate::Validator;
-use rustyline::{Context as RlContext, Editor, Helper};
-use similar::{ChangeTag, TextDiff};
+use rustyline::Editor;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -59,648 +62,9 @@ impl ShellLevel {
     }
 }
 
-struct NftyHelper {
-    level: Arc<Mutex<ShellLevel>>,
-    state: SharedState,
-}
-
-impl NftyHelper {
-    fn known_hosts(&self) -> Vec<String> {
-        let mut set = std::collections::BTreeSet::new();
-        if let Ok(st) = self.state.read() {
-            for h in st.resolved_hosts.keys() {
-                set.insert(h.clone());
-            }
-            for d in &st.discovered_services {
-                if let Some(h) = &d.host {
-                    set.insert(h.clone());
-                }
-            }
-            for svc in st.candidate.services.values() {
-                for b in &svc.backends {
-                    if let Some(h) = &b.host {
-                        set.insert(h.clone());
-                    }
-                }
-            }
-        }
-        if let Ok(raw) = fs::read_to_string("/etc/hosts") {
-            for line in raw.lines() {
-                let clean = line.split('#').next().unwrap_or("").trim();
-                let mut parts = clean.split_whitespace();
-                let _ = parts.next();
-                for host in parts {
-                    if !host.eq_ignore_ascii_case("localhost")
-                        && !host.contains("ip6-")
-                        && !host.is_empty()
-                    {
-                        set.insert(host.to_string());
-                    }
-                }
-            }
-        }
-        set.into_iter().collect()
-    }
-
-    fn known_host_ports(&self) -> Vec<String> {
-        let mut set = std::collections::BTreeSet::new();
-        if let Ok(st) = self.state.read() {
-            for d in &st.discovered_services {
-                set.insert(d.target_spec());
-            }
-            for svc in st.candidate.services.values() {
-                for b in &svc.backends {
-                    if !b.ip.is_loopback() {
-                        set.insert(b.to_string());
-                    }
-                }
-            }
-        }
-        for h in self.known_hosts() {
-            set.insert(format!("{}:80", h));
-        }
-        set.into_iter().collect()
-    }
-
-    fn wg_conf_files(&self) -> Vec<String> {
-        let mut list = Vec::new();
-        if let Ok(entries) = fs::read_dir("/data/wg") {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.ends_with(".conf") {
-                    list.push(name);
-                }
-            }
-        }
-        list.sort();
-        list
-    }
-}
-
-impl Completer for NftyHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &RlContext<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let slice = &line[..pos];
-        let words: Vec<&str> = slice.split_whitespace().collect();
-        let trailing_space = slice.ends_with(' ');
-        let prefix = if trailing_space {
-            ""
-        } else {
-            words.last().copied().unwrap_or("")
-        };
-        let start_pos = pos - prefix.len();
-        let word_idx = if trailing_space {
-            words.len()
-        } else {
-            words.len().saturating_sub(1)
-        };
-        let cmd0 = words.first().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
-        let cmd1 = words.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
-
-        // Global argument completions that apply at any shell level
-        if word_idx == 1 {
-            match cmd0.as_str() {
-                "show" => {
-                    let list = vec![
-                        "running", "candidate", "all", "nft", "allow", "hosts", "vips",
-                    ];
-                    let matches = list
-                        .into_iter()
-                        .filter(|c| c.starts_with(prefix))
-                        .map(|c| Pair {
-                            display: c.to_string(),
-                            replacement: c.to_string(),
-                        })
-                        .collect();
-                    return Ok((start_pos, matches));
-                }
-                "wg" | "wireguard" => {
-                    let list = vec!["list", "add", "edit", "paste", "show", "rm", " status"];
-                    let matches = list
-                        .into_iter()
-                        .map(|s| s.trim())
-                        .filter(|c| c.starts_with(prefix))
-                        .map(|c| Pair {
-                            display: c.to_string(),
-                            replacement: c.to_string(),
-                        })
-                        .collect();
-                    return Ok((start_pos, matches));
-                }
-                "cf" | "cloudflare" => {
-                    let list = vec![
-                        "status",
-                        "token",
-                        "tunnel-token",
-                        "sync",
-                        "logs",
-                        "stop",
-                    ];
-                    let matches = list
-                        .into_iter()
-                        .filter(|c| c.starts_with(prefix))
-                        .map(|c| Pair {
-                            display: c.to_string(),
-                            replacement: c.to_string(),
-                        })
-                        .collect();
-                    return Ok((start_pos, matches));
-                }
-                "drain" | "enable" => {
-                    let st = self.state.read().unwrap();
-                    let mut eps = std::collections::BTreeSet::new();
-                    for svc in st.running.services.values().chain(st.candidate.services.values()) {
-                        for b in &svc.backends {
-                            if !b.ip.is_loopback() {
-                                eps.insert(b.endpoint());
-                            }
-                        }
-                    }
-                    let matches = eps
-                        .into_iter()
-                        .filter(|c| c.starts_with(prefix))
-                        .map(|c| Pair {
-                            display: c.clone(),
-                            replacement: c,
-                        })
-                        .collect();
-                    return Ok((start_pos, matches));
-                }
-                "scan" => {
-                    let mut list = self.known_hosts();
-                    list.push("192.168.1.0/24".to_string());
-                    let matches = list
-                        .into_iter()
-                        .filter(|c| c.starts_with(prefix))
-                        .map(|c| Pair {
-                            display: c.clone(),
-                            replacement: c,
-                        })
-                        .collect();
-                    return Ok((start_pos, matches));
-                }
-                "adopt" => {
-                    let st = self.state.read().unwrap();
-                    let mut list = Vec::new();
-                    for d in &st.discovered_services {
-                        list.push(d.index.to_string());
-                        list.push(d.suggested_vip_name());
-                        list.push(d.target_spec());
-                    }
-                    let matches = list
-                        .into_iter()
-                        .filter(|c| c.starts_with(prefix))
-                        .map(|c| Pair {
-                            display: c.clone(),
-                            replacement: c,
-                        })
-                        .collect();
-                    return Ok((start_pos, matches));
-                }
-                "apply" | "commit" => {
-                    let list = vec!["confirm 60".to_string(), "confirm 30".to_string()];
-                    let matches = list
-                        .into_iter()
-                        .filter(|c| c.starts_with(prefix))
-                        .map(|c| Pair {
-                            display: c.clone(),
-                            replacement: c,
-                        })
-                        .collect();
-                    return Ok((start_pos, matches));
-                }
-                _ => {}
-            }
-        } else if word_idx == 2 && (cmd0 == "wg" || cmd0 == "wireguard") {
-            let files = self.wg_conf_files();
-            let matches = files
-                .into_iter()
-                .filter(|c| c.starts_with(prefix))
-                .map(|c| Pair {
-                    display: c.clone(),
-                    replacement: c,
-                })
-                .collect();
-            return Ok((start_pos, matches));
-        } else if word_idx >= 2 && cmd0 == "adopt" {
-            if words.get(word_idx.saturating_sub(1)).copied() == Some("vip") {
-                let st = self.state.read().unwrap();
-                let list: Vec<String> = st.candidate.vips.keys().cloned().collect();
-                let matches = list
-                    .into_iter()
-                    .filter(|c| c.starts_with(prefix))
-                    .map(|c| Pair {
-                        display: c.clone(),
-                        replacement: c,
-                    })
-                    .collect();
-                return Ok((start_pos, matches));
-            } else {
-                let list = vec!["vip".to_string(), "port".to_string(), "vlan".to_string()];
-                let matches = list
-                    .into_iter()
-                    .filter(|c| c.starts_with(prefix))
-                    .map(|c| Pair {
-                        display: c.clone(),
-                        replacement: c,
-                    })
-                    .collect();
-                return Ok((start_pos, matches));
-            }
-        }
-
-        let lvl = self.level.lock().unwrap().clone();
-        let candidates: Vec<String> = match (&lvl, word_idx) {
-            (ShellLevel::Operational, 0) => vec![
-                "scan",
-                "adopt",
-                "bootstrap",
-                "configure",
-                "status",
-                "flows",
-                "wg",
-                "cf",
-                "watch",
-                "probe",
-                "show",
-                "drain",
-                "enable",
-                "password",
-                "help",
-                "exit",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            (ShellLevel::ConfigRoot, 0) => vec![
-                "vip",
-                "gateway",
-                "service",
-                "scan",
-                "adopt",
-                "bootstrap",
-                "allow",
-                "host",
-                "no",
-                "show",
-                "flows",
-                "wg",
-                "cf",
-                "diff",
-                "test",
-                "apply",
-                "confirm",
-                "rollback",
-                "save",
-                "load",
-                "status",
-                "watch",
-                "probe",
-                "password",
-                "exit",
-                "help",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            (ShellLevel::ConfigRoot, 1) if cmd0 == "vip" => {
-                let st = self.state.read().unwrap();
-                let mut list: Vec<String> = st.candidate.vips.keys().cloned().collect();
-                for d in &st.discovered_services {
-                    let s = d.suggested_vip_name();
-                    if !list.contains(&s) {
-                        list.push(s);
-                    }
-                }
-                list
-            }
-            (ShellLevel::ConfigRoot, 1) if cmd0 == "gateway" => {
-                let st = self.state.read().unwrap();
-                st.candidate.gateways.keys().cloned().collect()
-            }
-            (ShellLevel::ConfigRoot, 1) if cmd0 == "service" => {
-                let st = self.state.read().unwrap();
-                st.candidate.services.keys().cloned().collect()
-            }
-            (ShellLevel::ConfigRoot, 1) if cmd0 == "no" => {
-                vec![
-                    "vip".to_string(),
-                    "gateway".to_string(),
-                    "service".to_string(),
-                    "allow".to_string(),
-                ]
-            }
-            (ShellLevel::ConfigRoot, 2) if cmd0 == "no" => {
-                let st = self.state.read().unwrap();
-                match cmd1.as_str() {
-                    "vip" => st.candidate.vips.keys().cloned().collect(),
-                    "gateway" => st.candidate.gateways.keys().cloned().collect(),
-                    "service" => st.candidate.services.keys().cloned().collect(),
-                    "allow" => st.candidate.global_allow.clone(),
-                    _ => Vec::new(),
-                }
-            }
-            (ShellLevel::Vip(vip_str), 0) | (ShellLevel::VipService(vip_str), 0) => {
-                let st = self.state.read().unwrap();
-                let mut list: Vec<String> = st
-                    .candidate
-                    .services
-                    .values()
-                    .filter(|s| s.belongs_to_vip(vip_str))
-                    .map(|s| s.display_name())
-                    .collect();
-                for hp in self.known_host_ports() {
-                    if !list.contains(&hp) {
-                        list.push(hp);
-                    }
-                }
-                for cmd in [
-                    "80",
-                    "443",
-                    "ssh:22",
-                    "dhcp",
-                    "vlan",
-                    "interface",
-                    "cloudflare-dns",
-                    "cloudflare-auth",
-                    "auth",
-                    "scan",
-                    "adopt",
-                    "no",
-                    "show",
-                    "diff",
-                    "test",
-                    "apply",
-                    "top",
-                    "..",
-                    "up",
-                    "exit",
-                    "help",
-                ] {
-                    list.push(cmd.to_string());
-                }
-                list
-            }
-            (ShellLevel::Vip(_), 1) | (ShellLevel::VipService(_), 1)
-                if cmd0.parse::<u16>().is_ok() || cmd0.contains('/') =>
-            {
-                vec!["to".to_string()]
-            }
-            (ShellLevel::Vip(_), 2) | (ShellLevel::VipService(_), 2) if cmd1 == "to" => {
-                self.known_host_ports()
-            }
-            (ShellLevel::Vip(vip_str), 1) | (ShellLevel::VipService(vip_str), 1)
-                if cmd0 == "no" =>
-            {
-                let st = self.state.read().unwrap();
-                let mut list: Vec<String> = st
-                    .candidate
-                    .services
-                    .values()
-                    .filter(|s| s.belongs_to_vip(vip_str))
-                    .map(|s| s.display_name())
-                    .collect();
-                list.push("vlan".to_string());
-                list.push("dhcp".to_string());
-                list.push("cloudflare-dns".to_string());
-                list.push("cloudflare-auth".to_string());
-                list.push("auth".to_string());
-                list.push("ssh:22".to_string());
-                list
-            }
-            (ShellLevel::Service(_), 0) => vec![
-                "port",
-                "proto",
-                "to",
-                "hostname",
-                "cloudflare-dns",
-                "cloudflare-auth",
-                "auth",
-                "balance",
-                "mode",
-                "interface",
-                "vlan",
-                "check",
-                "limit",
-                "allow",
-                "no",
-                "show",
-                "diff",
-                "test",
-                "apply",
-                "top",
-                "..",
-                "up",
-                "exit",
-                "help",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            (ShellLevel::Service(_), 1) if cmd0 == "to" => self.known_host_ports(),
-            (ShellLevel::Service(_), 1) if cmd0 == "hostname" => self
-                .known_hosts()
-                .into_iter()
-                .map(|h| {
-                    if h.ends_with(".local") {
-                        h
-                    } else {
-                        format!("{}.local", h)
-                    }
-                })
-                .collect(),
-            (ShellLevel::Service(_), 1) if cmd0 == "proto" => {
-                vec!["tcp".to_string(), "udp".to_string(), "both".to_string()]
-            }
-            (ShellLevel::Service(_), 1) if cmd0 == "balance" => {
-                vec!["round-robin".to_string(), "sticky".to_string()]
-            }
-            (ShellLevel::Service(_), 1) if cmd0 == "mode" => {
-                vec!["nat".to_string(), "transparent".to_string()]
-            }
-            (ShellLevel::Service(_), 1) if cmd0 == "check" => vec![
-                "tcp 5s".to_string(),
-                "http /healthz 5s".to_string(),
-                "ping 5s".to_string(),
-            ],
-            (ShellLevel::Service(_), 1) if cmd0 == "limit" => vec![
-                "100/sec per-ip".to_string(),
-                "50/sec burst 100 per-ip".to_string(),
-                "600/min per-ip".to_string(),
-            ],
-            (ShellLevel::Service(_), 1) if cmd0 == "cloudflare-auth" || cmd0 == "cf-auth" => vec![
-                "*@smith.gr".to_string(),
-                "you@email.com".to_string(),
-            ],
-            (ShellLevel::Service(_), 1) if cmd0 == "auth" => vec![
-                "admin:password".to_string(),
-                "nfty".to_string(),
-            ],
-            (ShellLevel::Service(k), 1) if cmd0 == "no" => {
-                let mut list = vec![
-                    "hostname".to_string(),
-                    "cloudflare-dns".to_string(),
-                    "cloudflare-auth".to_string(),
-                    "auth".to_string(),
-                    "check".to_string(),
-                    "limit".to_string(),
-                    "allow".to_string(),
-                    "vlan".to_string(),
-                    "to".to_string(),
-                ];
-                let st = self.state.read().unwrap();
-                if let Some(svc) = st.candidate.services.get(k) {
-                    for b in &svc.backends {
-                        list.push(b.to_string());
-                    }
-                }
-                list
-            }
-            (ShellLevel::Gateway(_), 0) => vec![
-                "privoxy:8118",
-                "socks5:1080",
-                "ssh:22",
-                "service",
-                "tunnels",
-                "tunnel",
-                "dhcp",
-                "vlan",
-                "interface",
-                "hostname",
-                "balance",
-                "killswitch",
-                "check",
-                "allow",
-                "no",
-                "show",
-                "diff",
-                "test",
-                "apply",
-                "top",
-                "..",
-                "up",
-                "exit",
-                "help",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            (ShellLevel::Gateway(_), 1) if cmd0 == "tunnel" || cmd0 == "tunnels" => {
-                self.wg_conf_files()
-            }
-            (ShellLevel::Gateway(_), 1) if cmd0 == "balance" => {
-                vec!["round-robin".to_string(), "sticky".to_string()]
-            }
-            (ShellLevel::Gateway(_), 1) if cmd0 == "killswitch" => {
-                vec!["on".to_string(), "off".to_string()]
-            }
-            (ShellLevel::Gateway(gw_k), 1) if cmd0 == "no" => {
-                let mut list = vec![
-                    "privoxy".to_string(),
-                    "socks5".to_string(),
-                    "ssh".to_string(),
-                    "killswitch".to_string(),
-                    "hostname".to_string(),
-                    "vlan".to_string(),
-                ];
-                let st = self.state.read().unwrap();
-                if let Some(gw) = st.candidate.gateways.get(gw_k) {
-                    for t in &gw.tunnels {
-                        list.push(t.name.clone());
-                    }
-                }
-                list
-            }
-            (ShellLevel::GatewayTunnels(_), 0) => {
-                let mut list = self.wg_conf_files();
-                for cmd in [
-                    "add", "paste", "nano", "vi", "no", "show", "apply", "top", "..", "up", "exit",
-                    "help",
-                ] {
-                    list.push(cmd.to_string());
-                }
-                list
-            }
-            (ShellLevel::GatewayService(_), 0) => vec![
-                "privoxy:8118",
-                "socks5:1080",
-                "ssh:22",
-                "no",
-                "show",
-                "top",
-                "..",
-                "up",
-                "exit",
-                "help",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            (ShellLevel::ServiceTo(k), 0) => {
-                let st = self.state.read().unwrap();
-                let mut list = self.known_host_ports();
-                for cmd in ["..", "up", "top", "no", "show", "apply"] {
-                    list.push(cmd.to_string());
-                }
-                if let Some(svc) = st.candidate.services.get(k) {
-                    for b in &svc.backends {
-                        list.push(b.endpoint());
-                    }
-                }
-                list
-            }
-            (ShellLevel::ServiceAllow(_), 0) | (ShellLevel::GlobalAllow, 0) => {
-                let mut list = self.known_hosts();
-                for pat in [
-                    "*.office.lan",
-                    "192.168.1.*",
-                    "192.168.0.0/16",
-                    "10.0.0.0/8",
-                    "..",
-                    "up",
-                    "top",
-                    "no",
-                    "show",
-                ] {
-                    list.push(pat.to_string());
-                }
-                list
-            }
-            _ => Vec::new(),
-        };
-
-        let matches: Vec<Pair> = candidates
-            .into_iter()
-            .filter(|c| c.starts_with(prefix))
-            .map(|c| Pair {
-                display: c.clone(),
-                replacement: c,
-            })
-            .collect();
-
-        Ok((start_pos, matches))
-    }
-}
-
-impl Hinter for NftyHelper {
-    type Hint = String;
-}
-impl Highlighter for NftyHelper {}
-impl Validator for NftyHelper {}
-impl Helper for NftyHelper {}
-
 pub async fn run_repl(shared: SharedState) -> Result<()> {
     let level = Arc::new(Mutex::new(ShellLevel::Operational));
-    let helper = NftyHelper {
-        level: level.clone(),
-        state: shared.clone(),
-    };
+    let helper = NftyHelper::new(level.clone(), shared.clone());
 
     let mut rl = Editor::new()?;
     rl.set_helper(Some(helper));
@@ -905,8 +269,9 @@ pub async fn handle_line(
         "wg" | "wireguard" => {
             match crate::features::handle_wg_cli_command(&tokens[1..]) {
                 Ok(Some(saved_filename)) => {
-                    // If currently inside a gateway context, auto-add the newly created tunnel!
-                    if let ShellLevel::Gateway(gw_key) | ShellLevel::GatewayTunnels(gw_key) = &cur_level {
+                    if let ShellLevel::Gateway(gw_key) | ShellLevel::GatewayTunnels(gw_key) =
+                        &cur_level
+                    {
                         let mut st = shared.write().unwrap();
                         if let Some(gw) = st.candidate.gateways.get_mut(gw_key) {
                             let next_idx = gw.tunnels.len();
@@ -1187,7 +552,12 @@ pub fn handle_bootstrap(args: &[&str], shared: &SharedState) -> Result<()> {
                 bail!("Expected interface name after 'dev'");
             }
             iface = args[idx].to_string();
-        } else if args[idx].chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+        } else if args[idx]
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
+        {
             iface = args[idx].to_string();
         } else {
             ip_specs.push(args[idx]);
@@ -1356,7 +726,6 @@ fn handle_config_root_command(
                     s.vip = Some(vip_cfg.clone());
                 }
             }
-            // Check if there are trailing service/ssh commands after header options
             let mut idx = 2;
             while idx < tokens.len() {
                 match tokens[idx].to_ascii_lowercase().as_str() {
@@ -1919,7 +1288,11 @@ fn handle_vip_level_command(
                         sv.vlan = None;
                     }
                 }
-                println!("  {} [vip {}] Removed VLAN tag", "✔".green().bold(), vip_key.cyan());
+                println!(
+                    "  {} [vip {}] Removed VLAN tag",
+                    "✔".green().bold(),
+                    vip_key.cyan()
+                );
                 return Ok(());
             }
             if tokens[1].eq_ignore_ascii_case("dhcp") {
@@ -1937,7 +1310,11 @@ fn handle_vip_level_command(
                         sv.dhcp = false;
                     }
                 }
-                println!("  {} [vip {}] Disabled DHCP", "✔".green().bold(), vip_key.cyan());
+                println!(
+                    "  {} [vip {}] Disabled DHCP",
+                    "✔".green().bold(),
+                    vip_key.cyan()
+                );
                 return Ok(());
             }
             let target = if tokens[1].eq_ignore_ascii_case("service") {
@@ -1956,7 +1333,6 @@ fn handle_vip_level_command(
             );
         }
         _ => {
-            // Allow typing a service target directly inside `vip <ip>` as a shortcut
             return handle_vip_service_command(vip_key, trimmed, level, shared);
         }
     }
@@ -2112,7 +1488,6 @@ pub fn handle_adopt(
         idx += 1;
     }
 
-    // If no scan has been run yet, run a quick scan automatically when adopting by # or service name
     let need_auto_scan = {
         let st = shared.read().unwrap();
         st.discovered_services.is_empty() && !raw_target.contains(':')
@@ -2171,10 +1546,6 @@ pub fn handle_adopt(
         parsed_vip.vlan = Some(vid);
     }
 
-    // Determine external listen port:
-    // - If explicit `port <N>` was given, use N
-    // - If adopting onto a dedicated DHCP VIP (`parsed_vip.dhcp`), default HTTP/app services to port 80 (`80 to sonarr:8989`)
-    // - If adopting onto a shared static VIP (e.g. `192.168.1.4`), keep backend_port + set `hostname <service_name>.local`
     let listen_port = if let Some(p) = explicit_port {
         p
     } else if parsed_vip.dhcp && backend_port != 22 && backend_port != 443 {
@@ -2494,7 +1865,15 @@ fn handle_gateway_service_command(
     let first_lower = tokens[0].to_ascii_lowercase();
     if matches!(
         first_lower.as_str(),
-        "tunnels" | "tunnel" | "vip" | "hostname" | "balance" | "killswitch" | "check" | "allow" | "gateway"
+        "tunnels"
+            | "tunnel"
+            | "vip"
+            | "hostname"
+            | "balance"
+            | "killswitch"
+            | "check"
+            | "allow"
+            | "gateway"
     ) {
         *level.lock().unwrap() = ShellLevel::Gateway(gw_key.to_string());
         return handle_gateway_level_command(gw_key, trimmed, level, shared);
@@ -2570,7 +1949,11 @@ fn handle_gateway_tunnels_command(
         "add" | "edit" | "nano" | "vi" | "vim" | "paste"
     ) {
         if tokens.len() < 2 {
-            bail!("Usage: {} <tunnel-name> (e.g. '{} mullvad-us-sea-001')", first_lower, first_lower);
+            bail!(
+                "Usage: {} <tunnel-name> (e.g. '{} mullvad-us-sea-001')",
+                first_lower,
+                first_lower
+            );
         }
         let saved_opt = if first_lower == "paste" {
             crate::features::paste_wg_config_interactive(tokens[1])?
@@ -2606,14 +1989,14 @@ fn handle_gateway_tunnels_command(
         return Ok(());
     }
 
-    // If the user typed a single tunnel name (e.g. `mullvad-us-sea-001` or `mullvad-us-sea-001.conf`)
-    // and that file does not exist yet in `/data/wg/`, automatically open nano so they can paste it!
     let mut effective_tokens: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
     if tokens.len() == 1 || (tokens.len() == 3 && tokens[1].eq_ignore_ascii_case("weight")) {
         let filename = crate::features::normalize_wg_filename(tokens[0])?;
         let full_path = std::path::Path::new("/data/wg").join(&filename);
         if !full_path.exists() {
-            if let Some(saved_name) = crate::features::edit_wg_config_interactive(&filename, Some("nano"))? {
+            if let Some(saved_name) =
+                crate::features::edit_wg_config_interactive(&filename, Some("nano"))?
+            {
                 effective_tokens[0] = saved_name;
             } else {
                 return Ok(());
@@ -2669,148 +2052,6 @@ fn handle_gateway_tunnels_command(
     Ok(())
 }
 
-fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
-    let st = shared.read().unwrap();
-    if let Some(first) = args.first() {
-        match first.to_ascii_lowercase().as_str() {
-            "nft" | "nftables" | "rules" => {
-                let cfg = if *level == ShellLevel::Operational && !st.running.services.is_empty() {
-                    &st.running
-                } else {
-                    &st.candidate
-                };
-                print!("{}", compile_nft_ruleset(cfg, Some(&st)));
-                return;
-            }
-            "allow" | "hosts" => {
-                println!("{}", "Global Allow-List Patterns:".bold().cyan());
-                if st.candidate.global_allow.is_empty() {
-                    println!("  (none)");
-                } else {
-                    for g in &st.candidate.global_allow {
-                        println!("  - {}", g.yellow());
-                    }
-                }
-                println!("\n{}", "Resolved Host -> IPv4 Cache:".bold().cyan());
-                if st.resolved_hosts.is_empty() {
-                    println!("  (none)");
-                } else {
-                    for (h, ips) in &st.resolved_hosts {
-                        println!("  {:<28} -> {:?}", h.green(), ips);
-                    }
-                }
-                return;
-            }
-            "running" => {
-                print!("{}", st.running.format_nftyfile());
-                return;
-            }
-            "candidate" | "all" => {
-                print!("{}", st.candidate.format_nftyfile());
-                return;
-            }
-            "vip" | "vips" => {
-                let cmds = generate_vip_commands(&Config::new(), &st.candidate);
-                if cmds.is_empty() {
-                    println!("(No VIPs configured)");
-                } else {
-                    for c in cmds {
-                        println!("{}", c);
-                    }
-                }
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    match level {
-        ShellLevel::Operational => {
-            if !st.running.services.is_empty()
-                || !st.running.gateways.is_empty()
-                || !st.running.global_allow.is_empty()
-            {
-                print!("{}", st.running.format_nftyfile());
-            } else {
-                print!("{}", st.candidate.format_nftyfile());
-            }
-        }
-        ShellLevel::ConfigRoot | ShellLevel::GlobalAllow => {
-            print!("{}", st.candidate.format_nftyfile());
-        }
-        ShellLevel::Vip(k) | ShellLevel::VipService(k) => {
-            print!("{}", st.candidate.format_vip_block_by_key(k));
-            if st.candidate.vips.len() + st.candidate.gateways.len() > 1 {
-                println!(
-                    "{}",
-                    format!(
-                        "# (Showing scoped vip {} — run 'show all' or 'top; show' to view full config)",
-                        k
-                    )
-                    .dimmed()
-                );
-            }
-        }
-        ShellLevel::Service(k) | ShellLevel::ServiceTo(k) | ShellLevel::ServiceAllow(k) => {
-            if let Some(svc) = st.candidate.services.get(k) {
-                print!("{}", svc.format_block());
-                if st.candidate.services.len() + st.candidate.gateways.len() > 1 {
-                    println!(
-                        "{}",
-                        format!(
-                            "# (Showing scoped service {} — run 'show all' or 'top; show' to view full config)",
-                            k
-                        )
-                        .dimmed()
-                    );
-                }
-            } else {
-                println!("(Service {} not found)", k);
-            }
-        }
-        ShellLevel::Gateway(k) | ShellLevel::GatewayTunnels(k) | ShellLevel::GatewayService(k) => {
-            if let Some(gw) = st.candidate.gateways.get(k) {
-                print!("{}", gw.format_block());
-                if st.candidate.services.len() + st.candidate.gateways.len() > 1 {
-                    println!(
-                        "{}",
-                        format!(
-                            "# (Showing scoped gateway {} — run 'show all' or 'top; show' to view full config)",
-                            k
-                        )
-                        .dimmed()
-                    );
-                }
-            } else {
-                println!("(Gateway {} not found)", k);
-            }
-        }
-    }
-}
-
-fn print_config_diff(shared: &SharedState) {
-    let st = shared.read().unwrap();
-    let old_txt = st.running.format_nftyfile();
-    let new_txt = st.candidate.format_nftyfile();
-
-    if old_txt == new_txt {
-        println!(
-            "{}",
-            "No uncommitted changes (candidate matches running).".green()
-        );
-        return;
-    }
-
-    let diff = TextDiff::from_lines(&old_txt, &new_txt);
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Delete => print!("{}{}", "- ".red().bold(), change.to_string().red()),
-            ChangeTag::Insert => print!("{}{}", "+ ".green().bold(), change.to_string().green()),
-            ChangeTag::Equal => print!("  {}", change),
-        }
-    }
-}
-
 fn handle_validate(shared: &SharedState) -> bool {
     let st = shared.read().unwrap();
     let report = validate_config(&st.candidate, Some(&st));
@@ -2833,7 +2074,6 @@ fn handle_validate(shared: &SharedState) -> bool {
 }
 
 async fn handle_apply(args: &[&str], shared: &SharedState) {
-    // Refresh DNS/wildcard host resolutions before compiling
     refresh_allowlist_hosts(shared).await;
 
     if !handle_validate(shared) {
@@ -3056,430 +2296,5 @@ fn set_drain_state(shared: &SharedState, endpoint: &str, drained: bool) {
     }
     if !st.running.services.is_empty() {
         let _ = reload_kernel_from_state(&mut st);
-    }
-}
-
-pub fn print_status_table(shared: &SharedState) {
-    let st = shared.read().unwrap();
-    let cfg = if !st.running.vips.is_empty()
-        || !st.running.services.is_empty()
-        || !st.running.gateways.is_empty()
-    {
-        &st.running
-    } else {
-        &st.candidate
-    };
-
-    if cfg.vips.is_empty() && cfg.services.is_empty() && cfg.gateways.is_empty() {
-        println!(
-            "No VIPs, services, or gateways configured. Run 'scan' to discover services or 'configure' -> 'vip <name>'."
-        );
-        return;
-    }
-
-    println!(
-        "{:<22} {:<13} {:<28} {:<30} {:<22} {}",
-        "SERVICE / VIP / GW".bold().underline(),
-        "STRATEGY".bold().underline(),
-        "VIP / MODE".bold().underline(),
-        "BACKEND / WG TUNNEL".bold().underline(),
-        "HEALTH (LATENCY)".bold().underline(),
-        "TRAFFIC".bold().underline()
-    );
-
-    // Show standalone VIPs that have no services attached yet
-    for (vip_key, vip_cfg) in &cfg.vips {
-        let has_svcs = cfg.services.values().any(|s| s.belongs_to_vip(vip_key));
-        if !has_svcs {
-            let status_str = if vip_cfg.dhcp {
-                if let Some(ip) = vip_cfg.leased_ip {
-                    format!("LEASED ({})", ip).green().to_string()
-                } else {
-                    "DHCP PENDING".yellow().to_string()
-                }
-            } else {
-                "READY (empty VIP)".cyan().to_string()
-            };
-            println!(
-                "{:<22} {:<13} {:<28} {:<30} {:<31} {}",
-                format!("vip:{}", vip_key).yellow().bold(),
-                "-",
-                vip_cfg.to_string(),
-                "(no services yet)",
-                status_str,
-                "-"
-            );
-        }
-    }
-
-    for svc in cfg.services.values() {
-        let active_eps: Vec<String> = st
-            .active_backends_for_service(&svc.backends)
-            .into_iter()
-            .map(|b| b.endpoint())
-            .collect();
-
-        let vip_mode = match &svc.vip {
-            Some(v) => format!("{}/{}", v, svc.mode),
-            None => format!("-/{}", svc.mode),
-        };
-
-        let mut host_badge = svc
-            .hostname
-            .as_deref()
-            .map(|h| format!(" [{}]", h))
-            .unwrap_or_default();
-        if let Some(cf_host) = svc.cloudflare.as_deref() {
-            if svc.cloudflare_auth.is_empty() && svc.auth.is_empty() {
-                host_badge.push_str(&format!(" [cf:{}]", cf_host));
-            } else {
-                host_badge.push_str(&format!(" [cf:{} 🔒]", cf_host));
-            }
-        } else if !svc.auth.is_empty() {
-            host_badge.push_str(" [🔒]");
-        }
-
-        if svc.backends.is_empty() {
-            println!(
-                "{:<22} {:<13} {:<28} {:<30} {:<22} {}",
-                svc.key.yellow(),
-                svc.balance.to_string(),
-                vip_mode,
-                format!("(none){}", host_badge),
-                "-",
-                "-"
-            );
-            continue;
-        }
-
-        for (idx, b) in svc.backends.iter().enumerate() {
-            let ep = b.endpoint();
-            let rt = st.runtime.get(&ep).cloned().unwrap_or_default();
-            let is_active = active_eps.contains(&ep);
-
-            let mut ep_label = match &b.host {
-                Some(h) if !b.ip.is_unspecified() => format!("{}:{} ({})", h, b.port, b.ip),
-                _ => ep.clone(),
-            };
-            if idx == 0 && !host_badge.is_empty() {
-                ep_label.push_str(&host_badge);
-            }
-            if b.backup {
-                ep_label.push_str(" [backup]");
-            }
-            if b.weight != 1 {
-                ep_label.push_str(&format!(" (w={})", b.weight));
-            }
-
-            let health_col = if rt.drained {
-                "DRAINED (paused)".yellow().to_string()
-            } else {
-                match rt.health {
-                    HealthState::Up => {
-                        let ms = rt
-                            .latency_ms
-                            .map(|m| format!(" {:.1}ms", m))
-                            .unwrap_or_default();
-                        format!("UP{}", ms).green().to_string()
-                    }
-                    HealthState::Down => "DOWN (unreachable)".red().to_string(),
-                    HealthState::Unknown => {
-                        if is_active {
-                            "READY (active)".cyan().to_string()
-                        } else {
-                            "STANDBY".bright_black().to_string()
-                        }
-                    }
-                }
-            };
-
-            let traffic_col = format!("{} pkts / {} B", rt.packets, rt.bytes);
-
-            if idx == 0 {
-                println!(
-                    "{:<22} {:<13} {:<28} {:<30} {:<31} {}",
-                    svc.key.yellow().bold(),
-                    svc.balance.to_string(),
-                    vip_mode,
-                    ep_label,
-                    health_col,
-                    traffic_col
-                );
-            } else {
-                println!(
-                    "{:<22} {:<13} {:<28} {:<30} {:<31} {}",
-                    "", "", "", ep_label, health_col, traffic_col
-                );
-            }
-        }
-    }
-
-    for gw in cfg.gateways.values() {
-        let mode_suffix = if gw.tunnels.is_empty() { "direct-gw" } else { "wg-gw" };
-        let vip_mode = match &gw.vip {
-            Some(v) => format!("{}/{}", v, mode_suffix),
-            None => format!("-/{}", mode_suffix),
-        };
-        let gw_title = format!("gw:{}", gw.key);
-        let svcs_label = if gw.services.is_empty() {
-            String::new()
-        } else {
-            let names: Vec<String> = gw.services.iter().map(|s| s.to_string()).collect();
-            format!(" [{}]", names.join(","))
-        };
-        if gw.tunnels.is_empty() {
-            println!(
-                "{:<22} {:<13} {:<28} {:<30} {:<31} {}",
-                gw_title.magenta().bold(),
-                "direct",
-                vip_mode,
-                format!("host (eth0){}", svcs_label),
-                "UP (direct)".green().to_string(),
-                "-"
-            );
-            continue;
-        }
-        for (idx, t) in gw.tunnels.iter().enumerate() {
-            let ep = if idx == 0 {
-                format!("{}{}", t.endpoint_key(), svcs_label)
-            } else {
-                t.endpoint_key()
-            };
-            let rt = st.runtime.get(&t.endpoint_key()).cloned().unwrap_or_default();
-            let health_col = match rt.health {
-                HealthState::Up => {
-                    let ms = rt
-                        .latency_ms
-                        .map(|m| format!(" {:.1}ms", m))
-                        .unwrap_or_default();
-                    format!("UP{}", ms).green().to_string()
-                }
-                HealthState::Down => "DOWN (unreachable)".red().to_string(),
-                HealthState::Unknown => "READY (active)".cyan().to_string(),
-            };
-            let traffic_col = format!("{} pkts / {} B", rt.packets, rt.bytes);
-            if idx == 0 {
-                println!(
-                    "{:<22} {:<13} {:<28} {:<30} {:<31} {}",
-                    gw_title.magenta().bold(),
-                    gw.balance.to_string(),
-                    vip_mode,
-                    ep,
-                    health_col,
-                    traffic_col
-                );
-            } else {
-                println!(
-                    "{:<22} {:<13} {:<28} {:<30} {:<31} {}",
-                    "", "", "", ep, health_col, traffic_col
-                );
-            }
-        }
-    }
-}
-
-fn print_context_help(level: &ShellLevel) {
-    match level {
-        ShellLevel::Operational => {
-            println!("{}", "Operational Mode Commands:".bold().cyan());
-            println!("  {:<26} Discover live LXD/LAN containers & open ports", "scan [host|subnet]".yellow());
-            println!("  {:<26} Adopt discovered service into a DHCP or static VIP", "adopt <# | name> [vip X]".yellow());
-            println!("  {:<26} Bootstrap VIP + base SSH service config", "bootstrap <ip[/24]>...".yellow());
-            println!("  {:<26} Enter configuration mode", "configure".yellow());
-            println!("  {:<26} Show service, gateway & backend health table", "status".yellow());
-            println!("  {:<26} Show live active conntrack flows & bandwidth", "flows".yellow());
-            println!("  {:<26} List saved WireGuard configs (/data/wg)", "wg".yellow());
-            println!("  {:<26} Open nano to paste/edit a WireGuard .conf", "wg add <name>".yellow());
-            println!("  {:<26} Paste a WireGuard .conf directly in CLI", "wg paste <name>".yellow());
-            println!("  {:<26} Cloudflare Tunnel & DNS status / API token setup", "cf [status|token <KEY>]".yellow());
-            println!("  {:<26} Open live interactive TUI dashboard", "watch".yellow());
-            println!("  {:<26} Run active health probes right now", "probe".yellow());
-            println!("  {:<26} Show Nftyfile configuration", "show".yellow());
-            println!("  {:<26} Show allow-lists & resolved hosts", "show allow".yellow());
-            println!("  {:<26} Show compiled nftables ruleset", "show nft".yellow());
-            println!("  {:<26} Drain backend from load balancer", "drain <ip:port>".yellow());
-            println!("  {:<26} Re-enable drained backend", "enable <ip:port>".yellow());
-            println!("  {:<26} Change nfty login password", "password".yellow());
-            println!("  {:<26} Exit nfty", "exit".yellow());
-        }
-        ShellLevel::ConfigRoot => {
-            println!("{}", "Config Root Commands (nfty(config)#):".bold().cyan());
-            println!(
-                "  {:<32} Discover live LXD/LAN containers & open ports",
-                "scan [host|subnet]".yellow()
-            );
-            println!(
-                "  {:<32} Adopt discovered service (e.g. 'adopt 1' or 'adopt sonarr vip 192.168.1.4')",
-                "adopt <# | name> [vip <vip>]".yellow()
-            );
-            println!(
-                "  {:<32} Create/enter a static or DHCP VIP container (e.g. 'vip 192.168.1.4' or 'vip sonarr')",
-                "vip <ipv4[/cidr]|name>".yellow()
-            );
-            println!(
-                "  {:<32} Create/enter a Virtual Gateway (static IP or DHCP, e.g. 'gateway 192.168.1.10' or 'gateway mullvad')",
-                "gateway <ipv4[/cidr]|name>".yellow()
-            );
-            println!("  {:<32} Bootstrap VIP + base SSH service config", "bootstrap <ip[/24]>...".yellow());
-            println!(
-                "  {:<32} Enter global allow-list block (supports wildcards e.g. '*.office.lan', '192.168.1.*')",
-                "allow [pattern...]".yellow()
-            );
-            println!(
-                "  {:<32} Register/update hostname -> IP mapping for wildcard rules",
-                "host <hostname> <ipv4>".yellow()
-            );
-            println!("  {:<32} Delete a VIP, gateway, service, or allow entry", "no <vip|gateway|service|allow> <target>".yellow());
-            println!("  {:<32} Show candidate configuration", "show".yellow());
-            println!("  {:<32} Show live active conntrack flows", "flows".yellow());
-            println!("  {:<32} List saved WireGuard configs (/data/wg)", "wg".yellow());
-            println!("  {:<32} Open nano to paste/edit a WireGuard .conf", "wg add <name>".yellow());
-            println!("  {:<32} Paste a WireGuard .conf directly in CLI", "wg paste <name>".yellow());
-            println!("  {:<32} Cloudflare Tunnel & DNS setup (e.g. 'cf token <API_TOKEN>')", "cf [status|token|sync|logs]".yellow());
-            println!("  {:<32} Show allow-lists & resolved hosts", "show allow".yellow());
-            println!("  {:<32} Show generated nftables ruleset", "show nft".yellow());
-            println!("  {:<32} Compare candidate vs running config", "diff".yellow());
-            println!("  {:<32} Validate config & nftables dry-run", "test".yellow());
-            println!("  {:<32} Apply candidate config to kernel", "apply / commit".yellow());
-            println!("  {:<32} Apply with auto-rollback timer (e.g. 60s)", "apply confirm <secs>".yellow());
-            println!("  {:<32} Confirm a pending timed apply", "confirm".yellow());
-            println!("  {:<32} Rollback to previous committed config", "rollback [N]".yellow());
-            println!("  {:<32} Save config to Nftyfile", "save [path]".yellow());
-            println!("  {:<32} Exit back to operational mode", "exit / ..".yellow());
-        }
-        ShellLevel::Vip(k) => {
-            println!(
-                "{}",
-                format!("VIP '{}' Commands (nfty(config-vip:{})#):", k, k)
-                    .bold()
-                    .cyan()
-            );
-            println!("  {:<32} Map listen port to backend (e.g. '80 to sonarr:8989')", "<port> to <host:port>".yellow());
-            println!("  {:<32} Add/enter backend service on matching port (e.g. 'gamble:9090')", "<host_or_ip:port>".yellow());
-            println!("  {:<32} Enable local nfty SSH shell on this VIP", "ssh:22 (or 'ssh')".yellow());
-            println!("  {:<32} Lease VIP via DHCP + register hostname with UDM DNS", "dhcp [eth0|off]".yellow());
-            println!("  {:<32} Set 802.1Q VLAN tag (e.g. 'vlan 20')", "vlan <1-4094>".yellow());
-            println!("  {:<32} Set NIC interface / subnet CIDR (e.g. 'interface eth1/24')", "interface <iface[/prefix]>".yellow());
-            println!("  {:<32} Expose via Cloudflare Tunnel & DNS (e.g. 'cloudflare-dns app.domain.com')", "cloudflare-dns <fqdn>".yellow());
-            println!("  {:<32} Remove VLAN, DHCP, Cloudflare, SSH, or a forwarded service", "no <vlan|dhcp|cloudflare-dns|ssh:22|<target>>".yellow());
-            println!("  {:<32} Show this VIP block", "show".yellow());
-            println!("  {:<32} Return to config root", ".. / up / exit / top".yellow());
-        }
-        ShellLevel::VipService(k) => {
-            println!(
-                "{}",
-                format!("VIP '{}' Forwarded Services Mode (nfty(config-vip:{}-service)#):", k, k)
-                    .bold()
-                    .cyan()
-            );
-            println!("  {:<32} Create/enter backend service (e.g. 'plex:32400' or 'gamble:9090')", "<host_or_ip:port>".yellow());
-            println!("  {:<32} Create/enter service by listen port (e.g. '80' or '53/udp')", "<port[/proto]>".yellow());
-            println!("  {:<32} Remove a service from this VIP", "no <target>".yellow());
-            println!("  {:<32} Return to VIP {} prompt", ".. / up / exit".yellow(), k);
-        }
-        ShellLevel::GlobalAllow => {
-            println!("{}", "Global Allow-List Mode (nfty(config-allow)#):".bold().cyan());
-            println!("  {:<32} Allow wildcard domain (e.g. '*.office.lan')", "<*.domain.tld>".yellow());
-            println!("  {:<32} Allow IP wildcard (e.g. '192.168.1.*')", "<a.b.c.*>".yellow());
-            println!("  {:<32} Allow hostname or CIDR (e.g. 'admin.lan' or '10.0.0.0/8')", "<host|cidr>".yellow());
-            println!("  {:<32} Remove allow entry", "no <pattern>".yellow());
-            println!("  {:<32} Return to config root", ".. / up / exit".yellow());
-        }
-        ShellLevel::Service(k) => {
-            println!(
-                "{}",
-                format!("Service '{}' Settings (nfty(config-service:{})#):", k, k)
-                    .bold()
-                    .cyan()
-            );
-            println!("  {:<32} Override external VIP listen port (e.g. 'port 80')", "port <1-65535>".yellow());
-            println!("  {:<32} Set protocol ('tcp', 'udp', or 'both')", "proto <tcp|udp|both>".yellow());
-            println!("  {:<32} Enter backend targets prompt ('to' sub-level)", "to".yellow());
-            println!("  {:<32} Add backend directly in one line", "to <ip|host[:port]> [weight N] [backup]".yellow());
-            println!("  {:<32} Announce mDNS (*.local) + route HTTP Host / TLS SNI", "hostname <name.local>".yellow());
-            println!("  {:<32} Expose via Cloudflare Tunnel & DNS (e.g. 'cloudflare-dns app.domain.com')", "cloudflare-dns <fqdn>".yellow());
-            println!("  {:<32} Require Auth on Cloudflare Tunnel ('nfty', 'user:pass', or 'you@email.com')", "cloudflare-auth <rule...>".yellow());
-            println!("  {:<32} Load balance strategy", "balance <round-robin|sticky>".yellow());
-            println!("  {:<32} Bind Virtual IP to NIC (e.g. 'vip eth0/21')", "vip <interface[/prefix]>".yellow());
-            println!("  {:<32} Active health check", "check <tcp|http /path|ping> [5s]".yellow());
-            println!("  {:<32} Per-IP DDoS/rate limit guard", "limit <100/sec|600/min> [burst N] [per-ip]".yellow());
-            println!("  {:<32} Client IP mode (nat masquerade vs transparent)", "mode <nat|transparent>".yellow());
-            println!("  {:<32} Enter source host/wildcard allowlist prompt", "allow [pattern...]".yellow());
-            println!("  {:<32} Remove a directive or backend", "no <vip|hostname|check|limit|allow|to <ip>>".yellow());
-            println!("  {:<32} Show this service block", "show".yellow());
-            println!("  {:<32} Go up one level / jump to config root", ".. / exit / top".yellow());
-        }
-        ShellLevel::ServiceTo(k) => {
-            println!(
-                "{}",
-                format!("Service '{}' Backend Target Mode (nfty(config-service:{}-to)#):", k, k)
-                    .bold()
-                    .cyan()
-            );
-            println!("  {:<32} Add backend (e.g. 'plex:32400' or '192.168.1.60:9000')", "<ip|host[:port]>".yellow());
-            println!("  {:<32} Add weighted backend", "<ip|host[:port]> weight <1-100>".yellow());
-            println!("  {:<32} Add failover standby backend", "<ip|host[:port]> backup".yellow());
-            println!("  {:<32} Remove a backend", "no <ip|host[:port]>".yellow());
-            println!("  {:<32} Go back to service {} prompt", ".. / up / exit".yellow(), k);
-            println!("  {:<32} Jump back to config root", "top".yellow());
-        }
-        ShellLevel::ServiceAllow(k) => {
-            println!(
-                "{}",
-                format!("Service '{}' Source Allowlist Mode (nfty(config-service:{}-allow)#):", k, k)
-                    .bold()
-                    .cyan()
-            );
-            println!("  {:<32} Allow wildcard domain, IP wildcard, host, or CIDR (e.g. '*.office.lan', '192.168.1.*')", "<pattern>".yellow());
-            println!("  {:<32} Remove source pattern", "no <pattern>".yellow());
-            println!("  {:<32} Go back to service {} prompt", ".. / up / exit".yellow(), k);
-        }
-        ShellLevel::Gateway(k) => {
-            println!(
-                "{}",
-                format!("Virtual Gateway '{}' Commands (nfty(config-gateway:{})#):", k, k)
-                    .bold()
-                    .cyan()
-            );
-            println!("  {:<32} Enable local HTTP/HTTPS Privoxy on this gateway", "privoxy:8118 (or 'privoxy')".yellow());
-            println!("  {:<32} Enable local SOCKS5 proxy on this gateway", "socks5:1080 (or 'socks5')".yellow());
-            println!("  {:<32} Enable local nfty SSH shell on this gateway", "ssh:22 (or 'ssh')".yellow());
-            println!("  {:<32} Enter optional WireGuard tunnels sub-level", "tunnels".yellow());
-            println!("  {:<32} Add an optional WireGuard tunnel config directly", "tunnel <mullvad-us-sea-001.conf> [weight N]".yellow());
-            println!("  {:<32} Bind Virtual Gateway IP to NIC (e.g. 'vip eth0/21')", "vip <interface[/prefix]>".yellow());
-            println!("  {:<32} Announce mDNS name (e.g. 'hostname vpn.local')", "hostname <name.local>".yellow());
-            println!("  {:<32} Per-flow load balance strategy across tunnels", "balance <round-robin|sticky>".yellow());
-            println!("  {:<32} Toggle WAN leak kill-switch when tunnels are used", "killswitch <on|off>".yellow());
-            println!("  {:<32} Remove a tunnel, service, or directive", "no <privoxy|socks5|ssh|tunnel <name>|vip|killswitch>".yellow());
-            println!("  {:<32} Show this gateway block", "show".yellow());
-            println!("  {:<32} Go up one level / jump to config root", ".. / top".yellow());
-        }
-        ShellLevel::GatewayService(k) => {
-            println!(
-                "{}",
-                format!("Gateway '{}' Services Mode (nfty(config-gateway:{}-service)#):", k, k)
-                    .bold()
-                    .cyan()
-            );
-            println!("  {:<32} Enable HTTP/HTTPS Privoxy on this gateway", "privoxy:8118 (or 'privoxy')".yellow());
-            println!("  {:<32} Enable SOCKS5 proxy on this gateway", "socks5:1080 (or 'socks5')".yellow());
-            println!("  {:<32} Enable nfty SSH shell on this gateway IP", "ssh:22 (or 'ssh')".yellow());
-            println!("  {:<32} Disable a gateway service", "no <privoxy|socks5|ssh>".yellow());
-            println!("  {:<32} Return to gateway {} prompt", ".. / up / exit".yellow(), k);
-        }
-        ShellLevel::GatewayTunnels(k) => {
-            println!(
-                "{}",
-                format!("Gateway '{}' WireGuard Tunnels Mode (nfty(config-gateway:{}-tunnels)#):", k, k)
-                    .bold()
-                    .cyan()
-            );
-            println!("  {:<32} Open nano to paste new WireGuard config & attach it", "add <name> / nano <name>".yellow());
-            println!("  {:<32} Paste WireGuard config inline & attach it", "paste <name>".yellow());
-            println!("  {:<32} Add tunnel from /data/wg/<file> (opens nano if new)", "<mullvad-us-sea-001.conf> [weight N]".yellow());
-            println!("  {:<32} Add inline tunnel", "<wg0> address <ip/32> privkey <k> peer <pub> endpoint <ip:port>".yellow());
-            println!("  {:<32} Remove a tunnel", "no <name>".yellow());
-            println!("  {:<32} Return to gateway {} prompt", ".. / up / exit".yellow(), k);
-        }
     }
 }

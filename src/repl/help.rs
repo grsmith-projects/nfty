@@ -1,0 +1,500 @@
+use super::ShellLevel;
+use colored::Colorize;
+
+pub fn print_context_help(level: &ShellLevel) {
+    match level {
+        ShellLevel::Operational => {
+            println!("{}", "Operational Mode Commands:".bold().cyan());
+            println!(
+                "  {:<26} Discover live LXD/LAN containers & open ports",
+                "scan [host|subnet]".yellow()
+            );
+            println!(
+                "  {:<26} Adopt discovered service into a DHCP or static VIP",
+                "adopt <# | name> [vip X]".yellow()
+            );
+            println!(
+                "  {:<26} Bootstrap VIP + base SSH service config",
+                "bootstrap <ip[/24]>...".yellow()
+            );
+            println!("  {:<26} Enter configuration mode", "configure".yellow());
+            println!(
+                "  {:<26} Show service, gateway & backend health table",
+                "status".yellow()
+            );
+            println!(
+                "  {:<26} Show live active conntrack flows & bandwidth",
+                "flows".yellow()
+            );
+            println!(
+                "  {:<26} List saved WireGuard configs (/data/wg)",
+                "wg".yellow()
+            );
+            println!(
+                "  {:<26} Open nano to paste/edit a WireGuard .conf",
+                "wg add <name>".yellow()
+            );
+            println!(
+                "  {:<26} Paste a WireGuard .conf directly in CLI",
+                "wg paste <name>".yellow()
+            );
+            println!(
+                "  {:<26} Cloudflare Tunnel & DNS status / API token setup",
+                "cf [status|token <KEY>]".yellow()
+            );
+            println!(
+                "  {:<26} Open live interactive TUI dashboard",
+                "watch".yellow()
+            );
+            println!(
+                "  {:<26} Run active health probes right now",
+                "probe".yellow()
+            );
+            println!("  {:<26} Show Nftyfile configuration", "show".yellow());
+            println!(
+                "  {:<26} Show allow-lists & resolved hosts",
+                "show allow".yellow()
+            );
+            println!(
+                "  {:<26} Show compiled nftables ruleset",
+                "show nft".yellow()
+            );
+            println!(
+                "  {:<26} Drain backend from load balancer",
+                "drain <ip:port>".yellow()
+            );
+            println!(
+                "  {:<26} Re-enable drained backend",
+                "enable <ip:port>".yellow()
+            );
+            println!("  {:<26} Change nfty login password", "password".yellow());
+            println!("  {:<26} Exit nfty", "exit".yellow());
+        }
+        ShellLevel::ConfigRoot => {
+            println!("{}", "Config Root Commands (nfty(config)#):".bold().cyan());
+            println!(
+                "  {:<32} Discover live LXD/LAN containers & open ports",
+                "scan [host|subnet]".yellow()
+            );
+            println!(
+                "  {:<32} Adopt discovered service (e.g. 'adopt 1' or 'adopt sonarr vip 192.168.1.4')",
+                "adopt <# | name> [vip <vip>]".yellow()
+            );
+            println!(
+                "  {:<32} Create/enter a static or DHCP VIP container (e.g. 'vip 192.168.1.4' or 'vip sonarr')",
+                "vip <ipv4[/cidr]|name>".yellow()
+            );
+            println!(
+                "  {:<32} Create/enter a Virtual Gateway (static IP or DHCP, e.g. 'gateway 192.168.1.10' or 'gateway mullvad')",
+                "gateway <ipv4[/cidr]|name>".yellow()
+            );
+            println!(
+                "  {:<32} Bootstrap VIP + base SSH service config",
+                "bootstrap <ip[/24]>...".yellow()
+            );
+            println!(
+                "  {:<32} Enter global allow-list block (supports wildcards e.g. '*.office.lan', '192.168.1.*')",
+                "allow [pattern...]".yellow()
+            );
+            println!(
+                "  {:<32} Register/update hostname -> IP mapping for wildcard rules",
+                "host <hostname> <ipv4>".yellow()
+            );
+            println!(
+                "  {:<32} Delete a VIP, gateway, service, or allow entry",
+                "no <vip|gateway|service|allow> <target>".yellow()
+            );
+            println!("  {:<32} Show candidate configuration", "show".yellow());
+            println!(
+                "  {:<32} Show live active conntrack flows",
+                "flows".yellow()
+            );
+            println!(
+                "  {:<32} List saved WireGuard configs (/data/wg)",
+                "wg".yellow()
+            );
+            println!(
+                "  {:<32} Open nano to paste/edit a WireGuard .conf",
+                "wg add <name>".yellow()
+            );
+            println!(
+                "  {:<32} Paste a WireGuard .conf directly in CLI",
+                "wg paste <name>".yellow()
+            );
+            println!(
+                "  {:<32} Cloudflare Tunnel & DNS setup (e.g. 'cf token <API_TOKEN>')",
+                "cf [status|token|sync|logs]".yellow()
+            );
+            println!(
+                "  {:<32} Show allow-lists & resolved hosts",
+                "show allow".yellow()
+            );
+            println!(
+                "  {:<32} Show generated nftables ruleset",
+                "show nft".yellow()
+            );
+            println!(
+                "  {:<32} Compare candidate vs running config",
+                "diff".yellow()
+            );
+            println!(
+                "  {:<32} Validate config & nftables dry-run",
+                "test".yellow()
+            );
+            println!(
+                "  {:<32} Apply candidate config to kernel",
+                "apply / commit".yellow()
+            );
+            println!(
+                "  {:<32} Apply with auto-rollback timer (e.g. 60s)",
+                "apply confirm <secs>".yellow()
+            );
+            println!("  {:<32} Confirm a pending timed apply", "confirm".yellow());
+            println!(
+                "  {:<32} Rollback to previous committed config",
+                "rollback [N]".yellow()
+            );
+            println!("  {:<32} Save config to Nftyfile", "save [path]".yellow());
+            println!(
+                "  {:<32} Exit back to operational mode",
+                "exit / ..".yellow()
+            );
+        }
+        ShellLevel::Vip(k) => {
+            println!(
+                "{}",
+                format!("VIP '{}' Commands (nfty(config-vip:{})#):", k, k)
+                    .bold()
+                    .cyan()
+            );
+            println!(
+                "  {:<32} Map listen port to backend (e.g. '80 to sonarr:8989')",
+                "<port> to <host:port>".yellow()
+            );
+            println!(
+                "  {:<32} Add/enter backend service on matching port (e.g. 'gamble:9090')",
+                "<host_or_ip:port>".yellow()
+            );
+            println!(
+                "  {:<32} Enable local nfty SSH shell on this VIP",
+                "ssh:22 (or 'ssh')".yellow()
+            );
+            println!(
+                "  {:<32} Lease VIP via DHCP + register hostname with UDM DNS",
+                "dhcp [eth0|off]".yellow()
+            );
+            println!(
+                "  {:<32} Set 802.1Q VLAN tag (e.g. 'vlan 20')",
+                "vlan <1-4094>".yellow()
+            );
+            println!(
+                "  {:<32} Set NIC interface / subnet CIDR (e.g. 'interface eth1/24')",
+                "interface <iface[/prefix]>".yellow()
+            );
+            println!(
+                "  {:<32} Expose via Cloudflare Tunnel & DNS (e.g. 'cloudflare-dns app.domain.com')",
+                "cloudflare-dns <fqdn>".yellow()
+            );
+            println!(
+                "  {:<32} Remove VLAN, DHCP, Cloudflare, SSH, or a forwarded service",
+                "no <vlan|dhcp|cloudflare-dns|ssh:22|<target>>".yellow()
+            );
+            println!("  {:<32} Show this VIP block", "show".yellow());
+            println!(
+                "  {:<32} Return to config root",
+                ".. / up / exit / top".yellow()
+            );
+        }
+        ShellLevel::VipService(k) => {
+            println!(
+                "{}",
+                format!(
+                    "VIP '{}' Forwarded Services Mode (nfty(config-vip:{}-service)#):",
+                    k, k
+                )
+                .bold()
+                .cyan()
+            );
+            println!(
+                "  {:<32} Create/enter backend service (e.g. 'plex:32400' or 'gamble:9090')",
+                "<host_or_ip:port>".yellow()
+            );
+            println!(
+                "  {:<32} Create/enter service by listen port (e.g. '80' or '53/udp')",
+                "<port[/proto]>".yellow()
+            );
+            println!(
+                "  {:<32} Remove a service from this VIP",
+                "no <target>".yellow()
+            );
+            println!(
+                "  {:<32} Return to VIP {} prompt",
+                ".. / up / exit".yellow(),
+                k
+            );
+        }
+        ShellLevel::GlobalAllow => {
+            println!(
+                "{}",
+                "Global Allow-List Mode (nfty(config-allow)#):"
+                    .bold()
+                    .cyan()
+            );
+            println!(
+                "  {:<32} Allow wildcard domain (e.g. '*.office.lan')",
+                "<*.domain.tld>".yellow()
+            );
+            println!(
+                "  {:<32} Allow IP wildcard (e.g. '192.168.1.*')",
+                "<a.b.c.*>".yellow()
+            );
+            println!(
+                "  {:<32} Allow hostname or CIDR (e.g. 'admin.lan' or '10.0.0.0/8')",
+                "<host|cidr>".yellow()
+            );
+            println!("  {:<32} Remove allow entry", "no <pattern>".yellow());
+            println!("  {:<32} Return to config root", ".. / up / exit".yellow());
+        }
+        ShellLevel::Service(k) => {
+            println!(
+                "{}",
+                format!("Service '{}' Settings (nfty(config-service:{})#):", k, k)
+                    .bold()
+                    .cyan()
+            );
+            println!(
+                "  {:<32} Override external VIP listen port (e.g. 'port 80')",
+                "port <1-65535>".yellow()
+            );
+            println!(
+                "  {:<32} Set protocol ('tcp', 'udp', or 'both')",
+                "proto <tcp|udp|both>".yellow()
+            );
+            println!(
+                "  {:<32} Enter backend targets prompt ('to' sub-level)",
+                "to".yellow()
+            );
+            println!(
+                "  {:<32} Add backend directly in one line",
+                "to <ip|host[:port]> [weight N] [backup]".yellow()
+            );
+            println!(
+                "  {:<32} Announce mDNS (*.local) + route HTTP Host / TLS SNI",
+                "hostname <name.local>".yellow()
+            );
+            println!(
+                "  {:<32} Expose via Cloudflare Tunnel & DNS (e.g. 'cloudflare-dns app.domain.com')",
+                "cloudflare-dns <fqdn>".yellow()
+            );
+            println!(
+                "  {:<32} Require Auth on Cloudflare Tunnel ('nfty', 'user:pass', or 'you@email.com')",
+                "cloudflare-auth <rule...>".yellow()
+            );
+            println!(
+                "  {:<32} Load balance strategy",
+                "balance <round-robin|sticky>".yellow()
+            );
+            println!(
+                "  {:<32} Bind Virtual IP to NIC (e.g. 'vip eth0/21')",
+                "vip <interface[/prefix]>".yellow()
+            );
+            println!(
+                "  {:<32} Active health check",
+                "check <tcp|http /path|ping> [5s]".yellow()
+            );
+            println!(
+                "  {:<32} Per-IP DDoS/rate limit guard",
+                "limit <100/sec|600/min> [burst N] [per-ip]".yellow()
+            );
+            println!(
+                "  {:<32} Client IP mode (nat masquerade vs transparent)",
+                "mode <nat|transparent>".yellow()
+            );
+            println!(
+                "  {:<32} Enter source host/wildcard allowlist prompt",
+                "allow [pattern...]".yellow()
+            );
+            println!(
+                "  {:<32} Remove a directive or backend",
+                "no <vip|hostname|check|limit|allow|to <ip>>".yellow()
+            );
+            println!("  {:<32} Show this service block", "show".yellow());
+            println!(
+                "  {:<32} Go up one level / jump to config root",
+                ".. / exit / top".yellow()
+            );
+        }
+        ShellLevel::ServiceTo(k) => {
+            println!(
+                "{}",
+                format!(
+                    "Service '{}' Backend Target Mode (nfty(config-service:{}-to)#):",
+                    k, k
+                )
+                .bold()
+                .cyan()
+            );
+            println!(
+                "  {:<32} Add backend (e.g. 'plex:32400' or '192.168.1.60:9000')",
+                "<ip|host[:port]>".yellow()
+            );
+            println!(
+                "  {:<32} Add weighted backend",
+                "<ip|host[:port]> weight <1-100>".yellow()
+            );
+            println!(
+                "  {:<32} Add failover standby backend",
+                "<ip|host[:port]> backup".yellow()
+            );
+            println!("  {:<32} Remove a backend", "no <ip|host[:port]>".yellow());
+            println!(
+                "  {:<32} Go back to service {} prompt",
+                ".. / up / exit".yellow(),
+                k
+            );
+            println!("  {:<32} Jump back to config root", "top".yellow());
+        }
+        ShellLevel::ServiceAllow(k) => {
+            println!(
+                "{}",
+                format!(
+                    "Service '{}' Source Allowlist Mode (nfty(config-service:{}-allow)#):",
+                    k, k
+                )
+                .bold()
+                .cyan()
+            );
+            println!(
+                "  {:<32} Allow wildcard domain, IP wildcard, host, or CIDR (e.g. '*.office.lan', '192.168.1.*')",
+                "<pattern>".yellow()
+            );
+            println!("  {:<32} Remove source pattern", "no <pattern>".yellow());
+            println!(
+                "  {:<32} Go back to service {} prompt",
+                ".. / up / exit".yellow(),
+                k
+            );
+        }
+        ShellLevel::Gateway(k) => {
+            println!(
+                "{}",
+                format!(
+                    "Virtual Gateway '{}' Commands (nfty(config-gateway:{})#):",
+                    k, k
+                )
+                .bold()
+                .cyan()
+            );
+            println!(
+                "  {:<32} Enable local HTTP/HTTPS Privoxy on this gateway",
+                "privoxy:8118 (or 'privoxy')".yellow()
+            );
+            println!(
+                "  {:<32} Enable local SOCKS5 proxy on this gateway",
+                "socks5:1080 (or 'socks5')".yellow()
+            );
+            println!(
+                "  {:<32} Enable local nfty SSH shell on this gateway",
+                "ssh:22 (or 'ssh')".yellow()
+            );
+            println!(
+                "  {:<32} Enter optional WireGuard tunnels sub-level",
+                "tunnels".yellow()
+            );
+            println!(
+                "  {:<32} Add an optional WireGuard tunnel config directly",
+                "tunnel <mullvad-us-sea-001.conf> [weight N]".yellow()
+            );
+            println!(
+                "  {:<32} Bind Virtual Gateway IP to NIC (e.g. 'vip eth0/21')",
+                "vip <interface[/prefix]>".yellow()
+            );
+            println!(
+                "  {:<32} Announce mDNS name (e.g. 'hostname vpn.local')",
+                "hostname <name.local>".yellow()
+            );
+            println!(
+                "  {:<32} Per-flow load balance strategy across tunnels",
+                "balance <round-robin|sticky>".yellow()
+            );
+            println!(
+                "  {:<32} Toggle WAN leak kill-switch when tunnels are used",
+                "killswitch <on|off>".yellow()
+            );
+            println!(
+                "  {:<32} Remove a tunnel, service, or directive",
+                "no <privoxy|socks5|ssh|tunnel <name>|vip|killswitch>".yellow()
+            );
+            println!("  {:<32} Show this gateway block", "show".yellow());
+            println!(
+                "  {:<32} Go up one level / jump to config root",
+                ".. / top".yellow()
+            );
+        }
+        ShellLevel::GatewayService(k) => {
+            println!(
+                "{}",
+                format!(
+                    "Gateway '{}' Services Mode (nfty(config-gateway:{}-service)#):",
+                    k, k
+                )
+                .bold()
+                .cyan()
+            );
+            println!(
+                "  {:<32} Enable HTTP/HTTPS Privoxy on this gateway",
+                "privoxy:8118 (or 'privoxy')".yellow()
+            );
+            println!(
+                "  {:<32} Enable SOCKS5 proxy on this gateway",
+                "socks5:1080 (or 'socks5')".yellow()
+            );
+            println!(
+                "  {:<32} Enable nfty SSH shell on this gateway IP",
+                "ssh:22 (or 'ssh')".yellow()
+            );
+            println!(
+                "  {:<32} Disable a gateway service",
+                "no <privoxy|socks5|ssh>".yellow()
+            );
+            println!(
+                "  {:<32} Return to gateway {} prompt",
+                ".. / up / exit".yellow(),
+                k
+            );
+        }
+        ShellLevel::GatewayTunnels(k) => {
+            println!(
+                "{}",
+                format!(
+                    "Gateway '{}' WireGuard Tunnels Mode (nfty(config-gateway:{}-tunnels)#):",
+                    k, k
+                )
+                .bold()
+                .cyan()
+            );
+            println!(
+                "  {:<32} Open nano to paste new WireGuard config & attach it",
+                "add <name> / nano <name>".yellow()
+            );
+            println!(
+                "  {:<32} Paste WireGuard config inline & attach it",
+                "paste <name>".yellow()
+            );
+            println!(
+                "  {:<32} Add tunnel from /data/wg/<file> (opens nano if new)",
+                "<mullvad-us-sea-001.conf> [weight N]".yellow()
+            );
+            println!(
+                "  {:<32} Add inline tunnel",
+                "<wg0> address <ip/32> privkey <k> peer <pub> endpoint <ip:port>".yellow()
+            );
+            println!("  {:<32} Remove a tunnel", "no <name>".yellow());
+            println!(
+                "  {:<32} Return to gateway {} prompt",
+                ".. / up / exit".yellow(),
+                k
+            );
+        }
+    }
+}
