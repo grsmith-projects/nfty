@@ -1,4 +1,5 @@
 pub mod cloudflare;
+pub mod dns;
 pub mod flows;
 pub mod gateway_proxy;
 pub mod scanner;
@@ -11,6 +12,10 @@ pub use cloudflare::{
     sanitize_authenticated_http_request, save_cloudflare_config, service_uses_local_cf_auth_proxy,
     start_or_ensure_cloudflared_daemon, stop_cloudflared_daemon, CloudflareConfig,
     CF_LOCAL_AUTH_PORT,
+};
+pub use dns::{
+    compile_dnsmasq_config, dnsmasq_running_pid, handle_dns_cli_command, print_dns_status,
+    reconcile_dnsmasq, run_dns_lookup_test, run_dns_supervisor, stop_dnsmasq_daemon,
 };
 pub use flows::{print_flows_table, read_active_flows, ConntrackFlow};
 pub use gateway_proxy::run_gateway_proxy_supervisor;
@@ -51,9 +56,14 @@ pub fn spawn_advanced_feature_daemons(shared: SharedState) {
         cloudflare::run_cf_auth_proxy_listener(shared_cf_auth).await;
     });
 
-    let shared_gw_proxies = shared;
+    let shared_gw_proxies = shared.clone();
     tokio::spawn(async move {
         gateway_proxy::run_gateway_proxy_supervisor(shared_gw_proxies).await;
+    });
+
+    let shared_dns = shared;
+    tokio::spawn(async move {
+        dns::run_dns_supervisor(shared_dns).await;
     });
 }
 

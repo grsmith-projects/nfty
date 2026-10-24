@@ -1,5 +1,6 @@
 use crate::ast::{
-    Backend, BalanceStrategy, Config, ForwardMode, Gateway, GatewayPortForward, GatewayService,
+    Backend, BalanceStrategy, Config, DnsBlocklist, DnsConfig, DnsForwardZone, DnsNftAction,
+    DnsNftRule, DnsRecord, ForwardMode, Gateway, GatewayPortForward, GatewayService,
     GatewayServiceKind, HealthCheckConfig, HealthCheckKind, Proto, RateLimit, RateUnit, Service,
     VipConfig, WgTunnel,
 };
@@ -603,6 +604,7 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
         GatewayTunnels(Gateway),
         GatewayService(Gateway),
         GatewayAllow(Gateway),
+        Dns,
     }
 
     let mut ctx = ParseContext::Root;
@@ -624,6 +626,9 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                 ParseContext::Root => {
                     if stmt == "allow {" || stmt == "allow" {
                         ParseContext::GlobalAllow
+                    } else if stmt == "dns {" || stmt == "dns" {
+                        config.dns.get_or_insert_with(DnsConfig::default);
+                        ParseContext::Dns
                     } else if stmt.starts_with("allow ") {
                         for tok in stmt.split_whitespace().skip(1) {
                             let entry = validate_allow_entry(tok)
@@ -1009,6 +1014,16 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         ParseContext::GatewayAllow(gw)
                     }
                 }
+                ParseContext::Dns => {
+                    if stmt == "}" {
+                        ParseContext::Root
+                    } else {
+                        let dns = config.dns.get_or_insert_with(DnsConfig::default);
+                        apply_dns_directive(dns, stmt)
+                            .with_context(|| format!("Line {}", line_no))?;
+                        ParseContext::Dns
+                    }
+                }
             };
         }
     }
@@ -1016,6 +1031,7 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
     match ctx {
         ParseContext::Root
         | ParseContext::GlobalAllow
+        | ParseContext::Dns
         | ParseContext::Vip(_)
         | ParseContext::VipServices(_) => {}
         ParseContext::VipServiceItem(vip_key, svc, _)
@@ -1100,7 +1116,7 @@ pub fn parse_ip_and_optional_cidr(raw: &str) -> Result<(Ipv4Addr, Option<u8>)> {
 }
 
 /// Creates or looks up a service inside a `vip <ip> -> service` container from a spec such as:
-/// - `plex:32400` or `gamble:9090` or `192.168.1.165:32400` (backend host/IP:port, listen port defaults to backend port)
+/// - `plex:32400` or `app-backend:9090` or `169.254.1.165:32400` (backend host/IP:port, listen port defaults to backend port)
 /// - `ssh:22` or `ssh` (local SSH service on port 22 -> `127.0.0.1:22`)
 /// - `80` or `53/udp` (listen port on the VIP)
 pub fn insert_vip_service_disambiguated(
@@ -1240,7 +1256,7 @@ pub fn create_or_find_vip_service_by_key(
         }
     }
 
-    // 2. Built-in `ssh` / `ssh:22`
+    // 2. Built-in `ssh` / `ssh:22` and `dns` / `dns:53`
     let lower = spec.to_ascii_lowercase();
     if lower == "ssh" || lower.starts_with("ssh:") {
         let port = if let Some((_, p_str)) = lower.split_once(':') {
@@ -1265,6 +1281,30 @@ pub fn create_or_find_vip_service_by_key(
         config.services.insert(key.clone(), svc);
         return Ok(key);
     }
+    if lower == "dns" || lower.starts_with("dns:") {
+        let port = if let Some((_, p_str)) = lower.split_once(':') {
+            p_str
+                .parse::<u16>()
+                .with_context(|| format!("Invalid DNS port '{}'", p_str))?
+        } else {
+            53
+        };
+        let key = format!("{}:{}/both", vip_key, port);
+        let mut svc = Service::new(key.clone(), vip_ip_opt, port, Proto::Both);
+        svc.vip_id = Some(vip_key.to_string());
+        svc.name = Some(format!("dns:{}", port));
+        svc.vip = vip_cfg;
+        svc.backends.push(Backend {
+            host: None,
+            ip: Ipv4Addr::new(127, 0, 0, 1),
+            port: 53,
+            weight: 1,
+            backup: false,
+        });
+        config.dns.get_or_insert_with(DnsConfig::default);
+        config.services.insert(key.clone(), svc);
+        return Ok(key);
+    }
 
     // 3. Plain port or port/proto (e.g. `80`, `:80`, `53/udp`)
     let port_candidate = clean_spec.split('/').next().unwrap_or(clean_spec);
@@ -1280,7 +1320,7 @@ pub fn create_or_find_vip_service_by_key(
         return Ok(key);
     }
 
-    // 4. Target `<host_or_ip>:<port>` (e.g. `plex:32400`, `gamble:9090`, `192.168.1.165:32400`)
+    // 4. Target `<host_or_ip>:<port>` (e.g. `plex:32400`, `app-backend:9090`, `169.254.1.165:32400`)
     let b = parse_backend(&[spec], 80)?;
     let port = b.port;
     let key = format!("{}:{}", vip_key, port);
@@ -1430,7 +1470,7 @@ pub fn apply_service_directive(svc: &mut Service, stmt: &str) -> Result<()> {
         "cloudflare-auth" | "cf-auth" | "tunnel-auth" => {
             if tokens.len() < 2 {
                 bail!(
-                    "Expected email rule after '{}' (e.g. 'cloudflare-auth you@email.com' or 'cloudflare-auth *@smith.gr')",
+                    "Expected email rule after '{}' (e.g. 'cloudflare-auth you@example.com' or 'cloudflare-auth *@example.com')",
                     tokens[0]
                 );
             }
@@ -1859,8 +1899,12 @@ pub fn parse_gateway_service(raw: &str) -> Result<GatewayService> {
             kind: GatewayServiceKind::Ssh,
             port: port_opt.unwrap_or(22),
         }),
+        "dns" | "dnsmasq" => Ok(GatewayService {
+            kind: GatewayServiceKind::Dns,
+            port: port_opt.unwrap_or(53),
+        }),
         other => bail!(
-            "Unknown gateway service '{}' (valid gateway services: 'privoxy[:8118]', 'socks5[:1080]', 'ssh[:22]')",
+            "Unknown gateway service '{}' (valid gateway services: 'privoxy[:8118]', 'socks5[:1080]', 'ssh[:22]', 'dns[:53]')",
             other
         ),
     }
@@ -1926,6 +1970,526 @@ pub fn apply_gateway_no_directive(gw: &mut Gateway, tokens: &[&str]) -> Result<(
                 gw.tunnels.retain(|t| t.name != other && t.iface != other);
             }
         }
+    }
+    Ok(())
+}
+
+fn parse_bool_flag(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" | "enable" | "enabled" => Ok(true),
+        "off" | "false" | "no" | "0" | "disable" | "disabled" => Ok(false),
+        other => bail!("Expected 'on' or 'off' (got '{}')", other),
+    }
+}
+
+pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
+    let tokens: Vec<&str> = stmt.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    match tokens[0].to_ascii_lowercase().as_str() {
+        "listen" | "bind" => {
+            if tokens.len() < 2 {
+                bail!("Expected IP or IP:PORT after 'listen' (e.g. 'listen 169.254.10.10')");
+            }
+            for tok in &tokens[1..] {
+                let s = tok.trim().to_string();
+                if !s.is_empty() && !dns.listen.contains(&s) {
+                    dns.listen.push(s);
+                }
+            }
+        }
+        "domain" | "local-domain" | "suffix" => {
+            if tokens.len() < 2 {
+                bail!("Expected domain suffix after 'domain' (e.g. 'domain lan')");
+            }
+            let d = tokens[1].trim().trim_start_matches('.').to_ascii_lowercase();
+            dns.domain = if d == "none" || d == "off" {
+                None
+            } else {
+                Some(d)
+            };
+        }
+        "cache-size" | "cache" => {
+            if tokens.len() < 2 {
+                bail!("Expected number of entries after 'cache-size' (e.g. 'cache-size 10000')");
+            }
+            dns.cache_size = tokens[1]
+                .parse()
+                .with_context(|| format!("Invalid cache-size '{}'", tokens[1]))?;
+        }
+        "auto-vips" | "auto_vips" => {
+            dns.auto_vips = if tokens.len() >= 2 {
+                parse_bool_flag(tokens[1])?
+            } else {
+                true
+            };
+        }
+        "auto-hosts" | "auto_hosts" => {
+            dns.auto_hosts = if tokens.len() >= 2 {
+                parse_bool_flag(tokens[1])?
+            } else {
+                true
+            };
+        }
+        "health-aware" | "health_aware" => {
+            dns.health_aware = if tokens.len() >= 2 {
+                parse_bool_flag(tokens[1])?
+            } else {
+                true
+            };
+        }
+        "all-servers" | "all_servers" | "fastest" => {
+            dns.all_servers = if tokens.len() >= 2 {
+                parse_bool_flag(tokens[1])?
+            } else {
+                true
+            };
+        }
+        "bogus-priv" | "bogus_priv" => {
+            dns.bogus_priv = if tokens.len() >= 2 {
+                parse_bool_flag(tokens[1])?
+            } else {
+                true
+            };
+        }
+        "domain-needed" | "domain_needed" => {
+            dns.domain_needed = if tokens.len() >= 2 {
+                parse_bool_flag(tokens[1])?
+            } else {
+                true
+            };
+        }
+        "upstream" | "upstreams" | "server" | "nameserver" => {
+            if tokens.len() < 2 {
+                bail!("Expected upstream DNS IP[:PORT][@iface] after 'upstream' (e.g. 'upstream 1.1.1.1 9.9.9.9')");
+            }
+            // If replacing default upstreams on first explicit upstream command, allow clean list
+            for tok in &tokens[1..] {
+                if tok.eq_ignore_ascii_case("fastest") || tok.eq_ignore_ascii_case("all-servers") {
+                    dns.all_servers = true;
+                    continue;
+                }
+                let s = tok.trim().to_string();
+                if !s.is_empty() && !dns.upstreams.contains(&s) {
+                    dns.upstreams.push(s);
+                }
+            }
+        }
+        "forward" | "forward-zone" => {
+            if tokens.len() < 3 {
+                bail!("Usage: forward <domain> [to] <upstream-ip...> [via <gateway>]");
+            }
+            let domain = tokens[1]
+                .trim()
+                .trim_start_matches("*.")
+                .trim_start_matches('.')
+                .to_ascii_lowercase();
+            let mut servers = Vec::new();
+            let mut via_gateway = None;
+            let mut idx = 2;
+            if idx < tokens.len() && tokens[idx].eq_ignore_ascii_case("to") {
+                idx += 1;
+            }
+            while idx < tokens.len() {
+                if matches!(
+                    tokens[idx].to_ascii_lowercase().as_str(),
+                    "via" | "via-gateway" | "gateway"
+                ) {
+                    idx += 1;
+                    if idx >= tokens.len() {
+                        bail!("Expected gateway IP or name after 'via'");
+                    }
+                    via_gateway = Some(tokens[idx].to_string());
+                } else {
+                    servers.push(tokens[idx].to_string());
+                }
+                idx += 1;
+            }
+            if servers.is_empty() {
+                bail!("Expected at least one upstream DNS server for 'forward {}'", domain);
+            }
+            let fz = DnsForwardZone {
+                domain: domain.clone(),
+                servers,
+                via_gateway,
+            };
+            if let Some(existing) = dns.forward_zones.iter_mut().find(|x| x.domain == domain) {
+                *existing = fz;
+            } else {
+                dns.forward_zones.push(fz);
+            }
+        }
+        "a" | "host-record" => {
+            if tokens.len() < 3 {
+                bail!("Usage: a <hostname> <ipv4> [ipv4...]");
+            }
+            let name = tokens[1].trim().to_ascii_lowercase();
+            let mut ips = Vec::new();
+            for tok in &tokens[2..] {
+                let ip: Ipv4Addr = tok
+                    .parse()
+                    .with_context(|| format!("Invalid IPv4 address '{}' in A record", tok))?;
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+            dns.records
+                .retain(|r| !matches!(r, DnsRecord::A { name: n, .. } if n == &name));
+            dns.records.push(DnsRecord::A { name, ips });
+        }
+        "aaaa" => {
+            if tokens.len() < 3 {
+                bail!("Usage: aaaa <hostname> <ipv6>");
+            }
+            let name = tokens[1].trim().to_ascii_lowercase();
+            let ip = tokens[2].trim().to_string();
+            dns.records
+                .retain(|r| !matches!(r, DnsRecord::Aaaa { name: n, .. } if n == &name));
+            dns.records.push(DnsRecord::Aaaa { name, ip });
+        }
+        "address" | "wildcard" => {
+            if tokens.len() < 3 {
+                bail!("Usage: address <domain-or-wildcard> <ipv4> (e.g. 'address *.k8s.lan 169.254.10.80')");
+            }
+            let domain = tokens[1].trim().to_ascii_lowercase();
+            let ip: Ipv4Addr = tokens[2]
+                .parse()
+                .with_context(|| format!("Invalid IPv4 '{}' in address rule", tokens[2]))?;
+            dns.records
+                .retain(|r| !matches!(r, DnsRecord::Address { domain: d, .. } if d == &domain));
+            dns.records.push(DnsRecord::Address { domain, ip });
+        }
+        "cname" => {
+            if tokens.len() < 3 {
+                bail!("Usage: cname <alias> <target>");
+            }
+            let alias = tokens[1].trim().to_ascii_lowercase();
+            let target = tokens[2].trim().to_ascii_lowercase();
+            dns.records
+                .retain(|r| !matches!(r, DnsRecord::Cname { alias: a, .. } if a == &alias));
+            dns.records.push(DnsRecord::Cname { alias, target });
+        }
+        "txt" | "txt-record" => {
+            if tokens.len() < 3 {
+                bail!("Usage: txt <name> <text...>");
+            }
+            let name = tokens[1].trim().to_ascii_lowercase();
+            let text = tokens[2..]
+                .join(" ")
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            dns.records
+                .retain(|r| !matches!(r, DnsRecord::Txt { name: n, .. } if n == &name));
+            dns.records.push(DnsRecord::Txt { name, text });
+        }
+        "srv" | "srv-host" => {
+            if tokens.len() < 3 {
+                bail!("Usage: srv <_service._proto.domain> <target:port> [priority] [weight]");
+            }
+            let service = tokens[1].trim().to_ascii_lowercase();
+            let (target, port) = if let Some((t, p_str)) = tokens[2].rsplit_once(':') {
+                let p: u16 = p_str
+                    .parse()
+                    .with_context(|| format!("Invalid SRV port '{}'", p_str))?;
+                (t.to_ascii_lowercase(), p)
+            } else if tokens.len() >= 4 {
+                let p: u16 = tokens[3]
+                    .parse()
+                    .with_context(|| format!("Invalid SRV port '{}'", tokens[3]))?;
+                let priority = tokens.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+                let weight = tokens.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+                dns.records
+                    .retain(|r| !matches!(r, DnsRecord::Srv { service: s, .. } if s == &service));
+                dns.records.push(DnsRecord::Srv {
+                    service,
+                    target: tokens[2].to_ascii_lowercase(),
+                    port: p,
+                    priority,
+                    weight,
+                });
+                return Ok(());
+            } else {
+                bail!("Expected <target:port> in SRV record");
+            };
+            let mut priority: u16 = 0;
+            let mut weight: u16 = 0;
+            let mut positional_nums = Vec::new();
+            let mut idx = 3;
+            while idx < tokens.len() {
+                match tokens[idx].to_ascii_lowercase().as_str() {
+                    "priority" | "prio" | "pref" => {
+                        idx += 1;
+                        if let Some(v) = tokens.get(idx).and_then(|s| s.parse().ok()) {
+                            priority = v;
+                        }
+                    }
+                    "weight" | "w" => {
+                        idx += 1;
+                        if let Some(v) = tokens.get(idx).and_then(|s| s.parse().ok()) {
+                            weight = v;
+                        }
+                    }
+                    other => {
+                        if let Ok(v) = other.parse::<u16>() {
+                            positional_nums.push(v);
+                        }
+                    }
+                }
+                idx += 1;
+            }
+            if !positional_nums.is_empty() {
+                priority = positional_nums[0];
+                if positional_nums.len() >= 2 {
+                    weight = positional_nums[1];
+                }
+            }
+            dns.records
+                .retain(|r| !matches!(r, DnsRecord::Srv { service: s, .. } if s == &service));
+            dns.records.push(DnsRecord::Srv {
+                service,
+                target,
+                port,
+                priority,
+                weight,
+            });
+        }
+        "mx" | "mx-host" => {
+            if tokens.len() < 3 {
+                bail!("Usage: mx <domain> <mail-host> [preference]");
+            }
+            let domain = tokens[1].trim().to_ascii_lowercase();
+            let target = tokens[2].trim().to_ascii_lowercase();
+            let mut preference: u16 = 10;
+            if let Some(tok3) = tokens.get(3) {
+                if matches!(
+                    tok3.to_ascii_lowercase().as_str(),
+                    "priority" | "prio" | "preference" | "pref"
+                ) {
+                    if let Some(v) = tokens.get(4).and_then(|s| s.parse().ok()) {
+                        preference = v;
+                    }
+                } else if let Ok(v) = tok3.parse::<u16>() {
+                    preference = v;
+                }
+            }
+            dns.records.retain(|r| {
+                !matches!(r, DnsRecord::Mx { domain: d, target: t, .. } if d == &domain && t == &target)
+            });
+            dns.records.push(DnsRecord::Mx {
+                domain,
+                target,
+                preference,
+            });
+        }
+        "ptr" | "ptr-record" => {
+            if tokens.len() < 3 {
+                bail!("Usage: ptr <ipv4> <hostname>");
+            }
+            let ip: Ipv4Addr = tokens[1]
+                .parse()
+                .with_context(|| format!("Invalid IPv4 '{}' in PTR record", tokens[1]))?;
+            let name = tokens[2].trim().to_ascii_lowercase();
+            dns.records
+                .retain(|r| !matches!(r, DnsRecord::Ptr { ip: i, .. } if *i == ip));
+            dns.records.push(DnsRecord::Ptr { ip, name });
+        }
+        "route" | "bypass" => {
+            let action = if tokens[0].eq_ignore_ascii_case("route") {
+                DnsNftAction::Route
+            } else {
+                DnsNftAction::Bypass
+            };
+            let sep_pos = tokens.iter().position(|t| {
+                matches!(
+                    t.to_ascii_lowercase().as_str(),
+                    "via" | "via-gateway" | "from" | "from-gateway" | "gateway" | "to"
+                )
+            });
+            let Some(pos) = sep_pos else {
+                bail!(
+                    "Usage: {} <domain...> {} <gateway>",
+                    tokens[0],
+                    if action == DnsNftAction::Route { "via" } else { "from" }
+                );
+            };
+            if pos < 2 || pos + 1 >= tokens.len() {
+                bail!("Expected domain(s) and gateway IP/name");
+            }
+            let domains: Vec<String> = tokens[1..pos]
+                .iter()
+                .map(|d| d.trim().to_ascii_lowercase())
+                .filter(|d| !d.is_empty())
+                .collect();
+            let gateway = tokens[pos + 1].trim().to_string();
+            if let Some(existing) = dns
+                .nft_rules
+                .iter_mut()
+                .find(|r| r.action == action && r.gateway == gateway)
+            {
+                for d in domains {
+                    if !existing.domains.contains(&d) {
+                        existing.domains.push(d);
+                    }
+                }
+            } else {
+                dns.nft_rules.push(DnsNftRule {
+                    action,
+                    domains,
+                    gateway,
+                });
+            }
+        }
+        "block" | "sinkhole" => {
+            if tokens.len() < 2 {
+                bail!("Expected domain(s) after 'block' (e.g. 'block *.telemetry.example.com')");
+            }
+            for tok in &tokens[1..] {
+                let d = tok.trim().to_ascii_lowercase();
+                if !d.is_empty() && !dns.blocks.contains(&d) {
+                    dns.blocks.push(d);
+                }
+            }
+        }
+        "blocklist" | "adblock" => {
+            if tokens.len() < 3 {
+                bail!("Usage: blocklist <name> <url-or-path>");
+            }
+            let name = tokens[1].trim().to_ascii_lowercase();
+            let url = tokens[2].trim().to_string();
+            if let Some(existing) = dns.blocklists.iter_mut().find(|b| b.name == name) {
+                existing.url = url;
+            } else {
+                dns.blocklists.push(DnsBlocklist { name, url });
+            }
+        }
+        "raw" | "dnsmasq" => {
+            if tokens.len() < 2 {
+                bail!("Expected raw dnsmasq option after 'raw' (e.g. 'raw localise-queries')");
+            }
+            let opt = tokens[1..].join(" ").trim_matches('"').to_string();
+            if !opt.is_empty() && !dns.raw_options.contains(&opt) {
+                dns.raw_options.push(opt);
+            }
+        }
+        "no" | "delete" | "remove" => {
+            apply_dns_no_directive(dns, &tokens[1..])?;
+        }
+        other => bail!(
+            "Unknown dns directive '{}'. Valid directives: listen, domain, cache-size, auto-vips, auto-hosts, health-aware, all-servers, upstream, forward, a, aaaa, address, cname, txt, srv, mx, ptr, route, bypass, block, blocklist, raw, no",
+            other
+        ),
+    }
+    Ok(())
+}
+
+pub fn apply_dns_no_directive(dns: &mut DnsConfig, tokens: &[&str]) -> Result<()> {
+    if tokens.is_empty() {
+        bail!("Expected item after 'no' (e.g. 'no listen', 'no upstream <ip>', 'no a <name>', 'no block <domain>')");
+    }
+    match tokens[0].to_ascii_lowercase().as_str() {
+        "listen" | "bind" => {
+            if tokens.len() == 1 {
+                dns.listen.clear();
+            } else {
+                dns.listen.retain(|x| x != tokens[1]);
+            }
+        }
+        "domain" => dns.domain = None,
+        "auto-vips" | "auto_vips" => dns.auto_vips = false,
+        "auto-hosts" | "auto_hosts" => dns.auto_hosts = false,
+        "health-aware" | "health_aware" => dns.health_aware = false,
+        "all-servers" | "all_servers" => dns.all_servers = false,
+        "bogus-priv" | "bogus_priv" => dns.bogus_priv = false,
+        "domain-needed" | "domain_needed" => dns.domain_needed = false,
+        "upstream" | "upstreams" | "server" => {
+            if tokens.len() == 1 {
+                dns.upstreams.clear();
+            } else {
+                dns.upstreams.retain(|x| x != tokens[1]);
+            }
+        }
+        "forward" | "forward-zone" => {
+            if tokens.len() == 1 {
+                dns.forward_zones.clear();
+            } else {
+                let dom = tokens[1].trim_start_matches("*.").trim_start_matches('.');
+                dns.forward_zones
+                    .retain(|x| !x.domain.eq_ignore_ascii_case(dom));
+            }
+        }
+        "a" | "aaaa" | "address" | "cname" | "txt" | "srv" | "mx" | "ptr" | "record" => {
+            if tokens.len() == 1 {
+                dns.records.clear();
+            } else {
+                let target = tokens[1].to_ascii_lowercase();
+                dns.records.retain(|r| match r {
+                    DnsRecord::A { name, .. }
+                    | DnsRecord::Aaaa { name, .. }
+                    | DnsRecord::Txt { name, .. }
+                    | DnsRecord::Ptr { name, .. } => name != &target && r.to_string() != target,
+                    DnsRecord::Address { domain, .. } | DnsRecord::Mx { domain, .. } => {
+                        domain != &target
+                    }
+                    DnsRecord::Cname { alias, .. } => alias != &target,
+                    DnsRecord::Srv { service, .. } => service != &target,
+                });
+            }
+        }
+        "route" => {
+            if tokens.len() == 1 {
+                dns.nft_rules.retain(|r| r.action != DnsNftAction::Route);
+            } else {
+                let target = tokens[1].to_ascii_lowercase();
+                for r in dns.nft_rules.iter_mut() {
+                    if r.action == DnsNftAction::Route {
+                        r.domains.retain(|d| d != &target);
+                    }
+                }
+                dns.nft_rules
+                    .retain(|r| !(r.action == DnsNftAction::Route && (r.domains.is_empty() || r.gateway == target)));
+            }
+        }
+        "bypass" => {
+            if tokens.len() == 1 {
+                dns.nft_rules.retain(|r| r.action != DnsNftAction::Bypass);
+            } else {
+                let target = tokens[1].to_ascii_lowercase();
+                for r in dns.nft_rules.iter_mut() {
+                    if r.action == DnsNftAction::Bypass {
+                        r.domains.retain(|d| d != &target);
+                    }
+                }
+                dns.nft_rules
+                    .retain(|r| !(r.action == DnsNftAction::Bypass && (r.domains.is_empty() || r.gateway == target)));
+            }
+        }
+        "block" | "sinkhole" => {
+            if tokens.len() == 1 {
+                dns.blocks.clear();
+            } else {
+                dns.blocks
+                    .retain(|b| !b.eq_ignore_ascii_case(tokens[1]));
+            }
+        }
+        "blocklist" | "adblock" => {
+            if tokens.len() == 1 {
+                dns.blocklists.clear();
+            } else {
+                dns.blocklists
+                    .retain(|b| !b.name.eq_ignore_ascii_case(tokens[1]));
+            }
+        }
+        "raw" | "dnsmasq" => {
+            if tokens.len() == 1 {
+                dns.raw_options.clear();
+            } else {
+                let pat = tokens[1..].join(" ");
+                dns.raw_options.retain(|r| !r.contains(&pat));
+            }
+        }
+        other => bail!("Unknown 'no {}' target in dns block", other),
     }
     Ok(())
 }

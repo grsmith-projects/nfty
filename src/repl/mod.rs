@@ -6,17 +6,17 @@ pub use completer::NftyHelper;
 pub use help::print_context_help;
 pub use status::{handle_show, print_config_diff, print_status, print_status_table};
 
-use crate::ast::{Gateway, Service};
+use crate::ast::{DnsConfig, Gateway, Service};
 use crate::compiler::{
     apply_vip_commands, generate_vip_commands, reconcile_dhcp_and_vlan_vips,
     reload_kernel_from_state, validate_config,
 };
 use crate::health::{refresh_allowlist_hosts, run_all_probes_once};
 use crate::parser::{
-    apply_gateway_directive, apply_service_directive, create_or_find_vip_service_by_key,
-    parse_backend, parse_gateway_service, parse_ip_and_optional_cidr, parse_nftyfile,
-    parse_service_spec, parse_vip, parse_vip_header, parse_vlan_id, parse_wg_tunnel,
-    remove_backend_from_service, validate_allow_entry,
+    apply_dns_directive, apply_gateway_directive, apply_service_directive,
+    create_or_find_vip_service_by_key, parse_backend, parse_gateway_service,
+    parse_ip_and_optional_cidr, parse_nftyfile, parse_service_spec, parse_vip, parse_vip_header,
+    parse_vlan_id, parse_wg_tunnel, remove_backend_from_service, validate_allow_entry,
 };
 use crate::state::{HealthState, PendingConfirm, SharedState};
 use crate::tui::run_watch_dashboard;
@@ -34,6 +34,7 @@ pub enum ShellLevel {
     Operational,
     ConfigRoot,
     GlobalAllow,
+    Dns,
     Vip(String),
     VipService(String),
     Service(String),
@@ -50,6 +51,7 @@ impl ShellLevel {
             ShellLevel::Operational => "nfty> ".to_string(),
             ShellLevel::ConfigRoot => "nfty(config)# ".to_string(),
             ShellLevel::GlobalAllow => "nfty(config-allow)# ".to_string(),
+            ShellLevel::Dns => "nfty(config-dns)# ".to_string(),
             ShellLevel::Vip(k) => format!("nfty(config-vip:{})# ", k),
             ShellLevel::VipService(k) => format!("nfty(config-vip:{}-service)# ", k),
             ShellLevel::Service(k) => format!("nfty(config-service:{})# ", k),
@@ -116,7 +118,8 @@ pub async fn run_repl(shared: SharedState) -> Result<()> {
                     | ShellLevel::Gateway(_)
                     | ShellLevel::GatewayTunnels(_)
                     | ShellLevel::GatewayService(_)
-                    | ShellLevel::GlobalAllow => {
+                    | ShellLevel::GlobalAllow
+                    | ShellLevel::Dns => {
                         *lvl = ShellLevel::ConfigRoot;
                         println!("^C (returned to config root)");
                     }
@@ -198,7 +201,10 @@ pub async fn handle_line(
                 ShellLevel::GatewayTunnels(k) | ShellLevel::GatewayService(k) => {
                     ShellLevel::Gateway(k.clone())
                 }
-                ShellLevel::Vip(_) | ShellLevel::Gateway(_) | ShellLevel::GlobalAllow => {
+                ShellLevel::Vip(_)
+                | ShellLevel::Gateway(_)
+                | ShellLevel::GlobalAllow
+                | ShellLevel::Dns => {
                     ShellLevel::ConfigRoot
                 }
                 ShellLevel::ConfigRoot => ShellLevel::Operational,
@@ -232,7 +238,10 @@ pub async fn handle_line(
                 ShellLevel::GatewayTunnels(k) | ShellLevel::GatewayService(k) => {
                     *lvl = ShellLevel::Gateway(k.clone());
                 }
-                ShellLevel::Vip(_) | ShellLevel::Gateway(_) | ShellLevel::GlobalAllow => {
+                ShellLevel::Vip(_)
+                | ShellLevel::Gateway(_)
+                | ShellLevel::GlobalAllow
+                | ShellLevel::Dns => {
                     *lvl = ShellLevel::ConfigRoot;
                 }
                 ShellLevel::ConfigRoot => {
@@ -316,6 +325,19 @@ pub async fn handle_line(
                 || matches!(cur_level, ShellLevel::Operational | ShellLevel::ConfigRoot) =>
         {
             if let Err(e) = crate::features::handle_cf_cli_command(&tokens[1..], shared) {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+            }
+            return false;
+        }
+        "dns"
+            if (cur_level == ShellLevel::Operational && tokens.len() == 1)
+                || (tokens.len() >= 2
+                    && matches!(
+                        tokens[1].to_ascii_lowercase().as_str(),
+                        "status" | "test" | "lookup" | "query" | "config" | "reload" | "flush"
+                    )) =>
+        {
+            if let Err(e) = crate::features::handle_dns_cli_command(&tokens[1..], shared) {
                 eprintln!("{} {}", "Error:".red().bold(), e);
             }
             return false;
@@ -420,7 +442,7 @@ pub async fn handle_line(
             "configure" | "conf" | "config" | "edit" => {
                 *level.lock().unwrap() = ShellLevel::ConfigRoot;
             }
-            "vip" | "service" | "gateway" | "allow" => {
+            "vip" | "service" | "gateway" | "allow" | "dns" => {
                 *level.lock().unwrap() = ShellLevel::ConfigRoot;
                 if let Err(e) = handle_config_root_command(trimmed, level, shared) {
                     eprintln!("{} {}", "Error:".red().bold(), e);
@@ -443,6 +465,11 @@ pub async fn handle_line(
         }
         ShellLevel::GlobalAllow => {
             if let Err(e) = handle_global_allow_command(trimmed, shared) {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+            }
+        }
+        ShellLevel::Dns => {
+            if let Err(e) = handle_dns_level_command(trimmed, level, shared) {
                 eprintln!("{} {}", "Error:".red().bold(), e);
             }
         }
@@ -674,6 +701,10 @@ fn handle_config_root_command(
             println!("  {} Updated gateway {}", "✔".green().bold(), k.bold());
             st.candidate.gateways.insert(k, gw);
         }
+        if let Some(dns_cfg) = parsed.dns {
+            println!("  {} Updated dns block", "✔".green().bold());
+            st.candidate.dns = Some(dns_cfg);
+        }
         st.sync_runtime_entries();
         return Ok(());
     }
@@ -689,6 +720,18 @@ fn handle_config_root_command(
                 *level.lock().unwrap() = ShellLevel::GlobalAllow;
             } else {
                 handle_global_allow_command(&tokens[1..].join(" "), shared)?;
+            }
+            Ok(())
+        }
+        "dns" => {
+            {
+                let mut st = shared.write().unwrap();
+                st.candidate.dns.get_or_insert_with(DnsConfig::default);
+            }
+            if tokens.len() == 1 {
+                *level.lock().unwrap() = ShellLevel::Dns;
+            } else {
+                handle_dns_level_command(&tokens[1..].join(" "), level, shared)?;
             }
             Ok(())
         }
@@ -857,7 +900,24 @@ fn handle_config_root_command(
         }
         "no" | "delete" | "remove" => {
             if tokens.len() < 2 {
-                bail!("Usage: no <vip|gateway|service|allow> <target>");
+                bail!("Usage: no <vip|gateway|service|allow|dns> [target]");
+            }
+            if tokens[1].eq_ignore_ascii_case("dns") {
+                let mut st = shared.write().unwrap();
+                if tokens.len() == 2 {
+                    st.candidate.dns = None;
+                    println!("  {} Removed global dns block", "✔".green().bold());
+                } else {
+                    let dns_cfg = st.candidate.dns.get_or_insert_with(DnsConfig::default);
+                    let rest = format!("no {}", tokens[2..].join(" "));
+                    apply_dns_directive(dns_cfg, &rest)?;
+                    println!(
+                        "  {} [dns] {}",
+                        "✔".green().bold(),
+                        rest.bold()
+                    );
+                }
+                return Ok(());
             }
             if tokens[1].eq_ignore_ascii_case("allow") {
                 let mut st = shared.write().unwrap();
@@ -954,6 +1014,28 @@ fn handle_config_root_command(
             }
         }
     }
+}
+
+fn handle_dns_level_command(
+    trimmed: &str,
+    level: &Arc<Mutex<ShellLevel>>,
+    shared: &SharedState,
+) -> Result<()> {
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let first_lower = tokens[0].to_ascii_lowercase();
+    if matches!(first_lower.as_str(), "vip" | "gateway" | "service") {
+        *level.lock().unwrap() = ShellLevel::ConfigRoot;
+        return handle_config_root_command(trimmed, level, shared);
+    }
+
+    let mut st = shared.write().unwrap();
+    let dns_cfg = st.candidate.dns.get_or_insert_with(DnsConfig::default);
+    apply_dns_directive(dns_cfg, trimmed)?;
+    println!("  {} [dns] {}", "✔".green().bold(), trimmed.bold());
+    Ok(())
 }
 
 fn handle_global_allow_command(trimmed: &str, shared: &SharedState) -> Result<()> {
@@ -1151,7 +1233,24 @@ fn handle_vip_level_command(
             );
             return Ok(());
         }
-        _ if first_lower.starts_with("ssh:") => {
+        "dns" => {
+            let spec = if tokens.len() >= 2 && tokens[1].parse::<u16>().is_ok() {
+                format!("dns:{}", tokens[1])
+            } else {
+                "dns:53".to_string()
+            };
+            let mut st = shared.write().unwrap();
+            let _ = create_or_find_vip_service_by_key(&mut st.candidate, vip_key, &spec)?;
+            st.sync_runtime_entries();
+            println!(
+                "  {} [vip {}] + {}",
+                "✔".green().bold(),
+                vip_key.cyan(),
+                spec.bold()
+            );
+            return Ok(());
+        }
+        _ if first_lower.starts_with("ssh:") || first_lower.starts_with("dns:") => {
             let mut st = shared.write().unwrap();
             let _ = create_or_find_vip_service_by_key(&mut st.candidate, vip_key, tokens[0])?;
             st.sync_runtime_entries();
@@ -1527,7 +1626,7 @@ pub fn handle_adopt(
         (b.to_string(), name, b.port)
     } else {
         bail!(
-            "Could not find '{}' in discovered services. Run 'scan' first or specify '<host>:<port>' (e.g. 'adopt media-util:8989').",
+            "Could not find '{}' in discovered services. Run 'scan' first or specify '<host>:<port>' (e.g. 'adopt app-backend:8989').",
             args[0]
         );
     };
@@ -1888,7 +1987,7 @@ fn handle_gateway_service_command(
 
     if matches!(first_lower.as_str(), "no" | "delete" | "remove") {
         if tokens.len() < 2 {
-            bail!("Usage: no <privoxy|socks5|ssh>");
+            bail!("Usage: no <privoxy|socks5|ssh|dns>");
         }
         let gs = parse_gateway_service(tokens[1])?;
         let before = gw.services.len();

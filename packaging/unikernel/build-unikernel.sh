@@ -56,6 +56,17 @@ if [[ -f /usr/bin/wg ]]; then
     ln -sf /usr/bin/wg "$STAGE_DIR/sbin/wg"
 fi
 
+if [[ -f /usr/bin/dnsmasq ]]; then
+    cp /usr/bin/dnsmasq "$STAGE_DIR/usr/bin/dnsmasq"
+    ln -sf /usr/bin/dnsmasq "$STAGE_DIR/bin/dnsmasq"
+    ln -sf /usr/bin/dnsmasq "$STAGE_DIR/sbin/dnsmasq"
+    for lib in $(ldd /usr/bin/dnsmasq | awk '/=>/ {print $3}'); do
+        if [[ -f "$lib" ]]; then
+            cp -L "$lib" "$STAGE_DIR/usr/lib/"
+        fi
+    done
+fi
+
 if [[ -f "$ROOT_DIR/packaging/unikernel/cloudflared" ]]; then
     cp "$ROOT_DIR/packaging/unikernel/cloudflared" "$STAGE_DIR/bin/cloudflared"
     chmod +x "$STAGE_DIR/bin/cloudflared"

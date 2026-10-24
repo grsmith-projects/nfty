@@ -374,7 +374,7 @@ pub async fn refresh_allowlist_hosts(shared: &SharedState) {
 
     if changed {
         st.sync_runtime_entries();
-        if !st.running.services.is_empty() || !st.running.gateways.is_empty() {
+        if !st.running.is_empty() {
             let _ = reload_kernel_from_state(&mut st);
         }
     }

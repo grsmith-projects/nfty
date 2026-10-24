@@ -444,12 +444,12 @@ service 192.168.1.240:443 {
             ShellLevel::Vip("192.168.1.4".to_string())
         );
 
-        handle_line("80 to 192.168.3.165:9090", &level, &shared).await;
+        handle_line("80 to 169.254.3.165:9090", &level, &shared).await;
         assert_eq!(
             *level.lock().unwrap(),
             ShellLevel::Service("192.168.1.4:80".to_string())
         );
-        handle_line("hostname gamble.local", &level, &shared).await;
+        handle_line("hostname app.local", &level, &shared).await;
 
         let formatted = {
             let st = shared.read().unwrap();
@@ -458,7 +458,7 @@ service 192.168.1.240:443 {
         assert!(formatted.contains("vip 192.168.1.4 {"));
         assert!(!formatted.contains("vip eth0/21"));
         assert!(formatted.contains("192.168.1.165:32400 {"));
-        assert!(formatted.contains("80 to 192.168.3.165:9090 {"));
+        assert!(formatted.contains("80 to 169.254.3.165:9090 {"));
 
         let reparsed = parse_nftyfile(&formatted).expect("reparse formatted vip Nftyfile");
         assert!(reparsed.services.contains_key("192.168.1.4:32400"));
@@ -540,8 +540,8 @@ gateway mullvad {
             let mut st = shared.write().unwrap();
             st.discovered_services.push(crate::state::DiscoveredService {
                 index: 1,
-                host: Some("media-util".to_string()),
-                ip: Ipv4Addr::new(192, 168, 2, 215),
+                host: Some("app-backend".to_string()),
+                ip: Ipv4Addr::new(169, 254, 2, 215),
                 port: 8989,
                 service_name: "sonarr".to_string(),
                 banner: "Sonarr".to_string(),
@@ -615,5 +615,82 @@ gateway 169.254.10.20 {
 
         let roundtrip = parse_nftyfile(&cfg.format_nftyfile()).expect("roundtrip gateway forward");
         assert_eq!(roundtrip.gateways["169.254.10.20"].forwards.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dns_endpoint_and_nftset_compilation() {
+        let raw = r#"
+vip 169.254.1.4/24 {
+    dns:53
+    80 to 169.254.20.10:8989 {
+        hostname sonarr.local
+    }
+}
+gateway 169.254.1.10/24 {
+    dns:53
+    tunnels {
+        wg-exit-01.conf
+    }
+}
+dns {
+    domain lan
+    cache-size 10000
+    auto-vips on
+    auto-hosts on
+    health-aware on
+    upstream 1.1.1.1
+    upstream 9.9.9.9
+    forward corp.internal 169.254.99.1 via 169.254.1.10
+    a nas.lan 169.254.1.50
+    aaaa nas.lan fd00::50
+    address *.k8s.lan 169.254.1.100
+    cname media.lan sonarr.lan
+    txt _acme-challenge.example.com "token-xyz"
+    srv _minecraft._tcp.lan mc.lan:25565 priority 0 weight 5
+    mx lan mail.lan priority 10
+    ptr 169.254.1.50 nas.lan
+    route linuxisos.org tracker.example.org via 169.254.1.10
+    bypass plex.tv netflix.com from 169.254.1.10
+    block doubleclick.net *.ads.example.com
+}
+"#;
+        let cfg = parse_nftyfile(raw).expect("parse dns endpoint Nftyfile");
+        assert!(cfg.has_any_dns_enabled());
+        let dns = cfg.dns.as_ref().expect("dns config present");
+        assert_eq!(dns.domain.as_deref(), Some("lan"));
+        assert_eq!(dns.upstreams, vec!["1.1.1.1", "9.9.9.9"]);
+        assert_eq!(dns.forward_zones.len(), 1);
+        assert_eq!(dns.records.len(), 8);
+        assert_eq!(dns.nft_rules.len(), 2);
+        assert_eq!(dns.blocks.len(), 2);
+
+        let (conf_txt, hosts_txt) = crate::features::compile_dnsmasq_config(&cfg, None);
+        assert!(conf_txt.contains("listen-address=127.0.0.1"));
+        assert!(conf_txt.contains("listen-address=169.254.1.4"));
+        assert!(conf_txt.contains("listen-address=169.254.1.10"));
+        assert!(conf_txt.contains("server=1.1.1.1"));
+        assert!(conf_txt.contains("server=/corp.internal/169.254.99.1@wg0"));
+        assert!(conf_txt.contains("host-record=nas.lan,169.254.1.50"));
+        assert!(conf_txt.contains("host-record=nas.lan,fd00::50"));
+        assert!(conf_txt.contains("address=/k8s.lan/169.254.1.100"));
+        assert!(conf_txt.contains("cname=media.lan,sonarr.lan"));
+        assert!(conf_txt.contains("txt-record=_acme-challenge.example.com,\"token-xyz\""));
+        assert!(conf_txt.contains("srv-host=_minecraft._tcp.lan,mc.lan,25565,0,5"));
+        assert!(conf_txt.contains("mx-host=lan,mail.lan,10"));
+        assert!(conf_txt.contains("nftset=/linuxisos.org/tracker.example.org/4#ip#nfty#dns_route_169_254_1_10"));
+        assert!(conf_txt.contains("nftset=/plex.tv/netflix.com/4#ip#nfty#dns_bypass_169_254_1_10"));
+        assert!(conf_txt.contains("address=/doubleclick.net/0.0.0.0"));
+        assert!(hosts_txt.contains("sonarr sonarr.lan sonarr.local"));
+
+        let nft = compile_nft_ruleset(&cfg, None);
+        assert!(nft.contains("set dns_route_169_254_1_10 {"));
+        assert!(nft.contains("set dns_bypass_169_254_1_10 {"));
+        assert!(nft.contains("ip daddr @dns_bypass_169_254_1_10 counter accept"));
+        assert!(nft.contains("ip daddr @dns_route_169_254_1_10 jump mark_wg_0 accept"));
+
+        let roundtrip = parse_nftyfile(&cfg.format_nftyfile()).expect("roundtrip dns Nftyfile");
+        assert!(roundtrip.dns.is_some());
+        assert_eq!(roundtrip.dns.as_ref().unwrap().records.len(), 8);
+        assert_eq!(roundtrip.dns.as_ref().unwrap().nft_rules.len(), 2);
     }
 }

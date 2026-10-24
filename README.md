@@ -15,6 +15,10 @@
   - Binds static or DHCP virtual gateway IPs (`gateway 169.254.10.20` or `gateway lan-exit dhcp eth0`) that LAN machines or containers can use as their default IPv4 gateway (`ip route replace default via ...`).
   - **Direct Internet Gateway Mode**: When configured without WireGuard tunnels, `nfty` masquerades forwarded LAN traffic directly out the primary WAN/LAN interface (`eth0`), enforces optional source `allow` ACLs, and exposes built-in `privoxy:<port>` (HTTP/HTTPS `CONNECT`) and `socks5:<port>` proxies.
   - **WireGuard Multi-Tunnel Mode**: Aggregates one or more WireGuard `.conf` tunnels under the gateway IP using kernel `fwmark` policy routing (`ip rule` + per-tunnel routing tables), `ct mark` connection pinning, `killswitch on`, and inbound tunnel port forwarding (`forward <port> to <host:port>`).
+- **Programmable DNS Endpoint (`dnsmasq` + `nftset`)**:
+  - Supervises a native `dnsmasq` endpoint (`dns:53` on VIPs/gateways or global `dns { ... }`) that automatically synthesizes forward (`A`) and reverse (`PTR`) records from configured VIPs, gateways, `/etc/hosts`, and discovered LAN services, and dynamically removes unhealthy backends from DNS responses (`health-aware on`).
+  - Supports authoritative `a`, `aaaa`, wildcard `address`, `cname`, `txt`, `srv`, `mx`, and `ptr` records, split-horizon conditional zone forwarding (`forward <domain> <server> [via <gateway>]`), and domain sinkholing (`block` / `blocklist`).
+  - Integrates `dnsmasq`'s native `nftset=` engine with `table ip nfty` dynamic timeout sets (`@dns_route_<gw>` and `@dns_bypass_<gw>`) for zero-latency domain-based policy routing (`route <domain...> via <gateway>` and `bypass <domain...> from <gateway>`).
 - **Cloudflare Tunnel and Authentication**:
   - `cloudflare-dns <fqdn>` provisions a remotely-managed Cloudflare Tunnel, ingress rule, and proxied CNAME record via the Cloudflare API and supervises `cloudflared`.
   - `cloudflare-auth <email...>` configures Cloudflare Zero Trust Access self-hosted applications and email/domain allow policies (`user@example.com`, `*@example.com`).
@@ -217,7 +221,69 @@ Checking tunnel and auth status:
 nfty# cf status
 ```
 
-### 6. Service Discovery (`scan` / `adopt`) and Safe Rollbacks
+### 6. Programmable DNS Endpoint (`dnsmasq` + `nftset` Domain Routing)
+
+`nfty` can act as a full authoritative and caching DNS server on any VIP or gateway (`dns:53`) or via a global `dns { ... }` block. Under the hood, `nfty` compiles your `Nftyfile` and live health-check state into `/run/nfty-dnsmasq.conf` and `/run/nfty-dnsmasq.hosts`, signals `dnsmasq` via `SIGHUP` on host/health changes for zero-downtime cache preservation, and wires `dnsmasq`'s `nftset=` directive into kernel `table ip nfty` sets:
+
+```hcl
+vip 169.254.10.10/24 {
+    dns:53
+    80 to 169.254.20.10:8989 {
+        hostname sonarr.local
+    }
+}
+
+gateway 169.254.10.20/24 {
+    dns:53
+    killswitch on
+    tunnels {
+        wg-exit-01.conf
+    }
+}
+
+dns {
+    domain lan
+    cache-size 10000
+    auto-vips on
+    auto-hosts on
+    health-aware on
+
+    upstream 1.1.1.1
+    upstream 9.9.9.9
+    forward corp.internal 169.254.99.1 via 169.254.10.20
+
+    a nas.lan 169.254.1.50
+    aaaa nas.lan fd00::50
+    address *.k8s.lan 169.254.1.100
+    cname media.lan sonarr.lan
+    txt _acme-challenge.example.com "token-xyz"
+    srv _minecraft._tcp.lan mc.lan:25565 priority 0 weight 5
+    mx lan mail.lan priority 10
+
+    # Populate kernel nftables sets on DNS resolution to route or bypass gateways by domain:
+    route linuxisos.org tracker.example.org via 169.254.10.20
+    bypass plex.tv netflix.com from 169.254.10.20
+
+    block doubleclick.net *.ads.example.com
+}
+```
+
+Interactive CLI configuration and operational diagnostics:
+
+```text
+nfty# conf
+nfty(config)# dns
+nfty(config-dns)# domain lan
+nfty(config-dns)# a nas.lan 169.254.1.50
+nfty(config-dns)# address *.k8s.lan 169.254.1.100
+nfty(config-dns)# route linuxisos.org via 169.254.10.20
+nfty(config-dns)# bypass plex.tv from 169.254.10.20
+nfty(config-dns)# commit
+nfty# dns status
+nfty# dns test sonarr.lan
+```
+
+### 7. Service Discovery (`scan` / `adopt`) and Safe Rollbacks
 
 Scan the local subnet/ARP table for running containers and adopt a discovered service directly into a VIP:
 
@@ -242,6 +308,7 @@ nfty(config-vip:169.254.10.10)# confirm
   ```
 - Runtime tools required on the target host (or bundled into the appliance rootfs by `packaging/unikernel/build-unikernel.sh`):
   - `nft` (`nftables`)
+  - `dnsmasq` (compiled with `nftset` support, optional unless using `dns`)
   - `wg` (`wireguard-tools`, optional unless using `gateway` tunnels)
   - Static `busybox` at `packaging/unikernel/busybox` (for `ip`, `ping`, `udhcpc`, `mount`, `vi` inside the appliance image)
   - Optional `cloudflared` binary at `packaging/unikernel/cloudflared` (only required if using `cloudflare-dns`)
@@ -349,6 +416,7 @@ src/
 ├── tui.rs                   # Terminal dashboard (ratatui)
 ├── features/
 │   ├── mod.rs               # Background daemon supervisor and module re-exports
+│   ├── dns.rs               # dnsmasq config/hosts compiler, supervisor, nftset & DNS CLI
 │   ├── wireguard.rs         # WireGuard config parser, kernel wg/ip-rule sync, wg CLI
 │   ├── vhost_mdns.rs        # Multicast mDNS responder and L7 Host/SNI reverse proxy
 │   ├── gateway_proxy.rs     # Gateway-bound Privoxy (HTTP/CONNECT) and SOCKS5 proxies

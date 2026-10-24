@@ -54,6 +54,12 @@ USERLAND_APKS=(
     "zlib-1.3.2-r1.apk"
     "zstd-libs-1.5.6-r2.apk"
     "wireguard-tools-wg-1.0.20210914-r4.apk"
+    "dnsmasq-dnssec-nftset-2.90-r3.apk"
+    "nettle-3.10.2-r0.apk"
+    "libidn2-2.3.7-r0.apk"
+    "libunistring-1.2-r0.apk"
+    "libnfnetlink-1.0.2-r3.apk"
+    "libnetfilter_conntrack-1.0.9-r3.apk"
 )
 
 for apk in "${USERLAND_APKS[@]}"; do
@@ -90,7 +96,7 @@ if [[ -f "$STAGE_DIR/bin/busybox.static" ]]; then
     done
 fi
 
-# Ensure ip, nft, wg, and cloudflared are in standard PATH locations
+# Ensure ip, nft, wg, dnsmasq, and cloudflared are in standard PATH locations
 ln -sf /sbin/ip "$STAGE_DIR/bin/ip"
 ln -sf /sbin/ip "$STAGE_DIR/usr/bin/ip"
 ln -sf /usr/sbin/nft "$STAGE_DIR/bin/nft"
@@ -98,6 +104,9 @@ ln -sf /usr/sbin/nft "$STAGE_DIR/sbin/nft"
 ln -sf /usr/sbin/nft "$STAGE_DIR/usr/bin/nft"
 ln -sf /usr/bin/wg "$STAGE_DIR/bin/wg"
 ln -sf /usr/bin/wg "$STAGE_DIR/sbin/wg"
+ln -sf /usr/sbin/dnsmasq "$STAGE_DIR/usr/bin/dnsmasq"
+ln -sf /usr/sbin/dnsmasq "$STAGE_DIR/bin/dnsmasq"
+ln -sf /usr/sbin/dnsmasq "$STAGE_DIR/sbin/dnsmasq"
 
 cp "$CACHE_DIR/cloudflared-linux-arm64" "$STAGE_DIR/bin/cloudflared"
 chmod +x "$STAGE_DIR/bin/cloudflared"

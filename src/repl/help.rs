@@ -27,6 +27,10 @@ pub fn print_context_help(level: &ShellLevel) {
                 "flows".yellow()
             );
             println!(
+                "  {:<26} Inspect / test dnsmasq DNS endpoint",
+                "dns [status|test <host>|config]".yellow()
+            );
+            println!(
                 "  {:<26} List saved WireGuard configs (/data/wg)",
                 "wg".yellow()
             );
@@ -87,6 +91,10 @@ pub fn print_context_help(level: &ShellLevel) {
             println!(
                 "  {:<32} Create/enter a Virtual Gateway (static IP or DHCP, e.g. 'gateway 192.168.1.10' or 'gateway mullvad')",
                 "gateway <ipv4[/cidr]|name>".yellow()
+            );
+            println!(
+                "  {:<32} Configure authoritative DNS, split-horizon, & nftset routing",
+                "dns".yellow()
             );
             println!(
                 "  {:<32} Bootstrap VIP + base SSH service config",
@@ -172,12 +180,16 @@ pub fn print_context_help(level: &ShellLevel) {
                 "<port> to <host:port>".yellow()
             );
             println!(
-                "  {:<32} Add/enter backend service on matching port (e.g. 'gamble:9090')",
+                "  {:<32} Add/enter backend service on matching port (e.g. 'app-backend:9090')",
                 "<host_or_ip:port>".yellow()
             );
             println!(
                 "  {:<32} Enable local nfty SSH shell on this VIP",
                 "ssh:22 (or 'ssh')".yellow()
+            );
+            println!(
+                "  {:<32} Enable dnsmasq DNS endpoint on this VIP (UDP+TCP 53)",
+                "dns:53 (or 'dns')".yellow()
             );
             println!(
                 "  {:<32} Lease VIP via DHCP + register hostname with UDM DNS",
@@ -216,7 +228,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 .cyan()
             );
             println!(
-                "  {:<32} Create/enter backend service (e.g. 'plex:32400' or 'gamble:9090')",
+                "  {:<32} Create/enter backend service (e.g. 'plex:32400' or 'app-backend:9090')",
                 "<host_or_ip:port>".yellow()
             );
             println!(
@@ -254,6 +266,88 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!("  {:<32} Remove allow entry", "no <pattern>".yellow());
             println!("  {:<32} Return to config root", ".. / up / exit".yellow());
+        }
+        ShellLevel::Dns => {
+            println!(
+                "{}",
+                "Programmable DNS Endpoint Mode (nfty(config-dns)#):"
+                    .bold()
+                    .cyan()
+            );
+            println!(
+                "  {:<36} Set authoritative search domain (default: 'lan')",
+                "domain <lan|home.arpa>".yellow()
+            );
+            println!(
+                "  {:<36} Add upstream resolver (e.g. 'upstream 1.1.1.1 9.9.9.9')",
+                "upstream <ip[:port]>...".yellow()
+            );
+            println!(
+                "  {:<36} Forward specific domain zone to custom DNS server",
+                "forward <domain> <ip[:port]>".yellow()
+            );
+            println!(
+                "  {:<36} Auto-synthesize A/PTR records from VIPs & gateways",
+                "auto-vips <on|off>".yellow()
+            );
+            println!(
+                "  {:<36} Auto-synthesize A/PTR records from /etc/hosts & scan",
+                "auto-hosts <on|off>".yellow()
+            );
+            println!(
+                "  {:<36} Auto-remove unhealthy backends from DNS responses",
+                "health-aware <on|off>".yellow()
+            );
+            println!(
+                "  {:<36} Add authoritative A record (with automatic PTR)",
+                "a <fqdn> <ipv4>".yellow()
+            );
+            println!(
+                "  {:<36} Add authoritative AAAA record",
+                "aaaa <fqdn> <ipv6>".yellow()
+            );
+            println!(
+                "  {:<36} Wildcard domain override (e.g. 'address *.dev.lan 10.0.0.5')",
+                "address <*.domain> <ip>".yellow()
+            );
+            println!(
+                "  {:<36} Add CNAME alias record",
+                "cname <alias> <target>".yellow()
+            );
+            println!(
+                "  {:<36} Add TXT record (SPF, ACME, verification)",
+                "txt <fqdn> \"<text>\"".yellow()
+            );
+            println!(
+                "  {:<36} Add SRV record (_service._proto.domain target:port)",
+                "srv <_svc._proto.dom> <host:port> [prio N] [weight N]".yellow()
+            );
+            println!(
+                "  {:<36} Add MX record",
+                "mx <domain> <mailhost> [prio N]".yellow()
+            );
+            println!(
+                "  {:<36} Add explicit PTR reverse record",
+                "ptr <ipv4> <fqdn>".yellow()
+            );
+            println!(
+                "  {:<36} Route resolved domain IPs through a gateway via nftset",
+                "route <domain...> via <gw>".yellow()
+            );
+            println!(
+                "  {:<36} Bypass VPN gateway for resolved domain IPs via nftset",
+                "bypass <domain...> from <gw>".yellow()
+            );
+            println!(
+                "  {:<36} Sinkhole domain/wildcard to 0.0.0.0 + ::",
+                "block <*.domain...>".yellow()
+            );
+            println!(
+                "  {:<36} Remove a record, upstream, forward, or routing rule",
+                "no <a|aaaa|address|cname|txt|srv|mx|ptr|upstream|forward|route|bypass|block> <target>".yellow()
+            );
+            println!("  {:<36} Show this DNS block", "show".yellow());
+            println!("  {:<36} Return to config root", ".. / up / exit / top".yellow());
         }
         ShellLevel::Service(k) => {
             println!(
@@ -396,6 +490,10 @@ pub fn print_context_help(level: &ShellLevel) {
             println!(
                 "  {:<32} Enable local nfty SSH shell on this gateway",
                 "ssh:22 (or 'ssh')".yellow()
+            );
+            println!(
+                "  {:<32} Enable dnsmasq DNS endpoint on this gateway (UDP+TCP 53)",
+                "dns:53 (or 'dns')".yellow()
             );
             println!(
                 "  {:<32} Forward inbound tunnel port (TCP+UDP) to LAN host",

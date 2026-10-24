@@ -1,5 +1,5 @@
 use crate::ast::{
-    Backend, BalanceStrategy, Config, ForwardMode, GatewayServiceKind, Proto, Service,
+    Backend, BalanceStrategy, Config, DnsNftAction, ForwardMode, GatewayServiceKind, Proto, Service,
 };
 use crate::parser::expand_ip_wildcard_to_cidr;
 use crate::state::{AppState, HealthState};
@@ -72,7 +72,41 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
         }
     }
 
-    // 1b. If WireGuard Virtual Gateways have tunnels configured, emit per-tunnel mark chains + mangle_prerouting ECMP vmap
+    // 1b. Emit DNS-driven nftset dynamic routing/bypass sets if configured
+    let mut dns_route_gws = BTreeSet::new();
+    let mut dns_bypass_gws = BTreeSet::new();
+    if let Some(dns) = &config.dns {
+        for r in &dns.nft_rules {
+            if let Some(gw) = config.gateways.get(&r.gateway) {
+                match r.action {
+                    DnsNftAction::Route => {
+                        dns_route_gws.insert(gw.nft_id());
+                    }
+                    DnsNftAction::Bypass => {
+                        dns_bypass_gws.insert(gw.nft_id());
+                    }
+                }
+            }
+        }
+    }
+    for gw_id in &dns_bypass_gws {
+        out.push_str(&format!("    set dns_bypass_{} {{\n", gw_id));
+        out.push_str("        type ipv4_addr\n");
+        out.push_str("        size 65535\n");
+        out.push_str("        flags dynamic,timeout\n");
+        out.push_str("        timeout 1h\n");
+        out.push_str("    }\n\n");
+    }
+    for gw_id in &dns_route_gws {
+        out.push_str(&format!("    set dns_route_{} {{\n", gw_id));
+        out.push_str("        type ipv4_addr\n");
+        out.push_str("        size 65535\n");
+        out.push_str("        flags dynamic,timeout\n");
+        out.push_str("        timeout 1h\n");
+        out.push_str("    }\n\n");
+    }
+
+    // 1c. If WireGuard Virtual Gateways have tunnels configured, emit per-tunnel mark chains + mangle_prerouting ECMP vmap
     let any_wg_tunnels = config.gateways.values().any(|g| !g.tunnels.is_empty());
     let any_direct_gw = config.gateways.values().any(|g| g.tunnels.is_empty());
     if any_wg_tunnels {
@@ -115,6 +149,12 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
         }
         out.push_str("        iifname \"wg*\" accept\n");
         out.push_str("        ip daddr { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } accept\n");
+        for gw_id in &dns_bypass_gws {
+            out.push_str(&format!(
+                "        ip daddr @dns_bypass_{} counter accept comment \"nfty:dns-bypass={}\"\n",
+                gw_id, gw_id
+            ));
+        }
         out.push_str("        ct mark != 0x0 meta mark set ct mark accept\n");
 
         let wg_gw_count = config
@@ -146,6 +186,14 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                 }
             }
             base_idx += gw.tunnels.len();
+
+            let gw_id = gw.nft_id();
+            if dns_route_gws.contains(&gw_id) && !active_indices.is_empty() {
+                out.push_str(&format!(
+                    "        ip daddr @dns_route_{} jump mark_wg_{} accept\n",
+                    gw_id, active_indices[0]
+                ));
+            }
 
             // When multiple tunnel gateways exist and this gateway has its own dedicated DHCP/VLAN interface,
             // scope the mangle rule to traffic arriving on that interface.
@@ -439,6 +487,12 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
     }
     if any_direct_gw {
         out.push_str("        oifname \"eth0\" ip saddr != 127.0.0.0/8 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 } counter masquerade comment \"nfty:direct-gw-nat\"\n");
+    }
+    for gw_id in &dns_bypass_gws {
+        out.push_str(&format!(
+            "        oifname \"eth0\" ip saddr != 127.0.0.0/8 ip daddr @dns_bypass_{} counter masquerade comment \"nfty:dns-bypass-nat\"\n",
+            gw_id
+        ));
     }
     for svc in config.services.values() {
         match svc.mode {
@@ -1229,5 +1283,8 @@ pub fn reload_kernel_from_state(state: &mut AppState) -> Result<String> {
     }
     state.last_applied_nft = ruleset;
     state.kernel_applied = in_kernel;
+    if unsafe { libc::geteuid() == 0 } {
+        let _ = crate::features::reconcile_dnsmasq(&state.running, Some(state));
+    }
     Ok(msg)
 }

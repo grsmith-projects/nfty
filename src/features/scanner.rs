@@ -21,7 +21,7 @@ pub const SCAN_PORTS: &[(u16, &str)] = &[
     (7878, "radarr"),
     (8000, "http-alt"),
     (8006, "proxmox"),
-    (8080, "qbittorrent/web"),
+    (8080, "webui/http"),
     (8081, "sabnzbd"),
     (8096, "jellyfin"),
     (8112, "deluge"),
@@ -33,7 +33,7 @@ pub const SCAN_PORTS: &[(u16, &str)] = &[
     (8787, "readarr"),
     (8989, "sonarr"),
     (9000, "portainer"),
-    (9090, "gamble/prometheus"),
+    (9090, "prometheus/app"),
     (9091, "transmission"),
     (9117, "jackett"),
     (9696, "prowlarr"),
@@ -41,8 +41,9 @@ pub const SCAN_PORTS: &[(u16, &str)] = &[
 ];
 
 pub const COMMON_CONTAINER_HOSTNAMES: &[&str] = &[
-    "gamble",
-    "media-util",
+    "web",
+    "api",
+    "app-backend",
     "media",
     "sonarr",
     "radarr",
@@ -52,7 +53,7 @@ pub const COMMON_CONTAINER_HOSTNAMES: &[&str] = &[
     "bazarr",
     "overseerr",
     "jellyseerr",
-    "qbittorrent",
+    "torrent-box",
     "sabnzbd",
     "transmission",
     "deluge",
@@ -144,8 +145,6 @@ fn identify_http_banner(
         "jellyfin"
     } else if lower.contains("overseerr") || lower.contains("jellyseerr") || port == 5055 {
         "overseerr"
-    } else if lower.contains("qbittorrent") {
-        "qbittorrent"
     } else if lower.contains("sabnzbd") || port == 8081 {
         "sabnzbd"
     } else if lower.contains("transmission") || port == 9091 {
@@ -160,10 +159,6 @@ fn identify_http_banner(
         "grafana"
     } else if lower.contains("prometheus") {
         "prometheus"
-    } else if lower.contains("gamble")
-        || (port == 9090 && host.map(|h| h.contains("gamble")).unwrap_or(false))
-    {
-        "gamble"
     } else if let Some(h) = host {
         if default_name.contains('/') {
             h
@@ -237,15 +232,7 @@ async fn probe_single_port(
         }
         if service_name.contains('/') {
             if let Some(h) = &host {
-                if h.contains("gamble") && port == 9090 {
-                    service_name = "gamble".to_string();
-                } else {
-                    service_name = service_name
-                        .split('/')
-                        .next()
-                        .unwrap_or(&service_name)
-                        .to_string();
-                }
+                service_name = h.clone();
             } else {
                 service_name = service_name
                     .split('/')

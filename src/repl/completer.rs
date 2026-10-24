@@ -127,8 +127,55 @@ impl Completer for NftyHelper {
             match cmd0.as_str() {
                 "show" => {
                     let list = vec![
-                        "running", "candidate", "all", "nft", "allow", "hosts", "vips",
+                        "running",
+                        "candidate",
+                        "all",
+                        "nft",
+                        "allow",
+                        "hosts",
+                        "vips",
+                        "dns",
                     ];
+                    let matches = list
+                        .into_iter()
+                        .filter(|c| c.starts_with(prefix))
+                        .map(|c| Pair {
+                            display: c.to_string(),
+                            replacement: c.to_string(),
+                        })
+                        .collect();
+                    return Ok((start_pos, matches));
+                }
+                "dns" => {
+                    let lvl_now = self.level.lock().unwrap().clone();
+                    let list = if lvl_now == ShellLevel::Operational {
+                        vec!["status", "test", "config", "reload"]
+                    } else {
+                        vec![
+                            "status",
+                            "test",
+                            "config",
+                            "reload",
+                            "domain",
+                            "upstream",
+                            "forward",
+                            "a",
+                            "aaaa",
+                            "address",
+                            "cname",
+                            "txt",
+                            "srv",
+                            "mx",
+                            "ptr",
+                            "route",
+                            "bypass",
+                            "block",
+                            "blocklist",
+                            "auto-vips",
+                            "auto-hosts",
+                            "health-aware",
+                        ]
+                    };
                     let matches = list
                         .into_iter()
                         .filter(|c| c.starts_with(prefix))
@@ -287,6 +334,7 @@ impl Completer for NftyHelper {
                 "configure",
                 "status",
                 "flows",
+                "dns",
                 "wg",
                 "cf",
                 "watch",
@@ -305,6 +353,7 @@ impl Completer for NftyHelper {
                 "vip",
                 "gateway",
                 "service",
+                "dns",
                 "scan",
                 "adopt",
                 "bootstrap",
@@ -328,6 +377,66 @@ impl Completer for NftyHelper {
                 "password",
                 "exit",
                 "help",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            (ShellLevel::Dns, 0) => vec![
+                "listen",
+                "domain",
+                "cache-size",
+                "auto-vips",
+                "auto-hosts",
+                "health-aware",
+                "all-servers",
+                "bogus-priv",
+                "domain-needed",
+                "upstream",
+                "forward",
+                "a",
+                "aaaa",
+                "address",
+                "cname",
+                "txt",
+                "srv",
+                "mx",
+                "ptr",
+                "route",
+                "bypass",
+                "block",
+                "blocklist",
+                "raw",
+                "no",
+                "show",
+                "diff",
+                "test",
+                "apply",
+                "top",
+                "..",
+                "up",
+                "exit",
+                "help",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            (ShellLevel::Dns, 1) if cmd0 == "no" => vec![
+                "listen",
+                "upstream",
+                "forward",
+                "a",
+                "aaaa",
+                "address",
+                "cname",
+                "txt",
+                "srv",
+                "mx",
+                "ptr",
+                "route",
+                "bypass",
+                "block",
+                "blocklist",
+                "raw",
             ]
             .into_iter()
             .map(String::from)
@@ -357,6 +466,7 @@ impl Completer for NftyHelper {
                     "gateway".to_string(),
                     "service".to_string(),
                     "allow".to_string(),
+                    "dns".to_string(),
                 ]
             }
             (ShellLevel::ConfigRoot, 2) if cmd0 == "no" => {
@@ -387,6 +497,7 @@ impl Completer for NftyHelper {
                     "80",
                     "443",
                     "ssh:22",
+                    "dns:53",
                     "dhcp",
                     "vlan",
                     "interface",
@@ -498,8 +609,8 @@ impl Completer for NftyHelper {
                 "600/min per-ip".to_string(),
             ],
             (ShellLevel::Service(_), 1) if cmd0 == "cloudflare-auth" || cmd0 == "cf-auth" => vec![
-                "*@smith.gr".to_string(),
-                "you@email.com".to_string(),
+                "*@example.com".to_string(),
+                "you@example.com".to_string(),
             ],
             (ShellLevel::Service(_), 1) if cmd0 == "auth" => vec![
                 "admin:password".to_string(),
@@ -529,6 +640,7 @@ impl Completer for NftyHelper {
                 "privoxy:8118",
                 "socks5:1080",
                 "ssh:22",
+                "dns:53",
                 "forward",
                 "service",
                 "tunnels",
@@ -596,6 +708,7 @@ impl Completer for NftyHelper {
                 "privoxy:8118",
                 "socks5:1080",
                 "ssh:22",
+                "dns:53",
                 "no",
                 "show",
                 "top",

@@ -56,6 +56,19 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
                 }
                 return;
             }
+            "dns" => {
+                let cfg = if *level == ShellLevel::Operational {
+                    st.active_config()
+                } else {
+                    &st.candidate
+                };
+                if let Some(dns) = &cfg.dns {
+                    print!("{}", dns.format_block());
+                } else {
+                    println!("(No global dns block configured)");
+                }
+                return;
+            }
             _ => {}
         }
     }
@@ -66,6 +79,13 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
         }
         ShellLevel::ConfigRoot | ShellLevel::GlobalAllow => {
             print!("{}", st.candidate.format_nftyfile());
+        }
+        ShellLevel::Dns => {
+            if let Some(dns) = &st.candidate.dns {
+                print!("{}", dns.format_block());
+            } else {
+                println!("(No dns block configured)");
+            }
         }
         ShellLevel::Vip(k) | ShellLevel::VipService(k) => {
             print!("{}", st.candidate.format_vip_block_by_key(k));
@@ -144,9 +164,13 @@ pub fn print_status_table(shared: &SharedState) {
     let st = shared.read().unwrap();
     let cfg = st.active_config();
 
-    if cfg.vips.is_empty() && cfg.services.is_empty() && cfg.gateways.is_empty() {
+    if cfg.vips.is_empty()
+        && cfg.services.is_empty()
+        && cfg.gateways.is_empty()
+        && !cfg.has_any_dns_enabled()
+    {
         println!(
-            "No VIPs, services, or gateways configured. Run 'scan' to discover services or 'configure' -> 'vip <name>'."
+            "No VIPs, services, gateways, or DNS configured. Run 'scan' to discover services or 'configure' -> 'vip <name>'."
         );
         return;
     }
@@ -356,6 +380,40 @@ pub fn print_status_table(shared: &SharedState) {
                 );
             }
         }
+    }
+
+    if cfg.has_any_dns_enabled() {
+        let dns = cfg.dns.clone().unwrap_or_default();
+        let pid_state = if crate::features::dnsmasq_running_pid().is_some() {
+            "UP (dnsmasq)".green().to_string()
+        } else {
+            "READY (dnsmasq)".cyan().to_string()
+        };
+        let upstreams = if dns.upstreams.is_empty() {
+            "1.1.1.1,9.9.9.9".to_string()
+        } else {
+            dns.upstreams.join(",")
+        };
+        let rules_summary = format!(
+            "upstreams={} recs={} nftsets={}",
+            upstreams,
+            dns.records.len(),
+            dns.nft_rules.len()
+        );
+        let dom_label = dns.domain.as_deref().unwrap_or("lan");
+        println!(
+            "{:<22} {:<13} {:<28} {:<30} {:<31} {}",
+            "dns:53".cyan().bold(),
+            if dns.all_servers {
+                "all-servers"
+            } else {
+                "failover"
+            },
+            format!("domain:.{}", dom_label),
+            rules_summary,
+            pid_state,
+            "-"
+        );
     }
 }
 

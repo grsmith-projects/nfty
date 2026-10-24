@@ -253,7 +253,7 @@ pub struct Service {
     /// Optional parent VIP key (e.g. "192.168.1.4" or DHCP VIP hostname "sonarr")
     #[serde(default)]
     pub vip_id: Option<String>,
-    /// Optional human/target name inside a `vip <ip> -> service` container (e.g. "plex:32400", "gamble:9090", "ssh:22")
+    /// Optional human/target name inside a `vip <ip> -> service` container (e.g. "plex:32400", "app-backend:9090", "ssh:22")
     #[serde(default)]
     pub name: Option<String>,
     pub listen_ip: Option<Ipv4Addr>,
@@ -266,7 +266,7 @@ pub struct Service {
     /// Optional Cloudflare Tunnel public hostname (e.g. "sonarr.example.com") provisioned via Cloudflare API + cloudflared
     #[serde(default)]
     pub cloudflare: Option<String>,
-    /// Optional Cloudflare Tunnel / Access authentication rules (e.g. "user@domain.com", "*@smith.gr")
+    /// Optional Cloudflare Tunnel / Access authentication rules (e.g. "user@example.com", "*@example.com")
     #[serde(default)]
     pub cloudflare_auth: Vec<String>,
     /// Optional HTTP Basic Authentication rules (e.g. "user:pass", "nfty")
@@ -330,6 +330,13 @@ impl Service {
         {
             return "ssh:22".to_string();
         }
+        if self.backends.len() == 1
+            && self.backends[0].ip.is_loopback()
+            && self.backends[0].port == 53
+            && self.port == 53
+        {
+            return "dns:53".to_string();
+        }
         if self.backends.len() == 1 && self.backends[0].weight == 1 && !self.backends[0].backup {
             return self.backends[0].to_string();
         }
@@ -359,6 +366,14 @@ impl Service {
         self.backends.len() == 1
             && self.backends[0].ip.is_loopback()
             && self.backends[0].port == 22
+            && self.hostname.is_none()
+            && self.cloudflare.is_none()
+    }
+
+    pub fn is_local_dns(&self) -> bool {
+        self.backends.len() == 1
+            && self.backends[0].ip.is_loopback()
+            && self.backends[0].port == 53
             && self.hostname.is_none()
             && self.cloudflare.is_none()
     }
@@ -571,6 +586,7 @@ pub enum GatewayServiceKind {
     Privoxy,
     Socks5,
     Ssh,
+    Dns,
 }
 
 impl fmt::Display for GatewayServiceKind {
@@ -579,6 +595,7 @@ impl fmt::Display for GatewayServiceKind {
             GatewayServiceKind::Privoxy => write!(f, "privoxy"),
             GatewayServiceKind::Socks5 => write!(f, "socks5"),
             GatewayServiceKind::Ssh => write!(f, "ssh"),
+            GatewayServiceKind::Dns => write!(f, "dns"),
         }
     }
 }
@@ -742,11 +759,281 @@ impl Gateway {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum DnsRecord {
+    A {
+        name: String,
+        ips: Vec<Ipv4Addr>,
+    },
+    Aaaa {
+        name: String,
+        ip: String,
+    },
+    Address {
+        domain: String,
+        ip: Ipv4Addr,
+    },
+    Cname {
+        alias: String,
+        target: String,
+    },
+    Txt {
+        name: String,
+        text: String,
+    },
+    Srv {
+        service: String,
+        target: String,
+        port: u16,
+        priority: u16,
+        weight: u16,
+    },
+    Mx {
+        domain: String,
+        target: String,
+        preference: u16,
+    },
+    Ptr {
+        ip: Ipv4Addr,
+        name: String,
+    },
+}
+
+impl fmt::Display for DnsRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DnsRecord::A { name, ips } => {
+                let ip_strs: Vec<String> = ips.iter().map(|i| i.to_string()).collect();
+                write!(f, "a {} {}", name, ip_strs.join(" "))
+            }
+            DnsRecord::Aaaa { name, ip } => write!(f, "aaaa {} {}", name, ip),
+            DnsRecord::Address { domain, ip } => write!(f, "address {} {}", domain, ip),
+            DnsRecord::Cname { alias, target } => write!(f, "cname {} {}", alias, target),
+            DnsRecord::Txt { name, text } => write!(f, "txt {} \"{}\"", name, text),
+            DnsRecord::Srv {
+                service,
+                target,
+                port,
+                priority,
+                weight,
+            } => {
+                if *priority == 0 && *weight == 0 {
+                    write!(f, "srv {} {}:{}", service, target, port)
+                } else {
+                    write!(
+                        f,
+                        "srv {} {}:{} {} {}",
+                        service, target, port, priority, weight
+                    )
+                }
+            }
+            DnsRecord::Mx {
+                domain,
+                target,
+                preference,
+            } => write!(f, "mx {} {} {}", domain, target, preference),
+            DnsRecord::Ptr { ip, name } => write!(f, "ptr {} {}", ip, name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsForwardZone {
+    pub domain: String,
+    pub servers: Vec<String>,
+    #[serde(default)]
+    pub via_gateway: Option<String>,
+}
+
+impl fmt::Display for DnsForwardZone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "forward {} to {}", self.domain, self.servers.join(" "))?;
+        if let Some(gw) = &self.via_gateway {
+            write!(f, " via {}", gw)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsBlocklist {
+    pub name: String,
+    pub url: String,
+}
+
+impl fmt::Display for DnsBlocklist {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "blocklist {} {}", self.name, self.url)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsNftAction {
+    Route,
+    Bypass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsNftRule {
+    pub action: DnsNftAction,
+    pub domains: Vec<String>,
+    pub gateway: String,
+}
+
+impl fmt::Display for DnsNftRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.action {
+            DnsNftAction::Route => write!(
+                f,
+                "route {} via {}",
+                self.domains.join(" "),
+                self.gateway
+            ),
+            DnsNftAction::Bypass => write!(
+                f,
+                "bypass {} from {}",
+                self.domains.join(" "),
+                self.gateway
+            ),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_cache_size() -> u32 {
+    10000
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsConfig {
+    #[serde(default)]
+    pub listen: Vec<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default = "default_cache_size")]
+    pub cache_size: u32,
+    #[serde(default = "default_true")]
+    pub auto_vips: bool,
+    #[serde(default = "default_true")]
+    pub auto_hosts: bool,
+    #[serde(default = "default_true")]
+    pub health_aware: bool,
+    #[serde(default = "default_true")]
+    pub all_servers: bool,
+    #[serde(default = "default_true")]
+    pub bogus_priv: bool,
+    #[serde(default = "default_true")]
+    pub domain_needed: bool,
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub forward_zones: Vec<DnsForwardZone>,
+    #[serde(default)]
+    pub records: Vec<DnsRecord>,
+    #[serde(default)]
+    pub blocks: Vec<String>,
+    #[serde(default)]
+    pub blocklists: Vec<DnsBlocklist>,
+    #[serde(default)]
+    pub nft_rules: Vec<DnsNftRule>,
+    #[serde(default)]
+    pub raw_options: Vec<String>,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            listen: Vec::new(),
+            domain: Some("lan".to_string()),
+            cache_size: 10000,
+            auto_vips: true,
+            auto_hosts: true,
+            health_aware: true,
+            all_servers: true,
+            bogus_priv: true,
+            domain_needed: true,
+            upstreams: vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()],
+            forward_zones: Vec::new(),
+            records: Vec::new(),
+            blocks: Vec::new(),
+            blocklists: Vec::new(),
+            nft_rules: Vec::new(),
+            raw_options: Vec::new(),
+        }
+    }
+}
+
+impl DnsConfig {
+    pub fn format_block(&self) -> String {
+        let mut out = String::from("dns {\n");
+        if !self.listen.is_empty() {
+            out.push_str(&format!("    listen {}\n", self.listen.join(" ")));
+        }
+        if let Some(dom) = &self.domain {
+            out.push_str(&format!("    domain {}\n", dom));
+        }
+        if self.cache_size != 10000 {
+            out.push_str(&format!("    cache-size {}\n", self.cache_size));
+        }
+        out.push_str(&format!(
+            "    auto-vips {}\n",
+            if self.auto_vips { "on" } else { "off" }
+        ));
+        out.push_str(&format!(
+            "    auto-hosts {}\n",
+            if self.auto_hosts { "on" } else { "off" }
+        ));
+        if !self.health_aware {
+            out.push_str("    health-aware off\n");
+        }
+        if !self.all_servers {
+            out.push_str("    all-servers off\n");
+        }
+        if !self.bogus_priv {
+            out.push_str("    bogus-priv off\n");
+        }
+        if !self.domain_needed {
+            out.push_str("    domain-needed off\n");
+        }
+        if !self.upstreams.is_empty() {
+            out.push_str(&format!("    upstream {}\n", self.upstreams.join(" ")));
+        }
+        for fz in &self.forward_zones {
+            out.push_str(&format!("    {}\n", fz));
+        }
+        for rec in &self.records {
+            out.push_str(&format!("    {}\n", rec));
+        }
+        for nr in &self.nft_rules {
+            out.push_str(&format!("    {}\n", nr));
+        }
+        if !self.blocks.is_empty() {
+            out.push_str(&format!("    block {}\n", self.blocks.join(" ")));
+        }
+        for bl in &self.blocklists {
+            out.push_str(&format!("    {}\n", bl));
+        }
+        for raw in &self.raw_options {
+            out.push_str(&format!("    raw {}\n", raw));
+        }
+        out.push_str("}\n");
+        out
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     /// Global allow-list of hosts/CIDRs/wildcards applied across services (or referenced by them)
     #[serde(default)]
     pub global_allow: Vec<String>,
+    /// Optional dnsmasq-backed programmable DNS endpoint configuration (`dns { ... }`)
+    #[serde(default)]
+    pub dns: Option<DnsConfig>,
     /// Explicitly defined VIP containers (`vip 192.168.1.4 { ... }` or `vip sonarr { dhcp eth0 ... }`)
     #[serde(default)]
     pub vips: BTreeMap<String, VipConfig>,
@@ -759,6 +1046,7 @@ impl Config {
     pub fn new() -> Self {
         Self {
             global_allow: Vec::new(),
+            dns: None,
             vips: BTreeMap::new(),
             services: BTreeMap::new(),
             gateways: BTreeMap::new(),
@@ -770,6 +1058,16 @@ impl Config {
             && self.services.is_empty()
             && self.gateways.is_empty()
             && self.global_allow.is_empty()
+            && self.dns.is_none()
+    }
+
+    pub fn has_any_dns_enabled(&self) -> bool {
+        self.dns.is_some()
+            || self.services.values().any(|s| s.is_local_dns())
+            || self
+                .gateways
+                .values()
+                .any(|g| g.services.iter().any(|gs| gs.kind == GatewayServiceKind::Dns))
     }
 
     pub fn format_vip_block(&self, vip_ip: Ipv4Addr) -> String {
@@ -805,10 +1103,17 @@ impl Config {
         {
             out.push_str(&format!("    ssh:{}\n", svc.port));
         }
+        for svc in self
+            .services
+            .values()
+            .filter(|s| s.belongs_to_vip(vip_key) && s.is_local_dns())
+        {
+            out.push_str(&format!("    dns:{}\n", svc.port));
+        }
         let svcs: Vec<&Service> = self
             .services
             .values()
-            .filter(|s| s.belongs_to_vip(vip_key) && !s.is_local_ssh())
+            .filter(|s| s.belongs_to_vip(vip_key) && !s.is_local_ssh() && !s.is_local_dns())
             .collect();
         for svc in svcs {
             out.push_str(&svc.format_in_vip());
@@ -829,6 +1134,9 @@ impl Config {
             }
             blk.push_str("}\n");
             blocks.push(blk);
+        }
+        if let Some(dns) = &self.dns {
+            blocks.push(dns.format_block());
         }
         let mut vip_keys = std::collections::BTreeSet::new();
         for k in self.vips.keys() {
