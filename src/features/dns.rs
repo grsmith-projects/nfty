@@ -422,35 +422,71 @@ fn find_dnsmasq_binary() -> Option<&'static str> {
     None
 }
 
-/// Fetches or copies configured blocklists into `/data/dns/lists/<name>.hosts`
-pub fn sync_dns_blocklists(dns_cfg: &DnsConfig) -> Vec<String> {
+const BLOCKLIST_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn blocklist_needs_refresh(path: &str, force: bool) -> bool {
+    if force {
+        return true;
+    }
+    let Ok(meta) = fs::metadata(path) else {
+        return true;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    match modified.elapsed() {
+        Ok(age) => age >= BLOCKLIST_REFRESH_INTERVAL,
+        Err(_) => false,
+    }
+}
+
+/// Fetches or refreshes configured blocklists into `/data/dns/lists/<name>.hosts`.
+/// Re-downloads remote lists automatically when missing, older than 24 hours, or when `force` is true.
+/// Returns `(log_messages, any_file_changed)`.
+pub fn sync_dns_blocklists(dns_cfg: &DnsConfig, force: bool) -> (Vec<String>, bool) {
     let mut logs = Vec::new();
+    let mut changed = false;
     if dns_cfg.blocklists.is_empty() {
-        return logs;
+        return (logs, changed);
     }
     let _ = fs::create_dir_all(DNS_LISTS_DIR);
     for bl in &dns_cfg.blocklists {
         let dest = format!("{}/{}.hosts", DNS_LISTS_DIR, bl.name);
         if bl.url.starts_with("http://") || bl.url.starts_with("https://") {
-            if Path::new(&dest).exists() {
+            if !blocklist_needs_refresh(&dest, force) {
                 continue;
             }
-            if let Ok(resp) = ureq::get(&bl.url).timeout(Duration::from_secs(10)).call() {
+            if let Ok(resp) = ureq::get(&bl.url).timeout(Duration::from_secs(15)).call() {
                 if let Ok(body) = resp.into_string() {
                     let normalized = normalize_blocklist_to_hosts(&body);
-                    if fs::write(&dest, normalized).is_ok() {
-                        logs.push(format!("Downloaded blocklist '{}' -> {}", bl.name, dest));
+                    let count = normalized.lines().count();
+                    let prev = fs::read_to_string(&dest).unwrap_or_default();
+                    let tmp = format!("{}.tmp", dest);
+                    if fs::write(&tmp, &normalized).is_ok() && fs::rename(&tmp, &dest).is_ok() {
+                        if prev != normalized {
+                            changed = true;
+                        }
+                        logs.push(format!(
+                            "Synced blocklist '{}' ({} domains) -> {}",
+                            bl.name, count, dest
+                        ));
                     }
                 }
             }
         } else if Path::new(&bl.url).exists() && bl.url != dest {
             if let Ok(body) = fs::read_to_string(&bl.url) {
                 let normalized = normalize_blocklist_to_hosts(&body);
-                let _ = fs::write(&dest, normalized);
+                let prev = fs::read_to_string(&dest).unwrap_or_default();
+                let tmp = format!("{}.tmp", dest);
+                if fs::write(&tmp, &normalized).is_ok() && fs::rename(&tmp, &dest).is_ok() {
+                    if prev != normalized {
+                        changed = true;
+                    }
+                }
             }
         }
     }
-    logs
+    (logs, changed)
 }
 
 fn normalize_blocklist_to_hosts(raw: &str) -> String {
@@ -481,16 +517,18 @@ pub fn reconcile_dnsmasq(cfg: &Config, st: Option<&AppState>) -> Result<String> 
         return Ok("DNS disabled".to_string());
     }
 
-    if let Some(dns_cfg) = &cfg.dns {
-        let _ = sync_dns_blocklists(dns_cfg);
-    }
+    let blocklists_changed = if let Some(dns_cfg) = &cfg.dns {
+        sync_dns_blocklists(dns_cfg, false).1
+    } else {
+        false
+    };
 
     let (conf_txt, hosts_txt) = compile_dnsmasq_config(cfg, st);
     let old_conf = fs::read_to_string(DNSMASQ_CONF_PATH).unwrap_or_default();
     let old_hosts = fs::read_to_string(DNSMASQ_HOSTS_PATH).unwrap_or_default();
 
     let conf_changed = old_conf != conf_txt;
-    let hosts_changed = old_hosts != hosts_txt;
+    let hosts_changed = old_hosts != hosts_txt || blocklists_changed;
 
     if hosts_changed || !Path::new(DNSMASQ_HOSTS_PATH).exists() {
         fs::write(DNSMASQ_HOSTS_PATH, &hosts_txt)
@@ -534,9 +572,31 @@ pub fn reconcile_dnsmasq(cfg: &Config, st: Option<&AppState>) -> Result<String> 
 pub async fn run_dns_supervisor(shared: SharedState) {
     loop {
         if unsafe { libc::geteuid() == 0 } {
-            let st = shared.read().unwrap();
-            let cfg = st.active_config().clone();
-            let _ = reconcile_dnsmasq(&cfg, Some(&st));
+            let dns_cfg_opt = {
+                let st = shared.read().unwrap();
+                let cfg = st.active_config();
+                if cfg.has_any_dns_enabled() {
+                    cfg.dns.clone()
+                } else {
+                    None
+                }
+            };
+            let mut blocklists_updated = false;
+            if let Some(dns_cfg) = dns_cfg_opt {
+                blocklists_updated = sync_dns_blocklists(&dns_cfg, false).1;
+            }
+            {
+                let st = shared.read().unwrap();
+                let cfg = st.active_config().clone();
+                let _ = reconcile_dnsmasq(&cfg, Some(&st));
+            }
+            if blocklists_updated {
+                if let Some(pid) = dnsmasq_running_pid() {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGHUP);
+                    }
+                }
+            }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -799,14 +859,29 @@ pub fn handle_dns_cli_command(args: &[&str], shared: &SharedState) -> Result<()>
             print!("{}", hosts_txt);
         }
         "reload" | "flush" | "sync" => {
-            let st = shared.read().unwrap();
-            let cfg = st.active_config().clone();
+            let cfg = {
+                let st = shared.read().unwrap();
+                st.active_config().clone()
+            };
+            let mut blocklist_changed = false;
             if let Some(dns_cfg) = &cfg.dns {
-                for l in sync_dns_blocklists(dns_cfg) {
+                let (logs, changed) = sync_dns_blocklists(dns_cfg, true);
+                blocklist_changed = changed;
+                for l in logs {
                     println!("  → {}", l);
                 }
             }
-            let msg = reconcile_dnsmasq(&cfg, Some(&st))?;
+            let msg = {
+                let st = shared.read().unwrap();
+                reconcile_dnsmasq(&cfg, Some(&st))?
+            };
+            if blocklist_changed {
+                if let Some(pid) = dnsmasq_running_pid() {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGHUP);
+                    }
+                }
+            }
             println!("  {} {}", "✔".green(), msg);
         }
         other => bail!(
