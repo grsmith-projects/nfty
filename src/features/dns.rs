@@ -80,6 +80,9 @@ pub fn compile_dnsmasq_config(cfg: &Config, st: Option<&AppState>) -> (String, S
     conf.push_str(&format!("pid-file={}\n", DNSMASQ_PID_PATH));
     conf.push_str(&format!("cache-size={}\n", dns_cfg.cache_size));
     conf.push_str("localise-queries\n");
+    if !dns_cfg.auto_hosts {
+        conf.push_str("no-hosts\n");
+    }
 
     if dns_cfg.all_servers {
         conf.push_str("all-servers\n");
@@ -142,12 +145,7 @@ pub fn compile_dnsmasq_config(cfg: &Config, st: Option<&AppState>) -> (String, S
         })
         .and_then(|gw| find_healthy_wg_iface_for_gateway(cfg, st, &gw.key));
 
-    let upstreams = if dns_cfg.upstreams.is_empty() {
-        vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()]
-    } else {
-        dns_cfg.upstreams.clone()
-    };
-    for u in &upstreams {
+    for u in &dns_cfg.upstreams {
         let formatted = if let Some((srv, target)) = u.split_once('@') {
             if let Some(wg_if) = find_healthy_wg_iface_for_gateway(cfg, st, target) {
                 format!("{}@{}", srv.replace(':', "#"), wg_if)
@@ -265,6 +263,7 @@ pub fn compile_dnsmasq_config(cfg: &Config, st: Option<&AppState>) -> (String, S
         let d = b.trim_start_matches("*.").trim_start_matches('.');
         if !d.is_empty() {
             conf.push_str(&format!("address=/{}/0.0.0.0\n", d));
+            conf.push_str(&format!("address=/{}/::\n", d));
         }
     }
     for bl in &dns_cfg.blocklists {
@@ -781,7 +780,7 @@ fn query_udp_a_record(server: &str, domain: &str) -> Option<(Vec<Ipv4Addr>, Dura
     let mut buf = [0u8; 512];
     let (n, _) = sock.recv_from(&mut buf).ok()?;
     let elapsed = start.elapsed();
-    if n < 12 {
+    if n < 12 || buf[0] != 0x12 || buf[1] != 0x34 {
         return None;
     }
     let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
@@ -807,10 +806,18 @@ fn query_udp_a_record(server: &str, domain: &str) -> Option<(Vec<Ipv4Addr>, Dura
         if (buf[pos] & 0xC0) == 0xC0 {
             pos += 2;
         } else {
+            let mut jumped = false;
             while pos < n && buf[pos] != 0 {
+                if (buf[pos] & 0xC0) == 0xC0 {
+                    pos += 2;
+                    jumped = true;
+                    break;
+                }
                 pos += 1 + (buf[pos] as usize);
             }
-            pos += 1;
+            if !jumped && pos < n && buf[pos] == 0 {
+                pos += 1;
+            }
         }
         if pos + 10 > n {
             break;

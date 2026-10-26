@@ -13,7 +13,11 @@ fn find_hostname_ip(shared: &SharedState, qname: &str) -> Option<Ipv4Addr> {
     let cfg = st.active_config();
 
     for (vip_key, vip_cfg) in &cfg.vips {
-        if let Some(ip) = vip_cfg.leased_ip.or_else(|| vip_key.parse::<Ipv4Addr>().ok()) {
+        if let Some(ip) = vip_cfg
+            .leased_ip
+            .or_else(|| vip_key.parse::<Ipv4Addr>().ok())
+            .filter(|ip| !ip.is_unspecified())
+        {
             let k_clean = vip_key.trim_end_matches('.').to_ascii_lowercase();
             let k_local = if k_clean.ends_with(".local") {
                 k_clean.clone()
@@ -35,7 +39,17 @@ fn find_hostname_ip(shared: &SharedState, qname: &str) -> Option<Ipv4Addr> {
                 format!("{}.local", h_clean)
             };
             if q == h_clean || q == h_local {
-                if let Some(ip) = svc.listen_ip {
+                if let Some(ip) = svc
+                    .listen_ip
+                    .filter(|ip| !ip.is_unspecified())
+                    .or_else(|| {
+                        svc.vip_id
+                            .as_ref()
+                            .and_then(|vid| cfg.vips.get(vid))
+                            .and_then(|v| v.leased_ip)
+                            .filter(|ip| !ip.is_unspecified())
+                    })
+                {
                     return Some(ip);
                 }
             }
@@ -50,7 +64,7 @@ fn find_hostname_ip(shared: &SharedState, qname: &str) -> Option<Ipv4Addr> {
             } else {
                 format!("{}.local", h_clean)
             };
-            if q == h_clean || q == h_local {
+            if (q == h_clean || q == h_local) && !gw.listen_ip.is_unspecified() {
                 return Some(gw.listen_ip);
             }
         }
@@ -216,8 +230,8 @@ pub fn extract_host_or_sni(buf: &[u8]) -> Option<String> {
     if buf.is_empty() {
         return None;
     }
-    // 1. Check TLS ClientHello (0x16 = Handshake, 0x03 = SSL/TLS)
-    if buf.len() > 43 && buf[0] == 0x16 && buf[1] == 0x03 {
+    // 1. Check TLS ClientHello (0x16 = Handshake, 0x03 = SSL/TLS, 0x01 = ClientHello)
+    if buf.len() > 43 && buf[0] == 0x16 && buf[1] == 0x03 && buf[5] == 0x01 {
         if let Some(sni) = parse_tls_sni(buf) {
             return Some(sni.to_ascii_lowercase());
         }
@@ -239,6 +253,9 @@ pub fn extract_host_or_sni(buf: &[u8]) -> Option<String> {
 }
 
 fn parse_tls_sni(buf: &[u8]) -> Option<String> {
+    if buf.len() <= 43 || buf[5] != 0x01 {
+        return None;
+    }
     // TLS record header (5 bytes) + Handshake header (4 bytes) + Version (2) + Random (32) = 43
     let mut pos = 43;
     if pos >= buf.len() {
@@ -350,7 +367,14 @@ pub(crate) async fn run_l7_virtual_host_listener(shared: SharedState, listen_por
                 });
 
                 let mut found = None;
+                let peer_ip = match peer.ip() {
+                    std::net::IpAddr::V4(v4) => v4,
+                    std::net::IpAddr::V6(_) => Ipv4Addr::LOCALHOST,
+                };
                 if let Some(svc) = candidates.first() {
+                    if !st.is_ip_allowed(peer_ip, &svc.allow, &cfg.global_allow) {
+                        return;
+                    }
                     let active = st.active_backends_for_service(&svc.backends);
                     if !active.is_empty() {
                         let mut weighted_slots = Vec::new();

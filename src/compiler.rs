@@ -1,5 +1,6 @@
 use crate::ast::{
-    Backend, BalanceStrategy, Config, DnsNftAction, ForwardMode, GatewayServiceKind, Proto, Service,
+    Backend, BalanceStrategy, Config, DnsNftAction, ForwardMode, Gateway, GatewayServiceKind, Proto,
+    Service,
 };
 use crate::parser::expand_ip_wildcard_to_cidr;
 use crate::state::{AppState, HealthState};
@@ -18,6 +19,24 @@ pub fn resolve_service_allow_set(
     } else {
         let mut set = BTreeSet::new();
         for entry in config.global_allow.iter().chain(svc.allow.iter()) {
+            if let Some(cidr) = expand_ip_wildcard_to_cidr(entry) {
+                set.insert(cidr);
+            }
+        }
+        set.into_iter().collect()
+    }
+}
+
+pub fn resolve_gateway_allow_set(
+    gw: &Gateway,
+    config: &Config,
+    state: Option<&AppState>,
+) -> Vec<String> {
+    if let Some(st) = state {
+        st.expand_allow_elements(&gw.allow, &config.global_allow)
+    } else {
+        let mut set = BTreeSet::new();
+        for entry in config.global_allow.iter().chain(gw.allow.iter()) {
             if let Some(cidr) = expand_ip_wildcard_to_cidr(entry) {
                 set.insert(cidr);
             }
@@ -69,6 +88,31 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                 out.push_str("        timeout 1m\n");
                 out.push_str("    }\n\n");
             }
+        }
+    }
+
+    // 1a. Emit allowlist sets per gateway when configured
+    for gw in config.gateways.values() {
+        let has_allow_rules = !gw.allow.is_empty() || !config.global_allow.is_empty();
+        if has_allow_rules {
+            let gw_id = gw.nft_id();
+            let elements = resolve_gateway_allow_set(gw, config, state);
+            let raw_rules: Vec<&String> =
+                config.global_allow.iter().chain(gw.allow.iter()).collect();
+            out.push_str(&format!(
+                "    # allow-list rules for gateway {}: {:?}\n",
+                gw.key, raw_rules
+            ));
+            out.push_str(&format!("    set allow_gw_{} {{\n", gw_id));
+            out.push_str("        type ipv4_addr\n");
+            out.push_str("        flags interval\n");
+            if !elements.is_empty() {
+                out.push_str(&format!(
+                    "        elements = {{ {} }}\n",
+                    elements.join(", ")
+                ));
+            }
+            out.push_str("    }\n\n");
         }
     }
 
@@ -148,7 +192,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             }
         }
         out.push_str("        iifname \"wg*\" accept\n");
-        out.push_str("        ip daddr { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } accept\n");
+        out.push_str("        ip daddr { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 224.0.0.0/4, 255.255.255.255 } accept\n");
         for gw_id in &dns_bypass_gws {
             out.push_str(&format!(
                 "        ip daddr @dns_bypass_{} counter accept comment \"nfty:dns-bypass={}\"\n",
@@ -188,16 +232,22 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             base_idx += gw.tunnels.len();
 
             let gw_id = gw.nft_id();
+            let has_gw_allow = !gw.allow.is_empty() || !config.global_allow.is_empty();
+            let gw_allow_prefix = if has_gw_allow {
+                format!("ip saddr @allow_gw_{} ", gw_id)
+            } else {
+                String::new()
+            };
             if dns_route_gws.contains(&gw_id) && !active_indices.is_empty() {
                 out.push_str(&format!(
-                    "        ip daddr @dns_route_{} jump mark_wg_{} accept\n",
-                    gw_id, active_indices[0]
+                    "        {}ip daddr @dns_route_{} jump mark_wg_{} accept\n",
+                    gw_allow_prefix, gw_id, active_indices[0]
                 ));
             }
 
             // When multiple tunnel gateways exist and this gateway has its own dedicated DHCP/VLAN interface,
             // scope the mangle rule to traffic arriving on that interface.
-            let gw_scope_prefix = if wg_gw_count > 1 {
+            let mut gw_scope_prefix = if wg_gw_count > 1 {
                 if let Some(vip) = &gw.vip {
                     if vip.dhcp {
                         let mv = dhcp_macvlan_iface_name(&gw.key);
@@ -213,6 +263,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             } else {
                 String::new()
             };
+            gw_scope_prefix.push_str(&gw_allow_prefix);
 
             if active_indices.len() == 1 {
                 out.push_str(&format!(
@@ -316,13 +367,31 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             .collect();
         gw_tunnel_offset += gw.tunnels.len();
 
+        let has_gw_allow = !gw.allow.is_empty() || !config.global_allow.is_empty();
+        let gw_allow_guard = if has_gw_allow {
+            format!(" ip saddr @allow_gw_{}", gw.nft_id())
+        } else {
+            String::new()
+        };
+
         if !gw.listen_ip.is_unspecified() {
             for gs in &gw.services {
-                if gs.kind == GatewayServiceKind::Ssh {
-                    out.push_str(&format!(
-                        "\n        # --- gateway {} service ssh:{} ---\n        ip daddr {} tcp dport {} counter redirect to :22 comment \"nfty:gw-ssh={}\"\n",
-                        gw.key, gs.port, gw.listen_ip, gs.port, gw.key
-                    ));
+                match gs.kind {
+                    GatewayServiceKind::Ssh => {
+                        out.push_str(&format!(
+                            "\n        # --- gateway {} service ssh:{} ---\n        ip daddr {} tcp dport {}{} counter redirect to :22 comment \"nfty:gw-ssh={}\"\n",
+                            gw.key, gs.port, gw.listen_ip, gs.port, gw_allow_guard, gw.key
+                        ));
+                    }
+                    GatewayServiceKind::Api => {
+                        out.push_str(&format!(
+                            "\n        # --- gateway {} service api:{} ---\n        ip daddr {} tcp dport {}{} counter redirect to :{} comment \"nfty:gw-api={}\"\n",
+                            gw.key, gs.port, gw.listen_ip, gs.port, gw_allow_guard, gs.port, gw.key
+                        ));
+                    }
+                    GatewayServiceKind::Privoxy
+                    | GatewayServiceKind::Socks5
+                    | GatewayServiceKind::Dns => {}
                 }
             }
         }
@@ -349,10 +418,11 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                 ));
                 for proto_str in expand_protos(fwd.proto) {
                     out.push_str(&format!(
-                        "        {} {} dport {} counter dnat to {}:{} comment \"nfty:gw-fwd={}:{}\"\n",
+                        "        {} {} dport {}{} counter dnat to {}:{} comment \"nfty:gw-fwd={}:{}\"\n",
                         iif_match,
                         proto_str,
                         fwd.listen_port,
+                        gw_allow_guard,
                         fwd.backend.ip,
                         fwd.backend.port,
                         gw.key,
@@ -364,8 +434,9 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
     }
     out.push_str("    }\n\n");
 
-    // 2b. Input chain (restrict SSH on VIPs unless explicitly enabled via service <vip>:22 or gateway service ssh:22)
+    // 2b. Input chain (restrict SSH and API on VIPs unless explicitly enabled via service <vip>:22 / api:<port> or gateway service)
     let mut ssh_allowed_vips = BTreeSet::new();
+    let mut api_allowed_vips = BTreeSet::new();
     let mut all_vips = BTreeSet::new();
     for (k, v) in &config.vips {
         if let Ok(ip) = k.parse::<std::net::Ipv4Addr>() {
@@ -386,6 +457,9 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                 if svc.port == 22 && svc.backends.iter().any(|b| b.ip.is_loopback() && b.port == 22) {
                     ssh_allowed_vips.insert(ip);
                 }
+                if svc.is_local_api() && svc.port == 9090 {
+                    api_allowed_vips.insert(ip);
+                }
             }
         }
     }
@@ -399,20 +473,44 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             {
                 ssh_allowed_vips.insert(gw.listen_ip);
             }
+            if gw
+                .services
+                .iter()
+                .any(|gs| gs.kind == GatewayServiceKind::Api && gs.port == 9090)
+            {
+                api_allowed_vips.insert(gw.listen_ip);
+            }
         }
     }
     let ssh_blocked_vips: Vec<String> = all_vips
-        .into_iter()
+        .iter()
         .filter(|ip| !ssh_allowed_vips.contains(ip))
         .map(|ip| ip.to_string())
         .collect();
-    if !ssh_blocked_vips.is_empty() {
+    let api_blocked_vips: Vec<String> = if config.has_any_api_service() {
+        all_vips
+            .iter()
+            .filter(|ip| !api_allowed_vips.contains(ip))
+            .map(|ip| ip.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !ssh_blocked_vips.is_empty() || !api_blocked_vips.is_empty() {
         out.push_str("    chain input {\n");
         out.push_str("        type filter hook input priority filter; policy accept;\n");
-        out.push_str(&format!(
-            "        ip daddr {{ {} }} tcp dport 22 counter drop comment \"nfty:ssh-disabled-on-vip\"\n",
-            ssh_blocked_vips.join(", ")
-        ));
+        if !ssh_blocked_vips.is_empty() {
+            out.push_str(&format!(
+                "        ip daddr {{ {} }} tcp dport 22 counter drop comment \"nfty:ssh-disabled-on-vip\"\n",
+                ssh_blocked_vips.join(", ")
+            ));
+        }
+        if !api_blocked_vips.is_empty() {
+            out.push_str(&format!(
+                "        ip daddr {{ {} }} tcp dport 9090 counter drop comment \"nfty:api-disabled-on-vip\"\n",
+                api_blocked_vips.join(", ")
+            ));
+        }
         out.push_str("    }\n\n");
     }
 
@@ -454,7 +552,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
         out.push_str("        iifname \"wg*\" ct state established,related counter accept\n");
         let any_killswitch = config.gateways.values().any(|g| !g.tunnels.is_empty() && g.killswitch);
         if any_killswitch {
-            out.push_str("        oifname \"eth0\" ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 } meta mark != 0x0 counter drop comment \"nfty:killswitch\"\n");
+            out.push_str("        oifname \"eth0\" ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 224.0.0.0/4 } meta mark != 0x0 counter drop comment \"nfty:killswitch\"\n");
         }
     }
     if any_direct_gw {
@@ -486,7 +584,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
         out.push_str("        oifname \"wg*\" counter masquerade comment \"nfty:wg-nat\"\n");
     }
     if any_direct_gw {
-        out.push_str("        oifname \"eth0\" ip saddr != 127.0.0.0/8 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 } counter masquerade comment \"nfty:direct-gw-nat\"\n");
+        out.push_str("        oifname \"eth0\" ip saddr != 127.0.0.0/8 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 224.0.0.0/4 } counter masquerade comment \"nfty:direct-gw-nat\"\n");
     }
     for gw_id in &dns_bypass_gws {
         out.push_str(&format!(
@@ -1124,7 +1222,7 @@ pub fn validate_config(config: &Config, state: Option<&AppState>) -> ValidationR
         if let Some(vip) = &svc.vip {
             if !vip.dhcp && svc.listen_ip.is_none() && svc.vip_id.is_none() {
                 errors.push(format!(
-                    "service '{}': specifies 'vip {}' but service has no listen IP (use e.g. 'service 192.168.1.240:{}')",
+                    "service '{}': specifies 'vip {}' but service has no listen IP (use e.g. 'service 169.254.1.240:{}')",
                     svc.key,
                     vip,
                     svc.port
@@ -1135,6 +1233,30 @@ pub fn validate_config(config: &Config, state: Option<&AppState>) -> ValidationR
             warnings.push(format!(
                 "service '{}': all backends are marked 'backup' (no primary backend defined)",
                 svc.key
+            ));
+        }
+    }
+
+    let wg_gws: Vec<&Gateway> = config
+        .gateways
+        .values()
+        .filter(|g| !g.tunnels.is_empty())
+        .collect();
+    if wg_gws.len() > 1 {
+        let unscoped: Vec<&str> = wg_gws
+            .iter()
+            .filter(|g| {
+                g.vip
+                    .as_ref()
+                    .map(|v| !v.dhcp && v.vlan.is_none() && v.interface == "eth0")
+                    .unwrap_or(true)
+            })
+            .map(|g| g.key.as_str())
+            .collect();
+        if unscoped.len() > 1 {
+            warnings.push(format!(
+                "multiple WireGuard gateways ({}) share eth0 without dedicated DHCP macvlan or VLAN scoping; the first unscoped gateway in mangle_prerouting will match all unscoped traffic unless 'allow' rules or VLAN/DHCP interfaces distinguish them",
+                unscoped.join(", ")
             ));
         }
     }
@@ -1270,11 +1392,12 @@ pub fn reload_kernel_from_state(state: &mut AppState) -> Result<String> {
             }
         }
     }
-    if !state.running.gateways.is_empty() {
-        let _ = crate::features::apply_wireguard_gateways(&state.running);
-    }
+    let _ = crate::features::apply_wireguard_gateways(&state.running);
     if unsafe { libc::geteuid() == 0 } {
-        let _ = crate::features::reconcile_cloudflare_tunnel(&state.running);
+        let cf_cfg = state.running.clone();
+        std::thread::spawn(move || {
+            let _ = crate::features::reconcile_cloudflare_tunnel(&cf_cfg);
+        });
     }
     let ruleset = compile_nft_ruleset(&state.running, Some(state));
     let (in_kernel, ok, msg) = run_nft_command(&ruleset, false);
