@@ -38,6 +38,10 @@ fn sys_mount(source: &str, target: &str, fstype: &str, flags: libc::c_ulong) -> 
 
 /// Pure-Rust DHCP lease hook invoked by `udhcpc -s /bin/udhcpc-hook`
 pub fn handle_udhcpc_hook(action: &str) {
+    std::env::set_var(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
     let iface = std::env::var("interface").unwrap_or_else(|_| "eth0".to_string());
     let is_primary = iface == "eth0";
     match action {
@@ -154,12 +158,20 @@ fn load_sysfs_modalias_modules() {
     }
 }
 
-fn ensure_primary_eth0_up() {
+pub fn ensure_primary_eth0_up() -> String {
     let mut candidate_ifaces = Vec::new();
     if let Ok(entries) = fs::read_dir("/sys/class/net") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == "lo" || name.starts_with("wg") || name.starts_with("sit") || name.starts_with("ip6tnl") {
+            if name == "lo"
+                || name.starts_with("wg")
+                || name.starts_with("mv-")
+                || name.starts_with("sit")
+                || name.starts_with("ip6tnl")
+                || name.starts_with("tunl")
+                || name.starts_with("gre")
+                || name.contains('.')
+            {
                 continue;
             }
             candidate_ifaces.push(name);
@@ -169,25 +181,55 @@ fn ensure_primary_eth0_up() {
 
     if !candidate_ifaces.iter().any(|n| n == "eth0") {
         if let Some(first) = candidate_ifaces.first() {
-            let _ = Command::new("ip")
+            let _ = Command::new("/sbin/ip")
                 .args(["link", "set", first, "down"])
                 .status();
-            let _ = Command::new("ip")
+            let _ = Command::new("/sbin/ip")
                 .args(["link", "set", first, "name", "eth0"])
                 .status();
         }
     }
 
-    for iface in ["eth0", "eth1", "enp5s0"] {
+    for iface in ["eth0", "eth1", "enp5s0", "enp0s3", "ens33", "ens18", "eth2"] {
         if Path::new(&format!("/sys/class/net/{}", iface)).exists() {
-            let _ = Command::new("ip")
+            let _ = Command::new("/sbin/ip")
                 .args(["link", "set", iface, "up"])
                 .status();
         }
     }
+
+    if Path::new("/sys/class/net/eth0").exists() {
+        return "eth0".to_string();
+    }
+    if let Ok(entries) = fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name != "lo"
+                && !name.starts_with("wg")
+                && !name.starts_with("mv-")
+                && !name.starts_with("sit")
+                && !name.starts_with("ip6tnl")
+            {
+                let _ = Command::new("/sbin/ip")
+                    .args(["link", "set", &name, "up"])
+                    .status();
+                return name;
+            }
+        }
+    }
+    "eth0".to_string()
 }
 
 pub fn init_unikernel_appliance() -> Option<PathBuf> {
+    if std::env::var("PATH")
+        .map(|p| !p.contains("/sbin") || !p.contains("/usr/sbin"))
+        .unwrap_or(true)
+    {
+        std::env::set_var(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+    }
     let is_pid1 = std::process::id() == 1;
     if is_pid1 {
         unsafe {
@@ -224,15 +266,13 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
                     "virtio_scsi",
                     "e1000",
                     "e1000e",
+                    "igb",
+                    "8139cp",
+                    "8139too",
+                    "pcnet32",
                     "vmxnet3",
-                    "hv_vmbus",
-                    "hv_storvsc",
-                    "hv_netvsc",
-                    "hyperv_keyboard",
-                    "hid_hyperv",
-                    "hyperv_drm",
-                    "hyperv_fb",
                     "ahci",
+                    "ata_piix",
                     "sd_mod",
                     "sr_mod",
                     "nvme",
@@ -250,22 +290,42 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
                     "r8152",
                     "nf_tables",
                     "nf_conntrack",
+                    "nf_nat",
                     "nft_ct",
                     "nft_nat",
                     "nft_masq",
+                    "nft_redir",
                     "nft_chain_nat",
                     "nft_counter",
                     "nft_limit",
                     "nft_numgen",
                     "nft_hash",
+                    "nft_reject",
+                    "nft_reject_inet",
                     "wireguard",
                     "8021q",
                     "macvlan",
                 ];
                 for m in core_mods {
-                    let _ = Command::new("modprobe").args(["-q", m]).status();
+                    let _ = Command::new("/sbin/modprobe").args(["-q", m]).status();
                 }
                 load_sysfs_modalias_modules();
+                for _ in 0..8 {
+                    let has_nic = fs::read_dir("/sys/class/net")
+                        .ok()
+                        .map(|entries| {
+                            entries.flatten().any(|e| {
+                                let n = e.file_name().to_string_lossy().to_string();
+                                n != "lo" && !n.starts_with("sit") && !n.starts_with("ip6tnl")
+                            })
+                        })
+                        .unwrap_or(false);
+                    if has_nic {
+                        break;
+                    }
+                    load_sysfs_modalias_modules();
+                    std::thread::sleep(Duration::from_millis(250));
+                }
             }
 
             let data_devs = [
@@ -302,17 +362,17 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
             }
         }
 
-        let _ = Command::new("ip").args(["link", "set", "lo", "up"]).status();
-        let _ = Command::new("ip")
+        let _ = Command::new("/sbin/ip").args(["link", "set", "lo", "up"]).status();
+        let _ = Command::new("/sbin/ip")
             .args(["addr", "replace", "127.0.0.1/8", "dev", "lo"])
             .status();
 
-        ensure_primary_eth0_up();
+        let primary_iface = ensure_primary_eth0_up();
 
         // Automatically acquire IPv4 address via DHCP on eth0
-        if Path::new("/bin/udhcpc").exists() {
+        if Path::new("/bin/udhcpc").exists() && Path::new(&format!("/sys/class/net/{}", primary_iface)).exists() {
             let _ = Command::new("/bin/udhcpc")
-                .args(["-i", "eth0", "-s", "/bin/udhcpc-hook", "-b", "-q"])
+                .args(["-i", &primary_iface, "-s", "/bin/udhcpc-hook", "-b", "-q"])
                 .status();
         }
     }

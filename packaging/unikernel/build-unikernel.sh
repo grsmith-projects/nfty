@@ -38,6 +38,9 @@ fetch_cached() {
 USERLAND_APKS=(
     "musl-1.2.5-r12.apk"
     "busybox-static-1.37.0-r14.apk"
+    "kmod-33-r2.apk"
+    "xz-libs-5.8.4-r0.apk"
+    "libcrypto3-3.3.7-r2.apk"
     "nftables-1.1.1-r0.apk"
     "libmnl-1.0.5-r2.apk"
     "libnftnl-1.2.8-r0.apk"
@@ -83,11 +86,11 @@ for apk in "${USERLAND_APKS[@]}" "${HOST_TOOL_APKS[@]}"; do
     fetch_cached "$apk" "$ALPINE_V321/$apk"
 done
 
-# Microsoft UEFI CA + Debian Secure Boot signed shim, grub, and Linux 6.12 LTS cloud kernel
+# Microsoft UEFI CA + Debian Secure Boot signed shim, grub, and full signed Linux 6.12 LTS kernel (includes e1000, e1000e, virtio, r8169, nvme, ahci)
 SHIM_DEB="shim-signed_1.51~1+deb13u1+16.1-2~deb13u1_amd64.deb"
 SHIM_HELPERS_DEB="shim-helpers-amd64-signed_1+16.1+2~deb13u1_amd64.deb"
 GRUB_SIGNED_DEB="grub-efi-amd64-signed_1+2.12+9+deb13u2_amd64.deb"
-SIGNED_KERNEL_DEB="linux-image-6.12.107+deb13-cloud-amd64_6.12.107-1_amd64.deb"
+SIGNED_KERNEL_DEB="linux-image-6.12.107+deb13-amd64_6.12.107-1_amd64.deb"
 
 fetch_cached "$SHIM_DEB" "$DEBIAN_POOL/s/shim-signed/$SHIM_DEB"
 fetch_cached "$SHIM_HELPERS_DEB" "$DEBIAN_POOL/s/shim-helpers-amd64-signed/$SHIM_HELPERS_DEB"
@@ -118,11 +121,17 @@ rm -f "$STAGE_DIR"/.PKGINFO "$STAGE_DIR"/.SIGN.* "$STAGE_DIR"/.post-*
 if [[ -f "$STAGE_DIR/bin/busybox.static" ]]; then
     mv "$STAGE_DIR/bin/busybox.static" "$STAGE_DIR/bin/busybox"
     chmod +x "$STAGE_DIR/bin/busybox"
-    for applet in ping mount umount udhcpc ifconfig route arping modprobe insmod rmmod lsmod depmod vi ls cat rm mkdir sleep dmesg uname; do
+    for applet in ping mount umount udhcpc ifconfig route arping vi ls cat rm mkdir sleep dmesg uname; do
         ln -sf /bin/busybox "$STAGE_DIR/bin/$applet"
         ln -sf /bin/busybox "$STAGE_DIR/sbin/$applet"
     done
 fi
+
+# Link full kmod tools (/bin/kmod) for reliable kernel module & dependency loading
+for ktool in modprobe insmod rmmod lsmod depmod modinfo; do
+    ln -sf ../bin/kmod "$STAGE_DIR/sbin/$ktool"
+    ln -sf kmod "$STAGE_DIR/bin/$ktool"
+done
 
 ln -sf /sbin/ip "$STAGE_DIR/bin/ip"
 ln -sf /sbin/ip "$STAGE_DIR/usr/bin/ip"
@@ -184,7 +193,7 @@ tar -czf "$ROOT_DIR/dist/lxd-container/rootfs.tar.gz" -C "$STAGE_DIR" .
 
 # Extract Secure Boot signed shim, grub, and signed Linux 6.12 LTS kernel + modules using python3
 python3 - "$CACHE_DIR/$SHIM_DEB" "$CACHE_DIR/$SHIM_HELPERS_DEB" "$CACHE_DIR/$GRUB_SIGNED_DEB" "$CACHE_DIR/$SIGNED_KERNEL_DEB" "$WORK_DIR/efi" "$WORK_DIR/kern" "$STAGE_DIR" <<'PY'
-import sys, os, io, tarfile, lzma
+import sys, os, io, tarfile
 
 shim_deb, helpers_deb, grub_deb, kern_deb, efi_dir, kern_dir, stage_dir = sys.argv[1:8]
 
@@ -212,8 +221,60 @@ with open_deb_data(helpers_deb) as tf:
 with open_deb_data(grub_deb) as tf:
     for m in tf.getmembers():
         if m.name.endswith("gcdx64.efi.signed"):
-            # gcdx64.efi.signed is Debian's signed GRUB EFI image that searches for /boot/grub/grub.cfg on ISO/ESP
             open(os.path.join(efi_dir, "grubx64.efi"), "wb").write(tf.extractfile(m).read())
+
+# Skip desktop/multimedia/GPU/wireless drivers to keep the initramfs & ISO compact
+SKIP_DIRS = (
+    "/kernel/sound/",
+    "/kernel/drivers/gpu/",
+    "/kernel/drivers/media/",
+    "/kernel/drivers/infiniband/",
+    "/kernel/drivers/net/wireless/",
+    "/kernel/drivers/bluetooth/",
+    "/kernel/drivers/staging/",
+    "/kernel/drivers/iio/",
+    "/kernel/drivers/isdn/",
+    "/kernel/drivers/NFC/",
+    "/kernel/drivers/thunderbolt/",
+    "/kernel/drivers/firewire/",
+    "/kernel/drivers/accessibility/",
+    "/kernel/drivers/comedi/",
+    "/kernel/drivers/fpga/",
+    "/kernel/drivers/gnss/",
+    "/kernel/drivers/greybus/",
+    "/kernel/drivers/most/",
+    "/kernel/drivers/mtd/",
+    "/kernel/drivers/ntb/",
+    "/kernel/drivers/pcmcia/",
+    "/kernel/drivers/platform/",
+    "/kernel/drivers/power/",
+    "/kernel/drivers/RapidIO/",
+    "/kernel/drivers/regulator/",
+    "/kernel/drivers/SLIMbus/",
+    "/kernel/drivers/soundwire/",
+    "/kernel/drivers/spmi/",
+    "/kernel/drivers/ssb/",
+    "/kernel/drivers/target/",
+    "/kernel/drivers/tty/serial/8250/8250_pci",
+    "/kernel/drivers/video/fbdev/",
+    "/kernel/drivers/w1/",
+    "/kernel/fs/ceph/",
+    "/kernel/fs/cifs/",
+    "/kernel/fs/dlm/",
+    "/kernel/fs/f2fs/",
+    "/kernel/fs/gfs2/",
+    "/kernel/fs/jfs/",
+    "/kernel/fs/nfs",
+    "/kernel/fs/nilfs2/",
+    "/kernel/fs/ntfs3/",
+    "/kernel/fs/ocfs2/",
+    "/kernel/fs/orangefs/",
+    "/kernel/fs/reiserfs/",
+    "/kernel/fs/smb/",
+    "/kernel/fs/ubifs/",
+    "/kernel/fs/xfs/",
+    "/kernel/fs/btrfs/",
+)
 
 with open_deb_data(kern_deb) as tf:
     for m in tf.getmembers():
@@ -222,16 +283,14 @@ with open_deb_data(kern_deb) as tf:
         if "/boot/vmlinuz-" in m.name:
             open(os.path.join(kern_dir, "vmlinuz"), "wb").write(tf.extractfile(m).read())
         elif "/lib/modules/" in m.name:
+            if any(s in m.name for s in SKIP_DIRS):
+                continue
             rel = m.name.lstrip("./")
             if rel.startswith("usr/lib/modules/"):
-                rel = rel[4:]  # normalize usr/lib/modules -> lib/modules
+                rel = rel[4:]
             out_path = os.path.join(stage_dir, rel)
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            data = tf.extractfile(m).read()
-            if out_path.endswith(".ko.xz"):
-                out_path = out_path[:-3]
-                data = lzma.decompress(data)
-            open(out_path, "wb").write(data)
+            open(out_path, "wb").write(tf.extractfile(m).read())
 PY
 
 KVER="$(ls "$STAGE_DIR/lib/modules" | head -n 1)"
@@ -240,7 +299,7 @@ run_tool "$WORK_DIR/tools/sbin/depmod" -b "$STAGE_DIR" "$KVER"
 INITRD_IMG="$ROOT_DIR/dist/nfty-unikernel-initramfs.cpio.gz"
 (
     cd "$STAGE_DIR"
-    find . -print0 | "$STAGE_DIR/bin/busybox" cpio -0 -o -H newc 2>/dev/null | gzip -9 > "$INITRD_IMG"
+    find . -print0 | "$STAGE_DIR/bin/busybox" cpio -0 -o -H newc 2>/dev/null | gzip -6 > "$INITRD_IMG"
 )
 
 echo "==> [4/6] Building Secure Boot UEFI ESP & Persistent ext4 Data Partitions..."
@@ -253,20 +312,24 @@ truncate -s 128M "$DATA_PART"
 mkfs.ext4 -q -F -L "nfty-data" -d "$WORK_DIR/data-seed" "$DATA_PART"
 
 KERNEL_IMG="$WORK_DIR/kern/vmlinuz"
-# Put console=tty0 last so Hyper-V VMConnect / VGA console is /dev/console (while serial ttyS0 also receives kernel logs)
 BOOTARGS="console=ttyS0,115200n8 console=tty0 quiet rdinit=/init -- --unikernel --file /data/Nftyfile --api-bind 0.0.0.0:9090"
 
 cat > "$WORK_DIR/grub.cfg" <<EOF
 set default=0
 set timeout=1
 
-menuentry "nfty x86_64 Unikernel Appliance (UEFI Secure Boot)" {
+menuentry "nfty x86_64 Unikernel Appliance (QEMU / KVM / UEFI Secure Boot)" {
     linux /vmlinuz ${BOOTARGS}
+    initrd /initramfs.img
+}
+
+menuentry "nfty x86_64 Unikernel Appliance (Serial Console ttyS0 Primary)" {
+    linux /vmlinuz console=tty0 console=ttyS0,115200n8 quiet rdinit=/init -- --unikernel --file /data/Nftyfile --api-bind 0.0.0.0:9090
     initrd /initramfs.img
 }
 EOF
 
-# 1. Tiny 8 MiB El Torito UEFI Boot Image for the ISO (loads /vmlinuz and /initramfs.img from ISO9660 root without duplication!)
+# 1. 8 MiB El Torito UEFI Boot Image for the ISO (loads /vmlinuz and /initramfs.img from ISO9660 root)
 ISO_EFIBOOT="$WORK_DIR/efiboot-iso.img"
 truncate -s 8M "$ISO_EFIBOOT"
 run_tool "$WORK_DIR/tools/usr/bin/mformat" -i "$ISO_EFIBOOT" -F -v "NFTY_EFI" ::
@@ -282,9 +345,9 @@ run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ISO_EFIBOOT" "$WORK_DIR/grub.cfg" 
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ISO_EFIBOOT" "$WORK_DIR/grub.cfg" ::/EFI/BOOT/grub.cfg
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ISO_EFIBOOT" "$WORK_DIR/grub.cfg" ::/boot/grub/grub.cfg
 
-# 2. Standalone 96 MiB ESP Partition for the Raw GPT Disk Image
+# 2. 128 MiB ESP Partition for the Raw GPT Disk Image
 ESP_PART="$WORK_DIR/part1-esp.fat"
-truncate -s 96M "$ESP_PART"
+truncate -s 128M "$ESP_PART"
 run_tool "$WORK_DIR/tools/usr/bin/mformat" -i "$ESP_PART" -F -v "NFTY_EFI" ::
 for dir in ::/EFI ::/EFI/BOOT ::/EFI/debian ::/boot ::/boot/grub; do
     run_tool "$WORK_DIR/tools/usr/bin/mmd" -i "$ESP_PART" "$dir"
@@ -352,19 +415,19 @@ run_tool "$WORK_DIR/tools/usr/bin/xorriso" -as mkisofs \
 echo "==> [6/6] Assembling GPT Bootable Disk Image (nfty-unikernel-x86_64.img.gz)..."
 RAW_DISK="$ROOT_DIR/dist/nfty-unikernel-x86_64.img"
 rm -f "$RAW_DISK" "$RAW_DISK.gz"
-truncate -s 232M "$RAW_DISK"
+truncate -s 264M "$RAW_DISK"
 
 sfdisk "$RAW_DISK" >/dev/null <<'EOF'
 label: gpt
 unit: sectors
 first-lba: 2048
 
-part1 : start=2048, size=196608, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="EFI System"
-part2 : start=198656, size=262144, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="nfty-data"
+part1 : start=2048, size=262144, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="EFI System"
+part2 : start=264192, size=262144, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="nfty-data"
 EOF
 
 dd if="$ESP_PART" of="$RAW_DISK" bs=1M seek=1 conv=notrunc status=none
-dd if="$DATA_PART" of="$RAW_DISK" bs=1M seek=97 conv=notrunc status=none
+dd if="$DATA_PART" of="$RAW_DISK" bs=1M seek=129 conv=notrunc status=none
 
 if command -v qemu-img >/dev/null 2>&1; then
     mkdir -p "$ROOT_DIR/dist/lxd-vm" "$WORK_DIR/meta-vm"
@@ -388,7 +451,7 @@ echo ""
 echo "================================================================================"
 echo "x86_64 Secure Boot Unikernel ISO, Disk Image & LXD Container Built"
 echo "================================================================================"
-echo "1. Bootable Hybrid BIOS + UEFI Secure Boot ISO (Hyper-V Gen1/Gen2 / Proxmox / VMware / QEMU):"
+echo "1. Bootable Hybrid BIOS + UEFI Secure Boot ISO (QEMU / KVM / Proxmox / VMware):"
 echo "   - ISO:       $ISO_OUT"
 echo ""
 echo "2. Bootable UEFI Secure Boot GPT Disk Image (with 128 MiB ext4 persistent /data partition):"

@@ -8,8 +8,8 @@ pub use status::{handle_show, print_config_diff, print_status, print_status_tabl
 
 use crate::ast::{DnsConfig, Gateway, GatewayService, GatewayServiceKind, Service};
 use crate::compiler::{
-    apply_vip_commands, generate_vip_commands, reconcile_dhcp_and_vlan_vips,
-    reload_kernel_from_state, validate_config,
+    apply_vip_commands, generate_vip_commands, reload_kernel_from_state,
+    reload_kernel_from_state_with_logs, validate_config,
 };
 use crate::health::{refresh_allowlist_hosts, run_all_probes_once};
 use crate::parser::{
@@ -2439,9 +2439,8 @@ async fn handle_apply(args: &[&str], shared: &SharedState) {
     {
         let mut st = shared.write().unwrap();
         let prev_running = st.running.clone();
-        let mut next_running = st.candidate.clone();
+        let next_running = st.candidate.clone();
 
-        dhcp_logs = reconcile_dhcp_and_vlan_vips(&mut next_running);
         let vip_cmds = generate_vip_commands(&prev_running, &next_running);
         vip_logs = apply_vip_commands(&vip_cmds);
 
@@ -2458,7 +2457,9 @@ async fn handle_apply(args: &[&str], shared: &SharedState) {
             st.pending_confirm = None;
         }
 
-        apply_res = reload_kernel_from_state(&mut st);
+        let (res, logs) = reload_kernel_from_state_with_logs(&mut st);
+        apply_res = res;
+        dhcp_logs = logs;
     }
 
     for log in dhcp_logs {

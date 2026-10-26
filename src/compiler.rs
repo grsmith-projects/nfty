@@ -4,7 +4,7 @@ use crate::ast::{
 };
 use crate::parser::expand_ip_wildcard_to_cidr;
 use crate::state::{AppState, HealthState};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -867,7 +867,13 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         let mv_iface = dhcp_macvlan_iface_name(&vip_key);
         active_mv_ifaces.insert(mv_iface.clone());
         let mac = dhcp_macvlan_mac(&vip_key);
-        let parent_iface = vip_cfg.effective_base_iface();
+        let mut parent_iface = vip_cfg.effective_base_iface();
+        if !std::path::Path::new(&format!("/sys/class/net/{}", parent_iface)).exists() {
+            let resolved = crate::unikernel::ensure_primary_eth0_up();
+            if parent_iface == "eth0" {
+                parent_iface = resolved;
+            }
+        }
 
         let mv_sys = format!("/sys/class/net/{}", mv_iface);
         let lower_sys = format!("/sys/class/net/{}/lower_{}", mv_iface, parent_iface);
@@ -879,6 +885,7 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         }
 
         if !std::path::Path::new(&mv_sys).exists() {
+            let _ = Command::new("modprobe").args(["-q", "macvlan"]).status();
             let _ = Command::new("ip")
                 .args([
                     "link",
@@ -902,6 +909,14 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
             let _ = Command::new("ip")
                 .args(["link", "set", "dev", &mv_iface, "up"])
                 .status();
+        }
+
+        if !std::path::Path::new(&mv_sys).exists() {
+            logs.push(format!(
+                "Warning: failed to create macvlan interface '{}' on parent '{}' (is NIC attached to VM?)",
+                mv_iface, parent_iface
+            ));
+            continue;
         }
 
         // Prevent ARP flux on macvlan
@@ -994,7 +1009,13 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         let mv_iface = dhcp_macvlan_iface_name(&gw_key);
         active_mv_ifaces.insert(mv_iface.clone());
         let mac = dhcp_macvlan_mac(&gw_key);
-        let parent_iface = vip_cfg.effective_base_iface();
+        let mut parent_iface = vip_cfg.effective_base_iface();
+        if !std::path::Path::new(&format!("/sys/class/net/{}", parent_iface)).exists() {
+            let resolved = crate::unikernel::ensure_primary_eth0_up();
+            if parent_iface == "eth0" {
+                parent_iface = resolved;
+            }
+        }
 
         let mv_sys = format!("/sys/class/net/{}", mv_iface);
         let lower_sys = format!("/sys/class/net/{}/lower_{}", mv_iface, parent_iface);
@@ -1005,6 +1026,7 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         }
 
         if !std::path::Path::new(&mv_sys).exists() {
+            let _ = Command::new("modprobe").args(["-q", "macvlan"]).status();
             let _ = Command::new("ip")
                 .args([
                     "link",
@@ -1025,6 +1047,14 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         let _ = Command::new("ip")
             .args(["link", "set", "dev", &mv_iface, "up"])
             .status();
+
+        if !std::path::Path::new(&mv_sys).exists() {
+            logs.push(format!(
+                "Warning: failed to create macvlan interface '{}' on parent '{}' (is NIC attached to VM?)",
+                mv_iface, parent_iface
+            ));
+            continue;
+        }
 
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", mv_iface), "1\n");
         let _ = std::fs::write(
@@ -1281,7 +1311,16 @@ pub fn validate_config(config: &Config, state: Option<&AppState>) -> ValidationR
 }
 
 pub fn run_nft_command(ruleset: &str, check_only: bool) -> (bool, bool, String) {
-    let mut cmd = Command::new("nft");
+    let nft_bin = if std::path::Path::new("/usr/sbin/nft").exists() {
+        "/usr/sbin/nft"
+    } else if std::path::Path::new("/usr/bin/nft").exists() {
+        "/usr/bin/nft"
+    } else if std::path::Path::new("/sbin/nft").exists() {
+        "/sbin/nft"
+    } else {
+        "nft"
+    };
+    let mut cmd = Command::new(nft_bin);
     if check_only {
         cmd.arg("-c");
     }
@@ -1369,7 +1408,11 @@ pub fn apply_vip_commands(cmds: &[String]) -> Vec<String> {
 }
 
 pub fn reload_kernel_from_state(state: &mut AppState) -> Result<String> {
-    let _dhcp_logs = reconcile_dhcp_and_vlan_vips(&mut state.running);
+    reload_kernel_from_state_with_logs(state).0
+}
+
+pub fn reload_kernel_from_state_with_logs(state: &mut AppState) -> (Result<String>, Vec<String>) {
+    let dhcp_logs = reconcile_dhcp_and_vlan_vips(&mut state.running);
     // Sync leased DHCP VIP IPs into candidate config as well so `status` and `show` stay in sync
     for (k, run_vip) in &state.running.vips {
         if let Some(leased) = run_vip.leased_ip {
@@ -1406,12 +1449,12 @@ pub fn reload_kernel_from_state(state: &mut AppState) -> Result<String> {
     let ruleset = compile_nft_ruleset(&state.running, Some(state));
     let (in_kernel, ok, msg) = run_nft_command(&ruleset, false);
     if !ok {
-        bail!("Failed to apply nftables ruleset: {}", msg);
+        return (Err(anyhow::anyhow!("Failed to apply nftables ruleset: {}", msg)), dhcp_logs);
     }
     state.last_applied_nft = ruleset;
     state.kernel_applied = in_kernel;
     if unsafe { libc::geteuid() == 0 } {
         let _ = crate::features::reconcile_dnsmasq(&state.running, Some(state));
     }
-    Ok(msg)
+    (Ok(msg), dhcp_logs)
 }
