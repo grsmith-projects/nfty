@@ -69,6 +69,10 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
                 }
                 return;
             }
+            "ssh" | "ssh-keys" => {
+                let _ = crate::ssh::handle_ssh_cli_command(&["list"]);
+                return;
+            }
             _ => {}
         }
     }

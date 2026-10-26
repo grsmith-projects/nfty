@@ -301,10 +301,22 @@ Run 'configure; diff; apply' to activate.
 | Command | Description |
 | :--- | :--- |
 | `wg` | Lists all WireGuard `.conf` profiles stored in `/data/wg/`, active `wg0..wgN` interfaces, endpoints, latest handshakes, and transfer counters. |
-| `wg add <name>` / `wg paste <name>` | Enters interactive multi-line paste mode to upload a WireGuard `.conf` profile into `/data/wg/<name>.conf` (finish with `EOF` or an empty line). |
+| `wg add <name>` / `wg paste <name>` | Opens `nano` (with `wg add`) or enters interactive paste mode (with `wg paste`) to upload a WireGuard `.conf` profile into `/data/wg/<name>.conf` (finish with `EOF` or `.`). |
 | `wg vi <name>` / `wg edit <name>` | Opens the built-in terminal editor for `/data/wg/<name>.conf`. |
 | `wg show <name>` | Displays the contents of `/data/wg/<name>.conf` (with private keys visible to authenticated CLI administrators). |
 | `wg rm <name>` | Deletes `/data/wg/<name>.conf` from disk. |
+
+### Global SSH Authorized Key Management (`ssh` / `ssh key`)
+
+| Command | Description |
+| :--- | :--- |
+| `ssh` / `ssh list` / `show ssh` | Lists all authorized OpenSSH public keys stored in `/data/ssh/*.pub` with their algorithm (`ssh-ed25519`, `ecdsa-sha2-*`, `ssh-rsa`), `SHA256:...` fingerprint, and comment. |
+| `ssh add <name> <pubkey>` | Validates and saves an inline OpenSSH public key directly to `/data/ssh/<name>.pub` (e.g. `ssh add workstation ssh-ed25519 AAAA... user@host`). |
+| `ssh add <name>` / `ssh edit <name>` | Opens `nano` on `/data/ssh/<name>.pub` to paste/edit an OpenSSH public key and validates it on save. |
+| `ssh paste <name>` | Enters interactive paste mode in the CLI and saves `/data/ssh/<name>.pub` immediately once a valid OpenSSH public key line is pasted. |
+| `ssh vi <name>` | Opens `vi` on `/data/ssh/<name>.pub`. |
+| `ssh show <name>` | Displays the algorithm, `SHA256:...` fingerprint, and raw OpenSSH public key line in `/data/ssh/<name>.pub`. |
+| `ssh rm <name>` | Deletes `/data/ssh/<name>.pub` from `/data/ssh/`. |
 
 ### Programmable DNS Operations (`dns`)
 

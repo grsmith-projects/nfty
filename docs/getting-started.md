@@ -336,6 +336,45 @@ Credentials are stored in `/data/auth.json` with `0600` permissions using a salt
 
 You can rotate the appliance password at any time from the interactive CLI by running `password` (or `passwd`), and you can reuse the `nfty` credential for HTTP Basic Auth on services by specifying `auth nfty`.
 
+### Step 3: Passwordless Global SSH Key Authentication (`/data/ssh/*.pub`)
+
+To log into `nfty` without a password across any enabled `ssh:22` listener, add your OpenSSH public keys (`ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, or `ssh-rsa`) to `/data/ssh/` using the `ssh` (or `ssh key`) CLI commands—mirroring how `wg` manages `/data/wg/*.conf`:
+
+```text
+# 1. Add a key directly inline:
+nfty> ssh add workstation ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... admin@workstation
+  ✔ Saved & validated /data/ssh/workstation.pub -> ssh-ed25519 SHA256:xK8...
+
+# 2. Or paste a key interactively in the CLI:
+nfty> ssh paste laptop
+  Paste OpenSSH public key for laptop.pub below (e.g. 'ssh-ed25519 AAAA... user@host').
+  Press Enter after pasting (or type EOF / . on a new line, or ABORT to cancel):
+
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@laptop
+  ✔ Saved & validated /data/ssh/laptop.pub -> ssh-ed25519 SHA256:9bQ...
+
+# 3. Or open nano / vi to paste and save:
+nfty> ssh add yubikey
+nfty> ssh vi backup-key
+
+# 4. List, inspect, or remove saved SSH public keys:
+nfty> ssh
+Saved SSH Authorized Keys (/data/ssh/):
+  ✔ laptop.pub               -> ssh-ed25519         SHA256:9bQ... (user@laptop)
+  ✔ workstation.pub          -> ssh-ed25519         SHA256:xK8... (admin@workstation)
+
+nfty> ssh show workstation
+nfty> ssh rm laptop
+```
+
+You can also provision an SSH public key non-interactively via `nfty -c` or from an LXD host before your first SSH login:
+
+```bash
+lxc exec nfty -- nfty -c "ssh add workstation $(cat ~/.ssh/id_ed25519.pub)"
+```
+
+> **Note:** When you authenticate with an authorized SSH public key, `nfty` drops you directly into `nfty>` without prompting for a password (even if the initial default password has not been rotated yet), and accepts any SSH username (`ssh nfty@169.254.10.10` or `ssh 169.254.10.10`).
+
 ---
 
 ## 4. Zero-Flag Appliance Ergonomics & One-Shot CLI Usage

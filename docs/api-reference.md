@@ -553,6 +553,25 @@ curl -s -X POST \
 
 ---
 
+### `GET /api/v1/ssh`, `POST /api/v1/ssh` & `DELETE /api/v1/ssh`
+
+- **`GET /api/v1/ssh`** (`ro` or `rw`): Lists all saved global OpenSSH authorized public keys in `/data/ssh/*.pub` along with their algorithm, `SHA256:...` fingerprint, and comment.
+- **`POST /api/v1/ssh`** (`rw` only): Validates and saves an OpenSSH public key (`ssh-ed25519`, `ecdsa-sha2-*`, or `ssh-rsa`) to `/data/ssh/<name>.pub`.
+- **`DELETE /api/v1/ssh`** (`rw` only): Removes `/data/ssh/<name>.pub`.
+
+**Example (`POST /api/v1/ssh`):**
+```bash
+curl -s -X POST \
+  -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
+  -d '{
+    "name": "workstation",
+    "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ admin@workstation.example.com"
+  }' \
+  http://169.254.1.4:9090/api/v1/ssh
+```
+
+---
+
 ### `GET /api/v1/cloudflare` & `POST /api/v1/cloudflare`
 
 Manages the integrated Cloudflare DNS and Zero-Trust `cloudflared` tunnel supervisor (also accessible at `/api/v1/cf`).

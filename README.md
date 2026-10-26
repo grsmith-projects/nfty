@@ -68,7 +68,7 @@ vip 169.254.10.10/24 {
 }
 ```
 
-### 2. Connect Over SSH and Set the Appliance Password
+### 2. Connect Over SSH and Set the Appliance Password (or Add SSH Public Keys)
 
 Once bootstrapped, connect directly to the VIP over SSH:
 
@@ -77,7 +77,15 @@ ssh nfty@169.254.10.10
 ```
 
 - **Default initial credentials**: username `nfty`, password `nfty`.
-- On first login, `nfty` enforces an interactive password change and stores the salted SHA-256 hash in `/data/auth.json`. You can rotate the password at any time from the operational prompt with `password`.
+- On first password login, `nfty` enforces an interactive password change and stores the salted SHA-256 hash in `/data/auth.json`. You can rotate the password at any time from the operational prompt with `password`.
+- **Global SSH Authorized Keys (`/data/ssh/*.pub`)**: Add OpenSSH public keys (`ssh-ed25519`, `ecdsa-sha2-*`, `ssh-rsa`) for passwordless SSH login across all `ssh:22` listeners using the same workflow as `wg`:
+  ```text
+  nfty> ssh add workstation ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... admin@workstation
+  nfty> ssh paste laptop
+  nfty> ssh add yubikey          # opens nano on /data/ssh/yubikey.pub
+  nfty> ssh list                 # lists all saved keys and SHA256 fingerprints
+  nfty> ssh rm laptop
+  ```
 
 ---
 

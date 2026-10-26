@@ -88,6 +88,21 @@ impl NftyHelper {
         list.sort();
         list
     }
+
+    fn ssh_pub_files(&self) -> Vec<String> {
+        let mut list = Vec::new();
+        let dir = crate::ssh::ssh_keys_dir();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.ends_with(".pub") {
+                    list.push(name);
+                }
+            }
+        }
+        list.sort();
+        list
+    }
 }
 
 impl Completer for NftyHelper {
@@ -198,6 +213,18 @@ impl Completer for NftyHelper {
                         .collect();
                     return Ok((start_pos, matches));
                 }
+                "ssh" | "ssh-key" | "ssh-keys" => {
+                    let list = vec!["list", "add", "edit", "paste", "vi", "show", "rm", "key"];
+                    let matches = list
+                        .into_iter()
+                        .filter(|c| c.starts_with(prefix))
+                        .map(|c| Pair {
+                            display: c.to_string(),
+                            replacement: c.to_string(),
+                        })
+                        .collect();
+                    return Ok((start_pos, matches));
+                }
                 "cf" | "cloudflare" => {
                     let list = vec![
                         "status",
@@ -298,6 +325,31 @@ impl Completer for NftyHelper {
                 })
                 .collect();
             return Ok((start_pos, matches));
+        } else if (word_idx == 2 || word_idx == 3)
+            && matches!(cmd0.as_str(), "ssh" | "ssh-key" | "ssh-keys")
+        {
+            if word_idx == 2 && matches!(cmd1.as_str(), "key" | "keys") {
+                let list = vec!["list", "add", "edit", "paste", "vi", "show", "rm"];
+                let matches = list
+                    .into_iter()
+                    .filter(|c| c.starts_with(prefix))
+                    .map(|c| Pair {
+                        display: c.to_string(),
+                        replacement: c.to_string(),
+                    })
+                    .collect();
+                return Ok((start_pos, matches));
+            }
+            let files = self.ssh_pub_files();
+            let matches = files
+                .into_iter()
+                .filter(|c| c.starts_with(prefix))
+                .map(|c| Pair {
+                    display: c.clone(),
+                    replacement: c,
+                })
+                .collect();
+            return Ok((start_pos, matches));
         } else if word_idx >= 2 && cmd0 == "adopt" {
             if words.get(word_idx.saturating_sub(1)).copied() == Some("vip") {
                 let st = self.state.read().unwrap();
@@ -336,6 +388,7 @@ impl Completer for NftyHelper {
                 "flows",
                 "dns",
                 "wg",
+                "ssh",
                 "cf",
                 "watch",
                 "probe",
@@ -363,6 +416,7 @@ impl Completer for NftyHelper {
                 "show",
                 "flows",
                 "wg",
+                "ssh",
                 "cf",
                 "diff",
                 "test",

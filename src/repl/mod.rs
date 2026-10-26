@@ -318,6 +318,26 @@ pub async fn handle_line(
             }
             return false;
         }
+        "ssh-key" | "ssh-keys" | "authorized-keys" => {
+            if let Err(e) = crate::ssh::handle_ssh_cli_command(&tokens[1..]) {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+            }
+            return false;
+        }
+        "ssh"
+            if matches!(
+                cur_level,
+                ShellLevel::Operational
+                    | ShellLevel::ConfigRoot
+                    | ShellLevel::GlobalAllow
+                    | ShellLevel::Dns
+            ) || (tokens.len() >= 2 && tokens[1].parse::<u16>().is_err()) =>
+        {
+            if let Err(e) = crate::ssh::handle_ssh_cli_command(&tokens[1..]) {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+            }
+            return false;
+        }
         "cf" | "cloudflare"
             if tokens.len() == 1
                 || matches!(

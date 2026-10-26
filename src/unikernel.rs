@@ -479,6 +479,8 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
     let default_seed = "gateway default {\n    dhcp eth0\n    ssh:22\n}\n";
     let data_dir = Path::new("/data");
     if data_dir.exists() && data_dir.is_dir() {
+        let _ = fs::create_dir_all(data_dir.join("wg"));
+        let _ = fs::create_dir_all(data_dir.join("ssh"));
         let persistent_cfg = data_dir.join("Nftyfile");
         let is_empty = fs::read_to_string(&persistent_cfg)
             .map(|s| {

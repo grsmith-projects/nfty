@@ -43,6 +43,18 @@ pub fn print_context_help(level: &ShellLevel) {
                 "wg paste <name>".yellow()
             );
             println!(
+                "  {:<26} List saved SSH authorized keys (/data/ssh)",
+                "ssh".yellow()
+            );
+            println!(
+                "  {:<26} Add/edit an SSH public key (inline or nano)",
+                "ssh add <name> [pubkey]".yellow()
+            );
+            println!(
+                "  {:<26} Paste an SSH public key directly in CLI",
+                "ssh paste <name>".yellow()
+            );
+            println!(
                 "  {:<26} Cloudflare Tunnel & DNS status / API token setup",
                 "cf [status|token <KEY>]".yellow()
             );
@@ -128,6 +140,18 @@ pub fn print_context_help(level: &ShellLevel) {
             println!(
                 "  {:<32} Paste a WireGuard .conf directly in CLI",
                 "wg paste <name>".yellow()
+            );
+            println!(
+                "  {:<32} List saved SSH authorized keys (/data/ssh)",
+                "ssh".yellow()
+            );
+            println!(
+                "  {:<32} Add/edit an SSH public key (inline or nano)",
+                "ssh add <name> [pubkey]".yellow()
+            );
+            println!(
+                "  {:<32} Paste an SSH public key directly in CLI",
+                "ssh paste <name>".yellow()
             );
             println!(
                 "  {:<32} Cloudflare Tunnel & DNS setup (e.g. 'cf token <API_TOKEN>')",

@@ -55,6 +55,18 @@ pub struct WgUploadRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SshKeyUploadRequest {
+    pub name: String,
+    #[serde(alias = "public_key", alias = "config")]
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SshKeyDeleteRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CloudflareConfigRequest {
     pub api_token: Option<String>,
     pub account_id: Option<String>,
@@ -611,6 +623,7 @@ pub async fn route_api_request_scoped(
                         .collect(),
                 );
             }
+            let ssh_keys = crate::ssh::list_saved_ssh_keys();
             (
                 200,
                 json!({
@@ -623,6 +636,7 @@ pub async fn route_api_request_scoped(
                     "resolved_hosts": st.resolved_hosts,
                     "flows": flows,
                     "wg_configs": wg_configs,
+                    "ssh_keys": ssh_keys,
                     "kernel_applied": st.kernel_applied,
                     "nft_ruleset": nft,
                 }),
@@ -648,6 +662,37 @@ pub async fn route_api_request_scoped(
                 }
             }
             (200, json!({"ok": true, "wg_configs": wg_configs}))
+        }
+        ("GET", "/api/v1/ssh") => {
+            let ssh_keys = crate::ssh::list_saved_ssh_keys();
+            (200, json!({"ok": true, "ssh_keys": ssh_keys}))
+        }
+        ("POST", "/api/v1/ssh") => {
+            let req: SshKeyUploadRequest = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
+            };
+            match crate::ssh::save_ssh_pubkey_file(&req.name, &req.key) {
+                Ok((filename, parsed)) => (
+                    200,
+                    json!({
+                        "ok": true,
+                        "filename": filename,
+                        "parsed": parsed,
+                    }),
+                ),
+                Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+            }
+        }
+        ("DELETE", "/api/v1/ssh") => {
+            let req: SshKeyDeleteRequest = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
+            };
+            match crate::ssh::delete_ssh_pubkey_file(&req.name) {
+                Ok(filename) => (200, json!({"ok": true, "deleted": filename})),
+                Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+            }
         }
         ("GET", "/api/v1/cloudflare") | ("GET", "/api/v1/cf") => {
             let cf = crate::features::load_cloudflare_config();
