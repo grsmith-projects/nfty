@@ -294,9 +294,9 @@ mod tests {
             ShellLevel::ServiceTo("9000".to_string())
         );
 
-        handle_line("192.168.1.60:9000", &level, &shared).await;
-        handle_line("192.168.1.61 weight 2", &level, &shared).await;
-        handle_line("192.168.1.62:9000 backup", &level, &shared).await;
+        handle_line("169.254.1.60:9000", &level, &shared).await;
+        handle_line("169.254.1.61 weight 2", &level, &shared).await;
+        handle_line("169.254.1.62:9000 backup", &level, &shared).await;
 
         handle_line("..", &level, &shared).await;
         assert_eq!(
@@ -312,8 +312,8 @@ mod tests {
         let st = shared.read().unwrap();
         let svc = st.candidate.services.get("9000").expect("service 9000");
         assert_eq!(svc.backends.len(), 3);
-        assert_eq!(svc.backends[0].endpoint(), "192.168.1.60:9000");
-        assert_eq!(svc.backends[1].endpoint(), "192.168.1.61:9000");
+        assert_eq!(svc.backends[0].endpoint(), "169.254.1.60:9000");
+        assert_eq!(svc.backends[1].endpoint(), "169.254.1.61:9000");
         assert_eq!(svc.backends[1].weight, 2);
         assert!(svc.backends[2].backup);
 
@@ -321,7 +321,7 @@ mod tests {
         assert!(nft.contains("set meter_9000"));
         assert!(nft.contains("jhash ip saddr mod 3 map"));
         assert!(nft.contains("mode transparent"));
-        assert!(!nft.contains("0 : 192.168.1.62") && !nft.contains("2 : 192.168.1.62"));
+        assert!(!nft.contains("0 : 169.254.1.62") && !nft.contains("2 : 169.254.1.62"));
     }
 
     #[tokio::test]
@@ -334,7 +334,7 @@ mod tests {
         let (code, _) = route_api_request(
             "POST",
             "/api/v1/cli",
-            r#"{"command": "service 9000; to; 192.168.1.60:9000; ..; apply"}"#,
+            r#"{"command": "service 9000; to; 169.254.1.60:9000; ..; apply"}"#,
             &shared,
         )
         .await;
@@ -343,7 +343,7 @@ mod tests {
         let (code, _) = route_api_request(
             "POST",
             "/api/v1/allow",
-            r#"{"service": "9000", "hosts": ["*.office.lan", "192.168.50.*"], "apply": true}"#,
+            r#"{"service": "9000", "hosts": ["*.office.lan", "169.254.50.*"], "apply": true}"#,
             &shared,
         )
         .await;
@@ -371,23 +371,23 @@ mod tests {
         assert!(nft.contains("set allow_9000"));
         assert!(nft.contains("10.20.30.40"));
         assert!(nft.contains("10.20.30.41"));
-        assert!(nft.contains("192.168.50.0/24"));
+        assert!(nft.contains("169.254.50.0/24"));
     }
 
     #[test]
     fn test_backup_failover_and_vip_generation() {
         let raw = r#"
-service 192.168.1.240:443 {
+service 169.254.1.240:443 {
     vip eth0/24
     balance round-robin
     check tcp 5s
     limit 50/sec per-ip
     allow {
-        192.168.0.0/16
+        169.254.0.0/16
     }
     to {
-        192.168.1.101:443
-        192.168.1.102:443 backup
+        169.254.1.101:443
+        169.254.1.102:443 backup
     }
 }
 "#;
@@ -395,20 +395,20 @@ service 192.168.1.240:443 {
         let vip_cmds = generate_vip_commands(&Config::new(), &cfg);
         assert_eq!(
             vip_cmds,
-            vec!["ip addr replace 192.168.1.240/24 dev eth0".to_string()]
+            vec!["ip addr replace 169.254.1.240/24 dev eth0".to_string()]
         );
 
         let mut state = AppState::new(cfg, PathBuf::from("Nftyfile"));
         let nft1 = compile_nft_ruleset(&state.running, Some(&state));
-        assert!(nft1.contains("dnat to 192.168.1.101:443"));
+        assert!(nft1.contains("dnat to 169.254.1.101:443"));
 
         state
             .runtime
-            .entry("192.168.1.101:443".to_string())
+            .entry("169.254.1.101:443".to_string())
             .or_default()
             .health = HealthState::Down;
         let nft2 = compile_nft_ruleset(&state.running, Some(&state));
-        assert!(nft2.contains("dnat to 192.168.1.102:443"));
+        assert!(nft2.contains("dnat to 169.254.1.102:443"));
     }
 
     #[tokio::test]
@@ -420,34 +420,34 @@ service 192.168.1.240:443 {
         let level = Arc::new(Mutex::new(ShellLevel::Operational));
 
         handle_line("configure", &level, &shared).await;
-        handle_line("vip 192.168.1.4/21", &level, &shared).await;
+        handle_line("vip 169.254.1.4/21", &level, &shared).await;
         assert_eq!(
             *level.lock().unwrap(),
-            ShellLevel::Vip("192.168.1.4".to_string())
+            ShellLevel::Vip("169.254.1.4".to_string())
         );
 
         handle_line("service", &level, &shared).await;
         assert_eq!(
             *level.lock().unwrap(),
-            ShellLevel::VipService("192.168.1.4".to_string())
+            ShellLevel::VipService("169.254.1.4".to_string())
         );
 
-        handle_line("192.168.1.165:32400", &level, &shared).await;
+        handle_line("169.254.1.165:32400", &level, &shared).await;
         assert_eq!(
             *level.lock().unwrap(),
-            ShellLevel::Service("192.168.1.4:32400".to_string())
+            ShellLevel::Service("169.254.1.4:32400".to_string())
         );
         handle_line("hostname plex.local", &level, &shared).await;
         handle_line("exit", &level, &shared).await;
         assert_eq!(
             *level.lock().unwrap(),
-            ShellLevel::Vip("192.168.1.4".to_string())
+            ShellLevel::Vip("169.254.1.4".to_string())
         );
 
         handle_line("80 to 169.254.3.165:9090", &level, &shared).await;
         assert_eq!(
             *level.lock().unwrap(),
-            ShellLevel::Service("192.168.1.4:80".to_string())
+            ShellLevel::Service("169.254.1.4:80".to_string())
         );
         handle_line("hostname app.local", &level, &shared).await;
 
@@ -455,16 +455,17 @@ service 192.168.1.240:443 {
             let st = shared.read().unwrap();
             st.candidate.format_nftyfile()
         };
-        assert!(formatted.contains("vip 192.168.1.4 {"));
-        assert!(!formatted.contains("vip eth0/21"));
-        assert!(formatted.contains("192.168.1.165:32400 {"));
+        assert!(formatted.contains("vip 169.254.1.4 {"));
+        assert!(formatted.contains("interface eth0/21"));
+        assert!(formatted.contains("169.254.1.165:32400 {"));
         assert!(formatted.contains("80 to 169.254.3.165:9090 {"));
 
         let reparsed = parse_nftyfile(&formatted).expect("reparse formatted vip Nftyfile");
-        assert!(reparsed.services.contains_key("192.168.1.4:32400"));
-        assert!(reparsed.services.contains_key("192.168.1.4:80"));
+        assert_eq!(reparsed.vips["169.254.1.4"].prefix_len, 21);
+        assert!(reparsed.services.contains_key("169.254.1.4:32400"));
+        assert!(reparsed.services.contains_key("169.254.1.4:80"));
         assert_eq!(
-            reparsed.services["192.168.1.4:80"].backends[0].port,
+            reparsed.services["169.254.1.4:80"].backends[0].port,
             9090
         );
     }
@@ -485,7 +486,7 @@ service 192.168.1.240:443 {
         );
 
         handle_line("vlan 20", &level, &shared).await;
-        handle_line("80 to 192.168.2.215:8989", &level, &shared).await;
+        handle_line("80 to 169.254.2.215:8989", &level, &shared).await;
         assert_eq!(
             *level.lock().unwrap(),
             ShellLevel::Service("sonarr:80".to_string())
@@ -498,7 +499,7 @@ service 192.168.1.240:443 {
         assert!(formatted.contains("vip sonarr {"));
         assert!(formatted.contains("dhcp eth0"));
         assert!(formatted.contains("vlan 20"));
-        assert!(formatted.contains("80 to 192.168.2.215:8989"));
+        assert!(formatted.contains("80 to 169.254.2.215:8989"));
 
         let reparsed = parse_nftyfile(&formatted).expect("reparse dhcp + vlan Nftyfile");
         assert!(reparsed.vips["sonarr"].dhcp);
@@ -510,11 +511,11 @@ service 192.168.1.240:443 {
     #[tokio::test]
     async fn test_multi_vhost_and_adopt_and_dhcp_gateway() {
         let raw = r#"
-vip 192.168.1.4 {
-    80 to 192.168.2.215:8989 {
+vip 169.254.1.4 {
+    80 to 169.254.2.215:8989 {
         hostname sonarr.local
     }
-    80 to 192.168.2.215:7878 {
+    80 to 169.254.2.215:7878 {
         hostname radarr.local
     }
 }
@@ -566,7 +567,7 @@ gateway mullvad {
         let level = Arc::new(Mutex::new(ShellLevel::ConfigRoot));
 
         handle_line("vip sonarr", &level, &shared).await;
-        handle_line("80 to 192.168.2.215:8989", &level, &shared).await;
+        handle_line("80 to 169.254.2.215:8989", &level, &shared).await;
         handle_line("cloudflare-dns sonarr.example.com", &level, &shared).await;
 
         let formatted = {
@@ -584,7 +585,7 @@ gateway mullvad {
         let routes = crate::features::collect_cloudflare_routes(&reparsed);
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].1, "sonarr.example.com");
-        assert_eq!(routes[0].2, "http://192.168.2.215:8989");
+        assert_eq!(routes[0].2, "http://169.254.2.215:8989");
     }
 
     #[tokio::test]
@@ -692,5 +693,279 @@ dns {
         assert!(roundtrip.dns.is_some());
         assert_eq!(roundtrip.dns.as_ref().unwrap().records.len(), 8);
         assert_eq!(roundtrip.dns.as_ref().unwrap().nft_rules.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_scoped_api_service_and_keys_on_vip_and_gateway() {
+        let shared: SharedState = Arc::new(RwLock::new(AppState::new(
+            Config::new(),
+            PathBuf::from("Nftyfile"),
+        )));
+        let level = Arc::new(Mutex::new(ShellLevel::Operational));
+
+        handle_line("configure", &level, &shared).await;
+        handle_line("vip 169.254.1.4/24", &level, &shared).await;
+        handle_line("api:9090", &level, &shared).await;
+        assert_eq!(
+            *level.lock().unwrap(),
+            ShellLevel::Service("169.254.1.4:9090".to_string())
+        );
+        handle_line("key new ro", &level, &shared).await;
+        handle_line("key new rw", &level, &shared).await;
+        handle_line("exit", &level, &shared).await;
+        handle_line("exit", &level, &shared).await;
+
+        handle_line("gateway 169.254.1.10/24", &level, &shared).await;
+        handle_line("api:9091", &level, &shared).await;
+        assert_eq!(
+            *level.lock().unwrap(),
+            ShellLevel::GatewayApi("169.254.1.10".to_string(), 9091)
+        );
+        handle_line("key nfty_ro_custom_gw_token ro", &level, &shared).await;
+        handle_line("exit", &level, &shared).await;
+        handle_line("exit", &level, &shared).await;
+
+        let (ro_key, rw_key, formatted) = {
+            let mut st = shared.write().unwrap();
+            st.running = st.candidate.clone();
+            let svc = &st.running.services["169.254.1.4:9090"];
+            assert!(svc.is_local_api());
+            assert_eq!(svc.api_keys.len(), 2);
+            assert_eq!(svc.api_keys[0].scope, crate::ast::ApiKeyScope::ReadOnly);
+            assert_eq!(svc.api_keys[1].scope, crate::ast::ApiKeyScope::ReadWrite);
+            assert!(svc.api_keys[0].key.starts_with("nfty_ro_"));
+            assert!(svc.api_keys[1].key.starts_with("nfty_rw_"));
+            (
+                svc.api_keys[0].key.clone(),
+                svc.api_keys[1].key.clone(),
+                st.running.format_nftyfile(),
+            )
+        };
+
+        assert!(formatted.contains("api:9090 {"));
+        assert!(formatted.contains(&format!("key {} ro", ro_key)));
+        assert!(formatted.contains(&format!("key {} rw", rw_key)));
+        assert!(formatted.contains("api:9091 {"));
+        assert!(formatted.contains("key nfty_ro_custom_gw_token ro"));
+
+        let reparsed = parse_nftyfile(&formatted).expect("roundtrip api:port Nftyfile");
+        assert_eq!(
+            reparsed.verify_api_key(&ro_key),
+            Some(crate::ast::ApiKeyScope::ReadOnly)
+        );
+        assert_eq!(
+            reparsed.verify_api_key(&rw_key),
+            Some(crate::ast::ApiKeyScope::ReadWrite)
+        );
+        assert_eq!(
+            reparsed.verify_api_key("nfty_ro_custom_gw_token"),
+            Some(crate::ast::ApiKeyScope::ReadOnly)
+        );
+
+        // Verify read-only scope blocks write endpoints and redacts rw keys in GET /api/v1/config
+        let (code_ro_get, body_ro_get) = crate::api::route_api_request_scoped(
+            "GET",
+            "/api/v1/config",
+            "",
+            &shared,
+            crate::ast::ApiKeyScope::ReadOnly,
+        )
+        .await;
+        assert_eq!(code_ro_get, 200);
+        let body_ro_str = body_ro_get.to_string();
+        assert!(body_ro_str.contains(&ro_key));
+        assert!(!body_ro_str.contains(&rw_key));
+
+        let (code_ro_post, _) = crate::api::route_api_request_scoped(
+            "POST",
+            "/api/v1/cli",
+            r#"{"command": "status"}"#,
+            &shared,
+            crate::ast::ApiKeyScope::ReadOnly,
+        )
+        .await;
+        assert_eq!(code_ro_post, 403);
+
+        // Verify read-write scope allows writes and views all keys
+        let (code_rw_get, body_rw_get) = crate::api::route_api_request_scoped(
+            "GET",
+            "/api/v1/config",
+            "",
+            &shared,
+            crate::ast::ApiKeyScope::ReadWrite,
+        )
+        .await;
+        assert_eq!(code_rw_get, 200);
+        let body_rw_str = body_rw_get.to_string();
+        assert!(body_rw_str.contains(&ro_key));
+        assert!(body_rw_str.contains(&rw_key));
+    }
+
+    #[test]
+    fn test_lossless_ast_roundtrip_edge_cases() {
+        let raw = r#"
+vip 169.254.1.4/20 {
+    ssh:22 {
+        limit 20/min burst 5 global
+        allow {
+            169.254.1.0/24
+        }
+    }
+    dns:53 {
+        limit 500/sec global
+    }
+    8080 to 169.254.2.50:8080 {
+        check off
+        limit 100/sec burst 10 global
+    }
+}
+gateway 169.254.1.10/20 {
+    balance sticky
+    killswitch on
+    check off
+}
+dns {
+    domain off
+    auto-vips on
+    auto-hosts off
+    no upstream
+    txt _acme-challenge.example.com "v=spf1; include:example.com #1"
+    block ads.example.com
+}
+"#;
+        let cfg = parse_nftyfile(raw).expect("parse edge-case Nftyfile");
+        assert_eq!(cfg.vips["169.254.1.4"].prefix_len, 20);
+        assert_eq!(
+            cfg.services["169.254.1.4:22"]
+                .limit
+                .as_ref()
+                .unwrap()
+                .per_ip,
+            false
+        );
+        assert_eq!(
+            cfg.services["169.254.1.4:22"].allow,
+            vec!["169.254.1.0/24".to_string()]
+        );
+        assert_eq!(
+            cfg.services["169.254.1.4:8080"].check,
+            Some(crate::ast::HealthCheckConfig {
+                kind: crate::ast::HealthCheckKind::Disabled,
+                interval_secs: 5,
+            })
+        );
+        let dns = cfg.dns.as_ref().expect("dns present");
+        assert!(dns.domain.is_none());
+        assert!(!dns.auto_hosts);
+        assert!(dns.upstreams.is_empty());
+        assert_eq!(
+            dns.records,
+            vec![crate::ast::DnsRecord::Txt {
+                name: "_acme-challenge.example.com".to_string(),
+                text: "v=spf1; include:example.com #1".to_string(),
+            }]
+        );
+
+        let formatted = cfg.format_nftyfile();
+        let reparsed = parse_nftyfile(&formatted).expect("reparse edge-case Nftyfile");
+        assert_eq!(cfg, reparsed);
+
+        let (dnsmasq_conf, _) = crate::features::compile_dnsmasq_config(&reparsed, None);
+        assert!(dnsmasq_conf.contains("no-hosts\n"));
+        assert!(!dnsmasq_conf.contains("server=1.1.1.1"));
+        assert!(dnsmasq_conf.contains("address=/ads.example.com/0.0.0.0\n"));
+        assert!(dnsmasq_conf.contains("address=/ads.example.com/::\n"));
+    }
+
+    #[test]
+    fn test_partial_inline_wg_tunnel_rejected() {
+        let bad = r#"
+gateway 169.254.1.10 {
+    tunnels {
+        tun0 address 10.64.0.2/32 privkey AAAA
+    }
+}
+"#;
+        let res = parse_nftyfile(bad);
+        assert!(res.is_err());
+        let err_msg = format!("{:#}", res.unwrap_err());
+        assert!(err_msg.contains("requires all four parameters"));
+    }
+
+    #[test]
+    fn test_drained_backends_fail_closed() {
+        let raw = r#"
+service 169.254.1.240:80 {
+    to {
+        169.254.1.101:80
+        169.254.1.102:80 backup
+    }
+}
+"#;
+        let cfg = parse_nftyfile(raw).expect("parse service");
+        let mut st = AppState::new(cfg.clone(), PathBuf::from("Nftyfile"));
+        let svc = &cfg.services["169.254.1.240:80"];
+
+        // Drain primary -> should fail over to non-drained backup
+        st.runtime
+            .entry("169.254.1.101:80".to_string())
+            .or_default()
+            .drained = true;
+        let active1 = st.active_backends_for_service(&svc.backends);
+        assert_eq!(active1.len(), 1);
+        assert_eq!(active1[0].endpoint(), "169.254.1.102:80");
+
+        // Drain backup too -> must return empty (fail-closed) and never route to drained backends
+        st.runtime
+            .entry("169.254.1.102:80".to_string())
+            .or_default()
+            .drained = true;
+        let active2 = st.active_backends_for_service(&svc.backends);
+        assert!(active2.is_empty());
+    }
+
+    #[test]
+    fn test_uncommitted_candidate_api_key_not_authenticated() {
+        let committed = parse_nftyfile(
+            r#"
+vip 169.254.1.4 {
+    api:9090 {
+        key nfty_rw_committed_token rw
+    }
+}
+"#,
+        )
+        .unwrap();
+        let candidate = parse_nftyfile(
+            r#"
+vip 169.254.1.4 {
+    api:9090 {
+        key nfty_rw_committed_token rw
+        key nfty_rw_uncommitted_candidate rw
+    }
+}
+"#,
+        )
+        .unwrap();
+        let mut app_state = AppState::new(committed, PathBuf::from("Nftyfile"));
+        app_state.candidate = candidate;
+        let shared: SharedState = Arc::new(RwLock::new(app_state));
+
+        assert_eq!(
+            crate::api::authenticate_api_request(
+                &shared,
+                false,
+                false,
+                Some("nfty_rw_committed_token")
+            ),
+            Ok(crate::ast::ApiKeyScope::ReadWrite)
+        );
+        assert!(crate::api::authenticate_api_request(
+            &shared,
+            false,
+            false,
+            Some("nfty_rw_uncommitted_candidate")
+        )
+        .is_err());
     }
 }
