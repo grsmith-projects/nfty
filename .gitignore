@@ -3,6 +3,7 @@
 /packaging/unikernel/busybox
 /packaging/unikernel/cloudflared
 /packaging/rk3588s/.cache/
+/packaging/unikernel/.cache/
 nfty-auth.json
 nfty-cloudflare.json
 nfty_ssh_host_ed25519_key
