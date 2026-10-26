@@ -338,27 +338,29 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
                 "/dev/sdb2",
                 "/dev/vda1",
                 "/dev/sda1",
-                "/dev/vda",
-                "/dev/sda",
                 "/dev/vdb",
                 "/dev/sdb",
             ];
-            let mut mounted = false;
-            for _ in 0..8 {
+            for _ in 0..4 {
+                let mut mounted = false;
+                let mut any_dev = false;
                 for dev in data_devs {
-                    if Path::new(dev).exists() && sys_mount(dev, "/data", "ext4", 0) {
-                        eprintln!(
-                            "[nfty-unikernel] Mounted persistent storage {} at /data (ext4)",
-                            dev
-                        );
-                        mounted = true;
-                        break;
+                    if Path::new(dev).exists() {
+                        any_dev = true;
+                        if sys_mount(dev, "/data", "ext4", 0) {
+                            eprintln!(
+                                "[nfty-unikernel] Mounted persistent storage {} at /data (ext4)",
+                                dev
+                            );
+                            mounted = true;
+                            break;
+                        }
                     }
                 }
-                if mounted {
+                if mounted || any_dev {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
 
