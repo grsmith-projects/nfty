@@ -98,7 +98,7 @@ Use this mode to run `nfty` on an existing Debian, Ubuntu, Arch, Fedora, or Alpi
 
    [Service]
    Type=simple
-   ExecStart=/usr/local/bin/nfty --file /etc/nfty/Nftyfile --api-bind 127.0.0.1:9090 daemon
+   ExecStart=/usr/local/bin/nfty --file /etc/nfty/Nftyfile daemon
    ExecReload=/bin/kill -HUP $MAINPID
    Restart=always
    RestartSec=2
@@ -110,7 +110,7 @@ Use this mode to run `nfty` on an existing Debian, Ubuntu, Arch, Fedora, or Alpi
 
 4. **Run manually in foreground daemon mode**:
    ```bash
-   sudo nfty --file /etc/nfty/Nftyfile --api-bind 127.0.0.1:9090 daemon
+   sudo nfty --file /etc/nfty/Nftyfile daemon
    ```
 
 ---
@@ -184,7 +184,7 @@ qemu-system-x86_64 \
   -m 512M \
   -smp 2 \
   -cdrom dist/nfty-unikernel-x86_64.iso \
-  -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::9090-:9090 \
+  -netdev user,id=net0,hostfwd=tcp::2222-:22 \
   -device virtio-net-pci,netdev=net0 \
   -nographic
 ```
@@ -196,7 +196,7 @@ qemu-system-x86_64 \
   -enable-kvm -m 256M -smp 2 \
   -kernel /boot/vmlinuz-linux \
   -initrd dist/nfty-unikernel-initramfs.cpio.gz \
-  -append "console=ttyS0 quiet rdinit=/init -- --unikernel --file /data/Nftyfile --api-bind 0.0.0.0:9090" \
+  -append "console=ttyS0 quiet rdinit=/init -- --unikernel --file /data/Nftyfile" \
   -nographic
 ```
 
@@ -390,8 +390,8 @@ lxc exec nfty -- nfty -c "ssh add workstation $(cat ~/.ssh/id_ed25519.pub)"
    - `/data/Nftyfile` (Appliance / Unikernel / LXD persistent volume)
    - `./Nftyfile` (Current working directory)
    - `/etc/nfty/Nftyfile` (Standalone Linux daemon path)
-2. **Automatic Daemon IPC Sync**:
-   When you run `nfty` from a secondary SSH session or `lxc exec` shell (where `PID != 1`), any configuration changes you apply are atomically written to `/data/Nftyfile` **and** pushed over loopback IPC (`127.0.0.1:9090`) to the running daemon so background health checkers, `dnsmasq`, and proxy supervisors update immediately.
+2. **Automatic Daemon IPC & Disk Sync**:
+   When you run `nfty` from a secondary SSH session or `lxc exec` shell (where `PID != 1`), any configuration changes you apply are atomically written to `/data/Nftyfile`, automatically detected and reconciled by the running PID 1 daemon, and also pushed over loopback IPC if any `api:<port>` or `web:<port>` listener is enabled—so background health checkers, `dnsmasq`, and proxy supervisors update immediately.
 
 ### Common CLI Invocations
 

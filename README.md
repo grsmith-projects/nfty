@@ -411,8 +411,8 @@ To run `nfty` on an existing Linux server or router without the PID-1 unikernel 
 ```bash
 ./packaging/standalone/build-standalone.sh
 
-# Run interactive REPL + background health prober + HTTP control API
-sudo ./dist/standalone/nfty --file /etc/nfty/Nftyfile --api-bind 127.0.0.1:9090
+# Run interactive REPL + background health prober
+sudo ./dist/standalone/nfty --file /etc/nfty/Nftyfile
 
 # Or run headless under systemd (see packaging/standalone/nfty.service)
 sudo ./dist/standalone/nfty --file /etc/nfty/Nftyfile daemon

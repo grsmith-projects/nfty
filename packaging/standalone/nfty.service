@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/nfty --file /etc/nfty/Nftyfile --api-bind 127.0.0.1:9090 daemon
+ExecStart=/usr/local/bin/nfty --file /etc/nfty/Nftyfile daemon
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=2

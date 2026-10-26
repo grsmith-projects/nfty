@@ -329,7 +329,7 @@ truncate -s 128M "$DATA_PART"
 mkfs.ext4 -q -F -L "nfty-data" -d "$WORK_DIR/data-seed" "$DATA_PART"
 
 KERNEL_IMG="$WORK_DIR/kern/vmlinuz"
-BOOTARGS="console=tty0 console=ttyS0,115200n8 quiet rdinit=/init -- --unikernel --file /data/Nftyfile --api-bind 0.0.0.0:9090"
+BOOTARGS="console=tty0 console=ttyS0,115200n8 quiet rdinit=/init -- --unikernel --file /data/Nftyfile"
 
 cat > "$WORK_DIR/grub.cfg" <<EOF
 serial --unit=0 --speed=115200
