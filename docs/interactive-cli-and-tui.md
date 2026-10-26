@@ -58,9 +58,9 @@ The interactive shell separates **Operational Mode** (read-only inspection, heal
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Operational: Login / `nfty`
-    Operational --> ConfigRoot: `configure` / `conf` / `edit`
-    ConfigRoot --> Operational: `exit` / `end` / `Ctrl-C`
+    [*] --> Operational: Login / nfty
+    Operational --> ConfigRoot: configure / conf / edit
+    ConfigRoot --> Operational: exit / end / Ctrl-C
     
     state "Operational Mode (nfty>)" as Operational
     state "Configuration Mode" as ConfigMode {
@@ -74,14 +74,14 @@ stateDiagram-v2
         GwTunCtx: nfty(config-gateway:169.254.1.10-tunnels)#
         GwApiCtx: nfty(config-gateway:169.254.1.10-api:9090)#
 
-        ConfigRoot --> AllowCtx: `allow`
-        ConfigRoot --> DnsCtx: `dns`
-        ConfigRoot --> VipCtx: `vip 169.254.1.4`
-        VipCtx --> VipSvcCtx: `service https:443`
-        VipSvcCtx --> VipSvcToCtx: `to`
-        ConfigRoot --> GwCtx: `gateway 169.254.1.10`
-        GwCtx --> GwTunCtx: `tunnels`
-        GwCtx --> GwApiCtx: `api:9090`
+        ConfigRoot --> AllowCtx: allow
+        ConfigRoot --> DnsCtx: dns
+        ConfigRoot --> VipCtx: vip 169.254.1.4
+        VipCtx --> VipSvcCtx: service https:443
+        VipSvcCtx --> VipSvcToCtx: to
+        ConfigRoot --> GwCtx: gateway 169.254.1.10
+        GwCtx --> GwTunCtx: tunnels
+        GwCtx --> GwApiCtx: api:9090
     }
 ```
 
@@ -235,7 +235,7 @@ flowchart LR
     Diff --> Test["test / validate<br/>(nft -c -f dry-run)"]
     Test --> Apply["apply / commit<br/>(Atomic kernel swap)"]
     Test --> ApplyConfirm["apply confirm 60<br/>(Dead-man's switch)"]
-    ApplyConfirm -->|"`confirm` within 60s"| Saved["Save to /data/Nftyfile"]
+    ApplyConfirm -->|"confirm within 60s"| Saved["Save to /data/Nftyfile"]
     ApplyConfirm -->|"Timeout expires"| AutoRollback["Automatic Rollback"]
     Apply --> Saved
 ```
