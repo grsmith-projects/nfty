@@ -31,11 +31,21 @@ struct FlatBackendRow {
     in_active_map: bool,
 }
 
+struct TerminalCleanupGuard;
+
+impl Drop for TerminalCleanupGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
 pub async fn run_watch_dashboard(shared: SharedState) -> Result<()> {
     // Run an initial probe pass before opening TUI
     let _ = run_all_probes_once(&shared).await;
 
     enable_raw_mode()?;
+    let _cleanup_guard = TerminalCleanupGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-LXD_HOST="${1:-192.168.1.3}"
+LXD_HOST="${1:-169.254.1.3}"
 INSTANCE="${2:-nfty}"
 VOLUME_NAME="${INSTANCE}-data"
 POOL_NAME="default"
@@ -37,11 +37,7 @@ ssh -n "${LXD_HOST}" "
       rm -rf /tmp/nfty-data-backup && mkdir -p /tmp/nfty-data-backup
       lxc file pull -r ${INSTANCE}/data/. /tmp/nfty-data-backup/ < /dev/null 2>/dev/null || true
       lxc config device add ${INSTANCE} data disk pool=${POOL_NAME} source=${VOLUME_NAME} path=/data < /dev/null
-      for f in /tmp/nfty-data-backup/*; do
-        if [ -f \"\$f\" ]; then
-          lxc file push \"\$f\" ${INSTANCE}/data/ < /dev/null
-        fi
-      done
+      lxc file push -r /tmp/nfty-data-backup/. ${INSTANCE}/data/ < /dev/null 2>/dev/null || true
       rm -rf /tmp/nfty-data-backup
     fi
 
@@ -55,9 +51,10 @@ ssh -n "${LXD_HOST}" "
   fi
 
   # 4. Promote staging image alias to nfty-ct
-  lxc image delete nfty-ct < /dev/null 2>/dev/null || true
-  lxc image alias create nfty-ct \$(lxc image info nfty-ct-staging | awk '/^Fingerprint:/ {print \$2}') < /dev/null
-  lxc image delete nfty-ct-staging < /dev/null 2>/dev/null || true
+  FP=\$(lxc image info nfty-ct-staging | awk '/^Fingerprint:/ {print \$2}')
+  lxc image alias delete nfty-ct < /dev/null 2>/dev/null || true
+  lxc image alias create nfty-ct \"\$FP\" < /dev/null
+  lxc image alias delete nfty-ct-staging < /dev/null 2>/dev/null || true
 
   sleep 3
   lxc list ${INSTANCE}

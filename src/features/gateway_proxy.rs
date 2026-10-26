@@ -170,13 +170,33 @@ fn select_gateway_tunnel(shared: &SharedState, gw_key: &str) -> GatewayRouteDeci
     GatewayRouteDecision::DirectHost
 }
 
+async fn resolve_target_ipv4(target_host: &str, target_port: u16) -> Option<Ipv4Addr> {
+    if let Ok(ip) = target_host.trim().parse::<Ipv4Addr>() {
+        return Some(ip);
+    }
+    if let Ok(Ok(addrs)) = tokio::time::timeout(
+        Duration::from_millis(2000),
+        tokio::net::lookup_host((target_host.trim(), target_port)),
+    )
+    .await
+    {
+        for sa in addrs {
+            if let std::net::IpAddr::V4(v4) = sa.ip() {
+                return Some(v4);
+            }
+        }
+    }
+    crate::parser::resolve_hostname_sync(target_host)
+}
+
 async fn connect_via_gateway_tunnel(
     shared: &SharedState,
     gw_key: &str,
     target_host: &str,
     target_port: u16,
 ) -> Result<(TcpStream, Option<String>)> {
-    let resolved_ip = crate::parser::resolve_hostname_sync(target_host)
+    let resolved_ip = resolve_target_ipv4(target_host, target_port)
+        .await
         .ok_or_else(|| anyhow::anyhow!("Could not resolve '{}'", target_host))?;
     let target_addr = SocketAddr::new(std::net::IpAddr::V4(resolved_ip), target_port);
 
@@ -243,9 +263,28 @@ async fn run_single_gateway_proxy(
     };
 
     loop {
-        let Ok((client, _peer)) = listener.accept().await else {
+        let Ok((client, peer)) = listener.accept().await else {
             continue;
         };
+        let peer_ip = match peer.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(_) => Ipv4Addr::LOCALHOST,
+        };
+        let allowed = {
+            if let Ok(st) = shared.read() {
+                let cfg = st.active_config();
+                if let Some(gw) = cfg.gateways.get(&gw_key) {
+                    st.is_ip_allowed(peer_ip, &gw.allow, &cfg.global_allow)
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        };
+        if !allowed {
+            continue;
+        }
         let shared_c = shared.clone();
         let gw_k = gw_key.clone();
         tokio::spawn(async move {
@@ -256,7 +295,7 @@ async fn run_single_gateway_proxy(
                 GatewayServiceKind::Socks5 => {
                     let _ = handle_socks5_client(client, shared_c, gw_k).await;
                 }
-                GatewayServiceKind::Ssh | GatewayServiceKind::Dns => {}
+                GatewayServiceKind::Ssh | GatewayServiceKind::Dns | GatewayServiceKind::Api => {}
             }
         });
     }
@@ -272,7 +311,18 @@ async fn handle_privoxy_client(
     if n == 0 {
         return Ok(());
     }
-    let req_str = String::from_utf8_lossy(&buf[..n]);
+    let header_end = buf[..n]
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .or_else(|| {
+            buf[..n]
+                .windows(2)
+                .position(|w| w == b"\n\n")
+                .map(|p| p + 2)
+        })
+        .unwrap_or(n);
+    let req_str = String::from_utf8_lossy(&buf[..header_end]);
     let mut lines = req_str.lines();
     let first_line = lines.next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
@@ -294,6 +344,9 @@ async fn handle_privoxy_client(
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: nfty-privoxy\r\n\r\n")
             .await?;
+        if header_end < n {
+            upstream.write_all(&buf[header_end..n]).await?;
+        }
         if let Ok((up_bytes, down_bytes)) =
             tokio::io::copy_bidirectional(&mut client, &mut upstream).await
         {
@@ -301,7 +354,7 @@ async fn handle_privoxy_client(
                 if let Ok(mut st) = shared.write() {
                     let rt = st.runtime.entry(ep).or_default();
                     rt.packets += 2;
-                    rt.bytes += up_bytes + down_bytes;
+                    rt.bytes += up_bytes + down_bytes + ((n - header_end) as u64);
                 }
             }
         }
@@ -342,6 +395,9 @@ async fn handle_privoxy_client(
     sanitized.push_str("Connection: close\r\n\r\n");
 
     upstream.write_all(sanitized.as_bytes()).await?;
+    if header_end < n {
+        upstream.write_all(&buf[header_end..n]).await?;
+    }
     if let Ok((up_bytes, down_bytes)) =
         tokio::io::copy_bidirectional(&mut client, &mut upstream).await
     {
@@ -349,7 +405,10 @@ async fn handle_privoxy_client(
             if let Ok(mut st) = shared.write() {
                 let rt = st.runtime.entry(ep).or_default();
                 rt.packets += 2;
-                rt.bytes += up_bytes + down_bytes + (sanitized.len() as u64);
+                rt.bytes += up_bytes
+                    + down_bytes
+                    + (sanitized.len() as u64)
+                    + ((n - header_end) as u64);
             }
         }
     }
@@ -361,30 +420,63 @@ async fn handle_socks5_client(
     shared: SharedState,
     gw_key: String,
 ) -> Result<()> {
-    let mut greet = [0u8; 258];
-    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut greet)).await??;
-    if n < 2 || greet[0] != 0x05 {
+    let mut buf = Vec::with_capacity(512);
+    let mut tmp = [0u8; 512];
+
+    while buf.len() < 2 {
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut tmp)).await??;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    if buf[0] != 0x05 {
         return Ok(());
+    }
+    let nmethods = buf[1] as usize;
+    let greet_len = 2 + nmethods;
+    while buf.len() < greet_len {
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut tmp)).await??;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
     }
     client.write_all(&[0x05, 0x00]).await?;
 
-    let mut req = [0u8; 512];
-    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut req)).await??;
-    if n < 7 || req[0] != 0x05 || req[1] != 0x01 {
+    let mut req = buf.split_off(greet_len);
+    while req.len() < 5 {
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut tmp)).await??;
+        if n == 0 {
+            return Ok(());
+        }
+        req.extend_from_slice(&tmp[..n]);
+    }
+    if req[0] != 0x05 || req[1] != 0x01 {
         return Ok(());
     }
 
+    let req_hdr_len = match req[3] {
+        0x01 => 10usize,
+        0x03 => 5 + (req[4] as usize) + 2,
+        _ => return Ok(()),
+    };
+    while req.len() < req_hdr_len {
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut tmp)).await??;
+        if n == 0 {
+            return Ok(());
+        }
+        req.extend_from_slice(&tmp[..n]);
+    }
+
     let (host, port) = match req[3] {
-        0x01 if n >= 10 => {
+        0x01 => {
             let ip = Ipv4Addr::new(req[4], req[5], req[6], req[7]);
             let port = u16::from_be_bytes([req[8], req[9]]);
             (ip.to_string(), port)
         }
         0x03 => {
             let dlen = req[4] as usize;
-            if n < 5 + dlen + 2 {
-                return Ok(());
-            }
             let domain = std::str::from_utf8(&req[5..5 + dlen])?.to_string();
             let port = u16::from_be_bytes([req[5 + dlen], req[5 + dlen + 1]]);
             (domain, port)
@@ -397,6 +489,11 @@ async fn handle_socks5_client(
         .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
 
+    let extra_payload = &req[req_hdr_len..];
+    if !extra_payload.is_empty() {
+        upstream.write_all(extra_payload).await?;
+    }
+
     if let Ok((up_bytes, down_bytes)) =
         tokio::io::copy_bidirectional(&mut client, &mut upstream).await
     {
@@ -404,7 +501,7 @@ async fn handle_socks5_client(
             if let Ok(mut st) = shared.write() {
                 let rt = st.runtime.entry(ep).or_default();
                 rt.packets += 2;
-                rt.bytes += up_bytes + down_bytes;
+                rt.bytes += up_bytes + down_bytes + (extra_payload.len() as u64);
             }
         }
     }
