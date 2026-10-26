@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Proto {
     Tcp,
@@ -140,6 +140,7 @@ pub enum HealthCheckKind {
     Tcp,
     Http { path: String },
     Ping,
+    Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +155,7 @@ impl fmt::Display for HealthCheckConfig {
             HealthCheckKind::Tcp => write!(f, "tcp {}s", self.interval_secs),
             HealthCheckKind::Http { path } => write!(f, "http {} {}s", path, self.interval_secs),
             HealthCheckKind::Ping => write!(f, "ping {}s", self.interval_secs),
+            HealthCheckKind::Disabled => write!(f, "off"),
         }
     }
 }
@@ -199,6 +201,8 @@ impl fmt::Display for RateLimit {
         }
         if self.per_ip {
             write!(f, " per-ip")?;
+        } else {
+            write!(f, " global")?;
         }
         Ok(())
     }
@@ -246,14 +250,57 @@ impl fmt::Display for Backend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ApiKeyScope {
+    #[serde(rename = "ro", alias = "readonly", alias = "read-only")]
+    ReadOnly,
+    #[serde(rename = "rw", alias = "readwrite", alias = "read-write")]
+    ReadWrite,
+}
+
+impl ApiKeyScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ApiKeyScope::ReadOnly => "ro",
+            ApiKeyScope::ReadWrite => "rw",
+        }
+    }
+}
+
+impl fmt::Display for ApiKeyScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub key: String,
+    pub scope: ApiKeyScope,
+}
+
+impl fmt::Display for ApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "key {} {}", self.key, self.scope)
+    }
+}
+
+pub fn generate_api_key(scope: ApiKeyScope) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 16] = rng.gen();
+    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("nfty_{}_{}", scope, hex)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Service {
-    /// Canonical key, e.g. "9000", "192.168.1.240:443", "sonarr:80", "53/udp"
+    /// Canonical key, e.g. "9000", "169.254.1.240:443", "sonarr:80", "53/udp"
     pub key: String,
-    /// Optional parent VIP key (e.g. "192.168.1.4" or DHCP VIP hostname "sonarr")
+    /// Optional parent VIP key (e.g. "169.254.1.4" or DHCP VIP hostname "sonarr")
     #[serde(default)]
     pub vip_id: Option<String>,
-    /// Optional human/target name inside a `vip <ip> -> service` container (e.g. "plex:32400", "app-backend:9090", "ssh:22")
+    /// Optional human/target name inside a `vip <ip> -> service` container (e.g. "plex:32400", "app-backend:9090", "ssh:22", "api:9090")
     #[serde(default)]
     pub name: Option<String>,
     pub listen_ip: Option<Ipv4Addr>,
@@ -272,11 +319,14 @@ pub struct Service {
     /// Optional HTTP Basic Authentication rules (e.g. "user:pass", "nfty")
     #[serde(default)]
     pub auth: Vec<String>,
+    /// Optional scoped API keys when this service is a local `api:<port>` control service
+    #[serde(default)]
+    pub api_keys: Vec<ApiKey>,
     pub balance: BalanceStrategy,
     pub mode: ForwardMode,
     pub check: Option<HealthCheckConfig>,
     pub limit: Option<RateLimit>,
-    /// Allow-list entries: can be IP/CIDR ("192.168.1.0/24"), IP wildcard ("192.168.1.*"),
+    /// Allow-list entries: can be IP/CIDR ("169.254.1.0/24"), IP wildcard ("169.254.1.*"),
     /// hostname ("admin.office.lan"), or wildcard hostname ("*.trusted.lan", "*")
     pub allow: Vec<String>,
     pub backends: Vec<Backend>,
@@ -296,6 +346,7 @@ impl Service {
             cloudflare: None,
             cloudflare_auth: Vec::new(),
             auth: Vec::new(),
+            api_keys: Vec::new(),
             balance: BalanceStrategy::RoundRobin,
             mode: ForwardMode::Nat,
             check: None,
@@ -320,6 +371,9 @@ impl Service {
     }
 
     pub fn display_name(&self) -> String {
+        if self.is_local_api() {
+            return format!("api:{}", self.port);
+        }
         if let Some(n) = &self.name {
             return n.clone();
         }
@@ -378,7 +432,20 @@ impl Service {
             && self.cloudflare.is_none()
     }
 
+    pub fn is_local_api(&self) -> bool {
+        self.name
+            .as_deref()
+            .map(|n| n.eq_ignore_ascii_case("api") || n.to_ascii_lowercase().starts_with("api:"))
+            .unwrap_or(false)
+            || (!self.api_keys.is_empty()
+                && self.backends.len() == 1
+                && self.backends[0].ip.is_loopback())
+    }
+
     pub fn format_in_vip(&self) -> String {
+        let is_api = self.is_local_api();
+        let is_ssh = self.is_local_ssh();
+        let is_dns = self.is_local_dns();
         let single_simple_backend =
             self.backends.len() == 1 && self.backends[0].weight == 1 && !self.backends[0].backup;
         let port_prefix = if self.proto == Proto::Tcp {
@@ -387,7 +454,13 @@ impl Service {
             format!("{}/{}", self.port, self.proto)
         };
 
-        let (hdr, port_encoded_in_hdr, backend_encoded_in_hdr) = if single_simple_backend {
+        let (hdr, port_encoded_in_hdr, backend_encoded_in_hdr) = if is_api {
+            (format!("api:{}", self.port), true, true)
+        } else if is_ssh {
+            (format!("ssh:{}", self.port), true, true)
+        } else if is_dns {
+            (format!("dns:{}", self.port), true, true)
+        } else if single_simple_backend {
             let b_str = self.backends[0].to_string();
             if self.port != self.backends[0].port {
                 (format!("{} to {}", port_prefix, b_str), true, true)
@@ -409,7 +482,12 @@ impl Service {
         if !port_encoded_in_hdr {
             body.push_str(&format!("        port {}\n", self.port));
         }
-        if self.proto != Proto::Tcp && !hdr.contains('/') {
+        if !is_dns
+            && !is_ssh
+            && !is_api
+            && self.proto != Proto::Tcp
+            && !hdr.contains('/')
+        {
             body.push_str(&format!("        proto {}\n", self.proto));
         }
         if let Some(h) = &self.hostname {
@@ -429,6 +507,9 @@ impl Service {
                 "        auth {}\n",
                 self.auth.join(" ")
             ));
+        }
+        for k in &self.api_keys {
+            body.push_str(&format!("        key {} {}\n", k.key, k.scope));
         }
         if self.balance != BalanceStrategy::RoundRobin || self.backends.len() > 1 {
             body.push_str(&format!("        balance {}\n", self.balance));
@@ -487,6 +568,9 @@ impl Service {
                 self.auth.join(" ")
             ));
         }
+        for k in &self.api_keys {
+            out.push_str(&format!("    key {} {}\n", k.key, k.scope));
+        }
         if self.balance != BalanceStrategy::RoundRobin || self.backends.len() > 1 {
             out.push_str(&format!("    balance {}\n", self.balance));
         }
@@ -506,7 +590,7 @@ impl Service {
             }
             out.push_str("    }\n");
         }
-        if !self.backends.is_empty() {
+        if !self.backends.is_empty() && !self.is_local_api() {
             out.push_str("    to {\n");
             for b in &self.backends {
                 out.push_str(&format!("        {}\n", b));
@@ -587,6 +671,7 @@ pub enum GatewayServiceKind {
     Socks5,
     Ssh,
     Dns,
+    Api,
 }
 
 impl fmt::Display for GatewayServiceKind {
@@ -596,6 +681,7 @@ impl fmt::Display for GatewayServiceKind {
             GatewayServiceKind::Socks5 => write!(f, "socks5"),
             GatewayServiceKind::Ssh => write!(f, "ssh"),
             GatewayServiceKind::Dns => write!(f, "dns"),
+            GatewayServiceKind::Api => write!(f, "api"),
         }
     }
 }
@@ -604,6 +690,31 @@ impl fmt::Display for GatewayServiceKind {
 pub struct GatewayService {
     pub kind: GatewayServiceKind,
     pub port: u16,
+    #[serde(default)]
+    pub api_keys: Vec<ApiKey>,
+}
+
+impl GatewayService {
+    pub fn new(kind: GatewayServiceKind, port: u16) -> Self {
+        Self {
+            kind,
+            port,
+            api_keys: Vec::new(),
+        }
+    }
+
+    pub fn format_block(&self) -> String {
+        if self.api_keys.is_empty() {
+            format!("{}:{}\n", self.kind, self.port)
+        } else {
+            let mut out = format!("{}:{} {{\n", self.kind, self.port);
+            for k in &self.api_keys {
+                out.push_str(&format!("    key {} {}\n", k.key, k.scope));
+            }
+            out.push_str("}\n");
+            out
+        }
+    }
 }
 
 impl fmt::Display for GatewayService {
@@ -640,7 +751,7 @@ impl fmt::Display for GatewayPortForward {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gateway {
-    /// Virtual Gateway IPv4 address (e.g. "192.168.1.5")
+    /// Virtual Gateway IPv4 address (e.g. "169.254.1.5")
     pub key: String,
     pub listen_ip: Ipv4Addr,
     pub vip: Option<VipConfig>,
@@ -651,7 +762,7 @@ pub struct Gateway {
     pub check: Option<HealthCheckConfig>,
     #[serde(default)]
     pub allow: Vec<String>,
-    /// Gateway-attached local services (e.g. `privoxy:8118`, `socks5:1080`, `ssh:22`)
+    /// Gateway-attached local services (e.g. `privoxy:8118`, `socks5:1080`, `ssh:22`, `api:9090`)
     #[serde(default)]
     pub services: Vec<GatewayService>,
     /// Inbound port forwards from the gateway's WireGuard tunnel interfaces to LAN backends (e.g. `forward 51413 to 169.254.20.10:51413`)
@@ -705,8 +816,8 @@ impl Gateway {
         if let Some(vip) = &self.vip {
             if vip.dhcp {
                 out.push_str(&format!("    dhcp {}\n", vip.interface));
-            } else if vip.interface != "eth0" {
-                if vip.prefix_len == 32 {
+            } else if vip.interface != "eth0" || vip.prefix_len != default_eth0_prefix_len() {
+                if vip.prefix_len == 32 && vip.interface != "eth0" {
                     out.push_str(&format!("    interface {}\n", vip.interface));
                 } else {
                     out.push_str(&format!("    interface {}/{}\n", vip.interface, vip.prefix_len));
@@ -726,6 +837,8 @@ impl Gateway {
         ));
         if let Some(check) = &self.check {
             out.push_str(&format!("    check {}\n", check));
+        } else {
+            out.push_str("    check off\n");
         }
         if !self.allow.is_empty() {
             out.push_str("    allow {\n");
@@ -735,7 +848,15 @@ impl Gateway {
             out.push_str("    }\n");
         }
         for s in &self.services {
-            out.push_str(&format!("    {}\n", s));
+            if s.kind == GatewayServiceKind::Api && !s.api_keys.is_empty() {
+                out.push_str(&format!("    {}:{} {{\n", s.kind, s.port));
+                for k in &s.api_keys {
+                    out.push_str(&format!("        key {} {}\n", k.key, k.scope));
+                }
+                out.push_str("    }\n");
+            } else {
+                out.push_str(&format!("    {}\n", s));
+            }
         }
         for fwd in &self.forwards {
             out.push_str(&format!("    {}\n", fwd));
@@ -810,7 +931,10 @@ impl fmt::Display for DnsRecord {
             DnsRecord::Aaaa { name, ip } => write!(f, "aaaa {} {}", name, ip),
             DnsRecord::Address { domain, ip } => write!(f, "address {} {}", domain, ip),
             DnsRecord::Cname { alias, target } => write!(f, "cname {} {}", alias, target),
-            DnsRecord::Txt { name, text } => write!(f, "txt {} \"{}\"", name, text),
+            DnsRecord::Txt { name, text } => {
+                let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+                write!(f, "txt {} \"{}\"", name, escaped)
+            }
             DnsRecord::Srv {
                 service,
                 target,
@@ -976,6 +1100,8 @@ impl DnsConfig {
         }
         if let Some(dom) = &self.domain {
             out.push_str(&format!("    domain {}\n", dom));
+        } else {
+            out.push_str("    domain off\n");
         }
         if self.cache_size != 10000 {
             out.push_str(&format!("    cache-size {}\n", self.cache_size));
@@ -1002,6 +1128,8 @@ impl DnsConfig {
         }
         if !self.upstreams.is_empty() {
             out.push_str(&format!("    upstream {}\n", self.upstreams.join(" ")));
+        } else {
+            out.push_str("    no upstream\n");
         }
         for fz in &self.forward_zones {
             out.push_str(&format!("    {}\n", fz));
@@ -1034,7 +1162,7 @@ pub struct Config {
     /// Optional dnsmasq-backed programmable DNS endpoint configuration (`dns { ... }`)
     #[serde(default)]
     pub dns: Option<DnsConfig>,
-    /// Explicitly defined VIP containers (`vip 192.168.1.4 { ... }` or `vip sonarr { dhcp eth0 ... }`)
+    /// Explicitly defined VIP containers (`vip 169.254.1.4 { ... }` or `vip sonarr { dhcp eth0 ... }`)
     #[serde(default)]
     pub vips: BTreeMap<String, VipConfig>,
     pub services: BTreeMap<String, Service>,
@@ -1070,6 +1198,96 @@ impl Config {
                 .any(|g| g.services.iter().any(|gs| gs.kind == GatewayServiceKind::Dns))
     }
 
+    pub fn has_any_api_service(&self) -> bool {
+        self.services.values().any(|s| s.is_local_api())
+            || self
+                .gateways
+                .values()
+                .any(|g| g.services.iter().any(|gs| gs.kind == GatewayServiceKind::Api))
+    }
+
+    pub fn has_any_api_keys(&self) -> bool {
+        self.services.values().any(|s| !s.api_keys.is_empty())
+            || self
+                .gateways
+                .values()
+                .any(|g| g.services.iter().any(|gs| !gs.api_keys.is_empty()))
+    }
+
+    /// Returns all configured API ports across VIP services and gateways.
+    pub fn api_ports(&self) -> Vec<u16> {
+        let mut ports = std::collections::BTreeSet::new();
+        for svc in self.services.values() {
+            if svc.is_local_api() {
+                ports.insert(svc.port);
+            }
+        }
+        for gw in self.gateways.values() {
+            for gs in &gw.services {
+                if gs.kind == GatewayServiceKind::Api {
+                    ports.insert(gs.port);
+                }
+            }
+        }
+        ports.into_iter().collect()
+    }
+
+    /// Verifies a candidate API key against all configured `api:<port>` blocks across VIPs and Gateways.
+    /// If the key matches multiple entries, returns the highest privilege scope (`ReadWrite` > `ReadOnly`).
+    pub fn verify_api_key(&self, candidate_key: &str) -> Option<ApiKeyScope> {
+        let trimmed = candidate_key.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let mut matched: Option<ApiKeyScope> = None;
+        for svc in self.services.values() {
+            for k in &svc.api_keys {
+                if k.key == trimmed {
+                    if k.scope == ApiKeyScope::ReadWrite {
+                        return Some(ApiKeyScope::ReadWrite);
+                    }
+                    matched = Some(ApiKeyScope::ReadOnly);
+                }
+            }
+        }
+        for gw in self.gateways.values() {
+            for gs in &gw.services {
+                for k in &gs.api_keys {
+                    if k.key == trimmed {
+                        if k.scope == ApiKeyScope::ReadWrite {
+                            return Some(ApiKeyScope::ReadWrite);
+                        }
+                        matched = Some(ApiKeyScope::ReadOnly);
+                    }
+                }
+            }
+        }
+        matched
+    }
+
+    /// Returns a clone of the `Config` with `ReadWrite` API keys masked so read-only callers
+    /// cannot escalate privileges by inspecting `/api/v1/status` or `/api/v1/config`.
+    pub fn redacted_for_readonly(&self) -> Self {
+        let mut c = self.clone();
+        for svc in c.services.values_mut() {
+            for k in &mut svc.api_keys {
+                if k.scope == ApiKeyScope::ReadWrite {
+                    k.key = "<redacted-rw-key>".to_string();
+                }
+            }
+        }
+        for gw in c.gateways.values_mut() {
+            for gs in &mut gw.services {
+                for k in &mut gs.api_keys {
+                    if k.scope == ApiKeyScope::ReadWrite {
+                        k.key = "<redacted-rw-key>".to_string();
+                    }
+                }
+            }
+        }
+        c
+    }
+
     pub fn format_vip_block(&self, vip_ip: Ipv4Addr) -> String {
         self.format_vip_block_by_key(&vip_ip.to_string())
     }
@@ -1085,8 +1303,8 @@ impl Config {
         if let Some(v) = vip_cfg {
             if v.dhcp {
                 out.push_str(&format!("    dhcp {}\n", v.interface));
-            } else if v.interface != "eth0" {
-                if v.prefix_len == 32 {
+            } else if v.interface != "eth0" || v.prefix_len != default_eth0_prefix_len() {
+                if v.prefix_len == 32 && v.interface != "eth0" {
                     out.push_str(&format!("    interface {}\n", v.interface));
                 } else {
                     out.push_str(&format!("    interface {}/{}\n", v.interface, v.prefix_len));
@@ -1101,14 +1319,14 @@ impl Config {
             .values()
             .filter(|s| s.belongs_to_vip(vip_key) && s.is_local_ssh())
         {
-            out.push_str(&format!("    ssh:{}\n", svc.port));
+            out.push_str(&svc.format_in_vip());
         }
         for svc in self
             .services
             .values()
             .filter(|s| s.belongs_to_vip(vip_key) && s.is_local_dns())
         {
-            out.push_str(&format!("    dns:{}\n", svc.port));
+            out.push_str(&svc.format_in_vip());
         }
         let svcs: Vec<&Service> = self
             .services
