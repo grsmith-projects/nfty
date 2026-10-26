@@ -1037,7 +1037,11 @@ vip 192.168.1.4 {
             401
         );
 
-        // 4. Compiled nftables ruleset enforces @allow_192_168_1_4_8000 on tcp dport 8000
+        // 4. Strict separation: port 8000 is a web port, port 8080 is an API-only port
+        assert!(cfg.is_web_port(Some(8000)));
+        assert!(!cfg.is_web_port(Some(8080)));
+
+        // 5. Compiled nftables ruleset enforces @allow_192_168_1_4_8000 on tcp dport 8000
         let st = shared.read().unwrap();
         let nft = compile_nft_ruleset(&cfg, Some(&st));
         assert!(nft.contains("set allow_192_168_1_4_8000"));
