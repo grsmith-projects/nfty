@@ -437,7 +437,6 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
 
     // 2b. Input chain (restrict SSH and API on VIPs unless explicitly enabled via service <vip>:22 / api:<port> or gateway service)
     let mut ssh_allowed_vips = BTreeSet::new();
-    let mut api_allowed_vips = BTreeSet::new();
     let mut all_vips = BTreeSet::new();
     for (k, v) in &config.vips {
         if let Ok(ip) = k.parse::<std::net::Ipv4Addr>() {
@@ -458,9 +457,6 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                 if svc.port == 22 && svc.backends.iter().any(|b| b.ip.is_loopback() && b.port == 22) {
                     ssh_allowed_vips.insert(ip);
                 }
-                if svc.is_local_api_or_web() && svc.port == 9090 {
-                    api_allowed_vips.insert(ip);
-                }
             }
         }
     }
@@ -474,12 +470,6 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             {
                 ssh_allowed_vips.insert(gw.listen_ip);
             }
-            if gw.services.iter().any(|gs| {
-                matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web)
-                    && gs.port == 9090
-            }) {
-                api_allowed_vips.insert(gw.listen_ip);
-            }
         }
     }
     let ssh_blocked_vips: Vec<String> = all_vips
@@ -487,16 +477,38 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
         .filter(|ip| !ssh_allowed_vips.contains(ip))
         .map(|ip| ip.to_string())
         .collect();
-    let api_blocked_vips: Vec<String> = if config.has_any_api_service() {
-        all_vips
+
+    let mut api_port_blocks: Vec<(u16, Vec<String>)> = Vec::new();
+    for api_port in config.api_ports() {
+        let mut allowed_vips = BTreeSet::new();
+        for svc in config.services.values() {
+            if let Some(ip) = svc.listen_ip {
+                if !ip.is_unspecified() && svc.port == api_port {
+                    allowed_vips.insert(ip);
+                }
+            }
+        }
+        for gw in config.gateways.values() {
+            if !gw.listen_ip.is_unspecified()
+                && gw.services.iter().any(|gs| {
+                    matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web)
+                        && gs.port == api_port
+                })
+            {
+                allowed_vips.insert(gw.listen_ip);
+            }
+        }
+        let blocked: Vec<String> = all_vips
             .iter()
-            .filter(|ip| !api_allowed_vips.contains(ip))
+            .filter(|ip| !allowed_vips.contains(ip))
             .map(|ip| ip.to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if !ssh_blocked_vips.is_empty() || !api_blocked_vips.is_empty() {
+            .collect();
+        if !blocked.is_empty() {
+            api_port_blocks.push((api_port, blocked));
+        }
+    }
+
+    if !ssh_blocked_vips.is_empty() || !api_port_blocks.is_empty() {
         out.push_str("    chain input {\n");
         out.push_str("        type filter hook input priority filter; policy accept;\n");
         if !ssh_blocked_vips.is_empty() {
@@ -505,10 +517,11 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                 ssh_blocked_vips.join(", ")
             ));
         }
-        if !api_blocked_vips.is_empty() {
+        for (api_port, blocked_vips) in &api_port_blocks {
             out.push_str(&format!(
-                "        ip daddr {{ {} }} tcp dport 9090 counter drop comment \"nfty:api-disabled-on-vip\"\n",
-                api_blocked_vips.join(", ")
+                "        ip daddr {{ {} }} tcp dport {} counter drop comment \"nfty:api-disabled-on-vip\"\n",
+                blocked_vips.join(", "),
+                api_port
             ));
         }
         out.push_str("    }\n\n");

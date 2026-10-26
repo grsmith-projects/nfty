@@ -1567,7 +1567,7 @@ pub fn create_or_find_vip_service_by_key(
         svc.backends.push(Backend {
             host: None,
             ip: Ipv4Addr::new(127, 0, 0, 1),
-            port: 9090,
+            port,
             weight: 1,
             backup: false,
         });
@@ -1597,7 +1597,7 @@ pub fn create_or_find_vip_service_by_key(
         svc.backends.push(Backend {
             host: None,
             ip: Ipv4Addr::new(127, 0, 0, 1),
-            port: 9090,
+            port,
             weight: 1,
             backup: false,
         });
