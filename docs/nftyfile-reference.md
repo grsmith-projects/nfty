@@ -166,24 +166,28 @@ vip 10.20.0.10/24 {
 | `vlan` | `<1-4094>` | Configures an 802.1Q VLAN ID on the parent interface (`<iface>.<vlan>`). |
 | `ssh` / `ssh:<port>` | Optional port (default `22`) | Enables the embedded `nfty` SSH2 management shell on this VIP. Without this directive, port 22 is dropped on the VIP. |
 | `dns` / `dns:<port>` | Optional port (default `53`) | Binds the supervised `dnsmasq` DNS server (UDP + TCP) to this VIP. |
-| `api` / `api:<port>` | Optional port (default `9090`) | Exposes the HTTP/JSON Control API & read-only web dashboard on this VIP. Can be opened as a block (`api:9090 { ... }`) to configure scoped API keys. |
+| `web` / `web:<port>` | Optional port (default `8000`) | Exposes the interactive JavaScript Web Console (`GET /`) and backing REST API on this VIP. Supports `allow { ... }` CIDR/hostname ACLs so allowed LAN clients get immediate access in the browser. |
+| `api` / `api:<port>` | Optional port (default `9090`) | Exposes the headless HTTP/JSON Control API on this VIP (`GET /` is disabled). Can be opened as a block (`api:8080 { ... }`) to configure scoped `ro` / `rw` API keys. |
 | `<port[/proto]> to <host:port>` | Listen port & target backend | Maps external `<port>` (e.g., `80`, `443`, `53/udp`) on this VIP to `<host_or_ip>:<port>`. Can be followed by `{ ... }` for service options. |
 | `<host_or_ip>:<port>` | Target backend endpoint | Forwards the matching port on this VIP directly to `<host_or_ip>:<port>` (e.g., `plex:32400` or `169.254.20.15:32400`). |
 
-### 3.5 Scoped `api:<port>` Service Inside a VIP
+### 3.5 `web:<port>` (Web Console) and `api:<port>` (Headless JSON API) Inside a VIP
 
-You can expose the HTTP Control API on a specific VIP and attach scoped read-write (`rw`) or read-only (`ro`) API keys:
+`nfty` enforces strict separation between `web:<port>` and `api:<port>`:
+- **`web:<port>`** serves the interactive 8-tab HTML/JS Web Console (`GET /`) and is typically secured with an IP `allow` list (e.g., `allow { 192.168.0.0/16 }`).
+- **`api:<port>`** serves only the headless JSON Control API (`/api/v1/*`) and is secured with scoped `ro` or `rw` API keys:
 
 ```hcl
-vip 169.254.1.4/24 {
+vip 192.168.1.4/21 {
     ssh:22
-    api:9090 {
+    web:8000 {
+        allow {
+            192.168.0.0/16
+        }
+    }
+    api:8080 {
         key new rw
         key new ro
-        key custom_ci_token_2026 rw
-        allow {
-            169.254.1.*
-        }
     }
 }
 ```

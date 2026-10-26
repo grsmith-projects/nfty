@@ -18,38 +18,38 @@
 
 ---
 
-## 1. Enabling & Scoping `api:<port>`
+## 1. Enabling `web:<port>` vs. `api:<port>`
 
-By default, the `nfty` HTTP control plane listens on port `9090`. To expose the API on a specific Virtual IP (`vip`) or WireGuard Virtual Gateway (`gateway`)—and optionally on custom ports such as `api:9090` or `api:9443`—declare an `api:<port>` block inside the target `vip` or `gateway`:
+`nfty` enforces a strict separation between the interactive Web Console (`web:<port>`) and the headless JSON Control API (`api:<port>`):
+
+- **`web:<port>`** (default `:8000`): Serves the interactive 8-tab JavaScript Web Console (`GET /`, `/ui`, `/dashboard`, `/index.html`) plus the `/api/v1/*` endpoints it calls. Designed to be secured by an IP/CIDR/hostname `allow` list (e.g. `allow { 192.168.0.0/16 }`) so allowed operators can use the web frontend directly in their browser.
+- **`api:<port>`** (default `:9090`): Serves **only** the headless JSON Control API (`/api/v1/*`; `GET /` returns `404 Not Found` JSON) and requires a scoped `rw` or `ro` API key.
 
 ### `Nftyfile` Configuration
 
 ```hcl
-allow {
-  169.254.1.0/24
-  10.100.0.0/16
-}
+vip 192.168.1.4/21 {
+  ssh:22
 
-vip 169.254.1.4/24@eth0 {
-  api:9090 {
+  # Interactive Web Console on port 8000 secured by IP allow-list
+  web:8000 {
+    allow {
+      192.168.0.0/16
+    }
+  }
+
+  # Headless JSON Control API on port 8080 secured by scoped API keys
+  api:8080 {
     # Full read-write automation key
     key nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b rw
 
-    # Read-only monitoring & dashboard key
-    key nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a ro
+    # Read-only monitoring key
+    key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
   }
 
-  service https:443 {
-    to 169.254.1.21:443
-  }
-}
-
-gateway 169.254.1.10/24@eth0 {
-  api:9091 {
-    key nfty_ro_55a1b2c3d4e5f60718293a4b5c6d7e8f ro
-  }
-  tunnels {
-    wg-mullvad-us1.conf
+  seer:5055 {
+    hostname seer.local
+    check tcp 5s
   }
 }
 ```
@@ -139,17 +139,22 @@ If an `ro` token attempts a write or scan operation, `nfty` returns `403 Forbidd
 
 ---
 
-## 3. Embedded Web Dashboard (`GET /`)
+## 3. Interactive Web Console (`web:<port>`)
 
-Navigating to `http://169.254.1.4:9090/` (or `/dashboard`, `/ui`, `/index.html`) in any web browser serves the built-in dark-mode **L4 Service Load Balancer & Health Dashboard**.
+Navigating to `http://192.168.1.4:8000/` (or `/dashboard`, `/ui`, `/index.html`) on any port configured with `web:<port>` serves the built-in dark-mode **8-Tab Interactive Web Console**:
 
-- **Zero External Assets**: All HTML, CSS, and JavaScript are compiled directly into the `nfty` binary—no internet connection or CDN is required.
-- **API Key Prompt & Local Storage**: If API keys are configured, the dashboard supports passing `?key=<ro_or_rw_key>` in the URL or entering your API key in the top bar.
-- **Live Telemetry**: Polls `/api/v1/status` every 2 seconds and renders:
-  - Appliance summary cards (Active VIPs, Total Services, Healthy Backends, Active NAT Conntrack Flows, Kernel Ruleset Status).
-  - Per-service load balancing tables showing VIP, port/protocol, forwarding mode (`dnat` / `dsr`), algorithm (`round-robin` / `sticky`), health check configuration, and per-backend status badges (`UP`, `DOWN`, `DRAINING`, `STANDBY`) with live millisecond RTT latencies.
-  - Active kernel `nf_conntrack` flow table.
-  - Side-by-side live `Nftyfile` configuration and compiled `nftables` kernel ruleset viewer.
+- **Strict Port Separation**: `GET /` is only served on `web:<port>` listeners (e.g., `web:8000`). Hitting `GET /` on an `api:<port>` listener (e.g., `api:8080`) returns `404 Not Found` (`application/json`).
+- **IP Allow-List Authentication**: When `web:8000` is configured with `allow { 192.168.0.0/16 }`, any browser client on `192.168.0.0/16` is automatically authenticated with `rw` access without needing to paste an API key.
+- **8 Interactive Views + Web CLI Drawer**:
+  1. **Overview & Topology** (KPI cards, live VIP/Service/Gateway topology cards, health matrix, 1-click Probe Now)
+  2. **VIPs & Services** (1-click Backend Drain/Enable, Add/Delete Service, API Key generator)
+  3. **WireGuard Gateways** (Upload `.conf` profiles, ECMP tunnel health/latency/traffic, port forwards)
+  4. **Programmable DNS** (`dnsmasq` settings, authoritative records, `nftset` policy routes, adblock domains)
+  5. **Allow-List & Cloudflare** (Global & per-service allow-lists, dynamic host->IP registration, Refresh DNS Now)
+  6. **Conntrack Flows** (Real-time `/proc/net/nf_conntrack` table with search/filter and pause/resume)
+  7. **Network Scanner** (`POST /api/v1/scan` LAN discovery with 1-click **+ Adopt into VIP**)
+  8. **Nftyfile & `nftables`** (Editable `Nftyfile` with Save & Apply + compiled `table ip nfty` viewer)
+  - **Slide-Up Web CLI (`)**: Press `` ` `` to run any `nfty` CLI command directly in the browser.
 
 ---
 
@@ -157,7 +162,9 @@ Navigating to `http://169.254.1.4:9090/` (or `/dashboard`, `/ui`, `/index.html`)
 
 | Method | Endpoint | Min Scope | Description |
 | :--- | :--- | :---: | :--- |
-| `GET` | `/`, `/dashboard`, `/ui` | Public HTML | Serves the embedded single-page dark-mode HTML dashboard. |
+| `GET` | `/`, `/dashboard`, `/ui` | `web:<port>` only | Serves the embedded 8-tab interactive HTML/JS Web Console (`404` on `api:<port>`). |
+| `GET` | `/api/v1/auth/whoami` | `ro` / Allow-List | Returns active authentication scope (`rw` or `ro`), mode (`allowlist` or `token`), client IP, and listener port. |
+| `POST` | `/api/v1/auth/login` | Public | Exchanges an API key or appliance username/password (`nfty`) for a session token and scope. |
 | `GET` | `/api/v1/status` (or `/status`) | `ro` | Full appliance snapshot: config, backend health/RTT, active backends, flows, WireGuard profiles, and compiled `nftables` ruleset. |
 | `GET` | `/api/v1/config` | `ro` | Returns structured JSON and formatted `Nftyfile` text for both `running` and `candidate` configs. |
 | `PUT` | `/api/v1/config` | `rw` | Parses a raw `Nftyfile` payload, reconciles VIPs/VLANs, and atomically applies it to the running configuration and kernel. |

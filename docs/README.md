@@ -13,8 +13,9 @@ Welcome to the official documentation for **`nfty`** — a zero-dependency Linux
 | **[1. Getting Started & Deployment Guide](./getting-started.md)** | Building from source (`glibc` & static `musl`), deploying across all 4 modes (Standalone Daemon, LXD Container, Bootable Unikernel VM/Bare-Metal x86_64, and Bare-Metal ARM64/RK3588S), first-boot SSH setup, and zero-flag CLI ergonomics. |
 | **[2. `Nftyfile` Configuration Reference](./nftyfile-reference.md)** | Complete declarative syntax reference for `/data/Nftyfile`: global `allow` ACLs, static/VLAN/DHCP `macvlan` `vip` blocks, L4/L7 `service` blocks, `gateway` blocks, programmable `dns` blocks, and `no ...` negation rules. |
 | **[3. Interactive CLI & Live TUI Guide](./interactive-cli-and-tui.md)** | Navigating Operational vs. Configuration modes, hierarchical drill-down contexts, Candidate vs. Running state workflows, automatic rollback timers (`apply confirm <secs>`), service discovery (`scan`/`adopt`), and the `watch` TUI dashboard. |
-| **[4. HTTP/JSON Control API Reference](./api-reference.md)** | Enabling and scoping `api:<port>` on VIPs and Gateways, `ro` vs. `rw` API keys, key redaction security model, authentication methods, the embedded read-only web dashboard, and full `curl` endpoint schemas. |
+| **[4. HTTP/JSON Control API & Web Console Reference](./api-reference.md)** | Enabling and scoping `web:<port>` (interactive SPA with allow-list auth) and `api:<port>` (headless JSON API with `ro`/`rw` keys), key redaction security model, and full `curl` endpoint schemas. |
 | **[5. Programmable DNS, WireGuard Gateways & Cloudflare Tunnels](./dns-and-wireguard-gateways.md)** | Deep dive into `dnsmasq` supervision, health-aware DNS, split-horizon zones, `nftset` domain-based policy routing (`route`/`bypass`), multi-tunnel WireGuard ECMP gateways, inbound port forwards, `privoxy`/`socks5` proxies, and Cloudflare Zero-Trust Tunnels. |
+| **[6. `web:<port>` Web Console Architecture](./web-interface-spec.md)** | Specification and architecture of the embedded 8-tab JavaScript Single-Page Application (SPA) Web Console, allow-list authentication, and Web CLI drawer. |
 
 ---
 

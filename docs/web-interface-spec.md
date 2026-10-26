@@ -1,30 +1,26 @@
 # `web:<port>` — Interactive Web UI & Control Plane Specification
 
-> **Status**: Proposed Specification  
+> **Status**: Implemented  
 > **Target Binary**: `nfty` (Zero-dependency embedded SPA served directly by the static `musl` binary)  
-> **Directive Syntax**: `web:<port>` (or `web` defaulting to `:8080`) inside `vip <ip|name> { ... }` and `gateway <ip|name> { ... }`
+> **Directive Syntax**: `web:<port>` (or `web` defaulting to `:8000`) inside `vip <ip|name> { ... }` and `gateway <ip|name> { ... }`
 
 ---
 
 ## 1. Overview & Goals
 
-Currently, [src/api.rs](file:///home/gsmith/nfty/src/api.rs) exposes a basic read-only HTML status page (`READONLY_DASHBOARD_HTML`) on `GET /` and the REST API on `/api/v1/*` via `api:<port>`.
+`nfty` provides strict separation between two local HTTP control-plane directives:
+- **`web:<port>`** (default `:8000`): Serves the interactive single-page JavaScript Web Console (`GET /`, `/ui`, `/dashboard`, `/index.html`) **and** its backing `/api/v1/*` JSON endpoints on the same port, typically secured via an IP/CIDR/hostname `allow` list (e.g., `allow 192.168.0.0/16`).
+- **`api:<port>`** (default `:9090`): Serves **only** the headless `/api/v1/*` JSON Control API (`GET /` returns `404 Not Found` JSON), secured via scoped `ro` / `rw` API keys.
 
-This specification defines a first-class **`web:<port>`** service directive on any **VIP** or **Gateway** that serves a rich, single-page JavaScript frontend (SPA) backed by the `/api/v1/*` control plane:
-
+Key capabilities:
 1. **First-Class `Nftyfile` & REPL Directive (`web:<port>`)**:
-   - Declare `web:8443` or `web:8080` inside any `vip` or `gateway` block, with optional `allow`, `limit`, `auth`, `hostname` (mDNS `.local`), `cloudflare-dns`, and `key` sub-directives.
-   - Kernel `nftables` `input` chain automatically protects the `web:<port>` listener so it is only reachable on the VIP/Gateway IP(s) where it is declared (plus `127.0.0.1`), enforcing any attached `allow` CIDR/hostname sets and `limit` meters.
-2. **Scope-Aware Authentication (`ro` vs `rw` vs SSH Password Login)**:
-   - Supports logging in with:
-     - An **API Key** (`nfty_ro_...` or `nfty_rw_...`), or
-     - The **appliance username/password** (`nfty` / `/data/auth.json` via a new `POST /api/v1/auth/login` endpoint that exchanges credentials for a session token or uses `Authorization: Basic`), or
-     - Pre-configured server-side default scope (`mode ro` or `mode rw` inside `web:<port> { ... }`) for trusted LAN dashboards.
-   - Dynamically adapts the UI based on the active scope:
-     - **`ro` (Read-Only)**: Live telemetry, topology graph, service/gateway health, conntrack flow inspector, DNS/WG status, and redacted `Nftyfile` / `nftables` viewer. All mutating controls are disabled/hidden.
-     - **`rw` (Read-Write)**: Full interactive control — add/edit/delete VIPs, Services, Backends, WireGuard Gateways & Tunnels, DNS records/blocklists, Drain/Undrain backends, LAN Scanner + 1-click Adopt, interactive Web CLI Drawer, and Candidate vs. Running diff + `Commit` / `Commit Confirmed` with automatic rollback timer.
+   - Declare `web:8000` (or `web`) inside any `vip` or `gateway` block, with `allow`, `limit`, `auth`, `hostname` (mDNS `.local`), `cloudflare-dns`, and optional `key` sub-directives.
+   - Kernel `nftables` `prerouting` and `input` chains automatically enforce any attached `allow` CIDR/hostname sets (`@allow_<id>`) and `limit` meters (`@meter_<id>`) before redirecting to the local `web:<port>` listener.
+2. **Allow-List Authentication (plus Optional API Key / Appliance Login)**:
+   - **IP Allow-List Auth (Primary for `web:<port>`)**: When `web:8000` is configured with an `allow` list (e.g., `allow 192.168.0.0/16`) and no API keys are required on that listener, clients matching the allow-list are permitted by both kernel `nftables` and userspace `authenticate_api_request_with_context` with full `rw` access.
+   - **Appliance Login & Scoped API Keys**: Also supports logging in with the appliance username/password (`nfty` / `/data/auth.json` via `POST /api/v1/auth/login`) or switching to an `nfty_ro_...` / `nfty_rw_...` API key via the **🔑 Switch Key / Login** modal.
 3. **Zero External Runtime Dependencies**:
-   - Compiled directly into the static `nfty` binary (`include_str!` / embedded assets) so it works offline inside the 10MB Unikernel, LXD container, and RK3588S bare-metal appliance with zero Node.js or external CDN requirements.
+   - Compiled directly into the static `nfty` binary (`WEB_CONSOLE_HTML` in `src/api.rs`) so it works offline inside the 10MB Unikernel, LXD container, and RK3588S bare-metal appliance with zero Node.js or external CDN requirements.
 
 ---
 
@@ -32,34 +28,35 @@ This specification defines a first-class **`web:<port>`** service directive on a
 
 ### 2.1 `Nftyfile` Configuration Examples
 
-#### Example A: Read-Write Web Console on a VIP with API Keys & mDNS
-```nginx
-vip 169.254.1.4/21 {
+#### Example A: Web Console on `192.168.1.4:8000` with IP Allow-List + Separate `api:8080`
+```hcl
+vip 192.168.1.4 {
     ssh:22
-    web:8080 {
-        hostname nfty.local
-        key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
-        key nfty_rw_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c rw
+    web:8000 {
         allow {
-            169.254.1.0/21
-            *.office.lan
+            192.168.0.0/16
         }
     }
-    5055 to seer:5055 {
+    api:8080 {
+        key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
+    }
+    seer:5055 {
         hostname seer.local
-        cloudflare-dns seer.example.com
+        cloudflare-dns seer.smith.gr
+        check tcp 5s
     }
 }
 ```
 
-#### Example B: Exposing `web:<port>` on a WireGuard Gateway
-```nginx
-gateway 169.254.1.10/21 {
+#### Example B: Exposing `web:<port>` on a WireGuard Gateway with an Allow-List
+```hcl
+gateway 192.168.1.10 {
     balance round-robin
     killswitch on
     privoxy:8118
-    web:8081 {
-        key new ro
+    web:8000
+    allow {
+        192.168.0.0/16
     }
     tunnels {
         ca-van-wg-201.conf
@@ -71,23 +68,18 @@ gateway 169.254.1.10/21 {
 ### 2.2 Interactive REPL Drill-Down Workflow
 ```text
 nfty> configure
-nfty(config)# vip 169.254.1.4
-nfty(config-vip:169.254.1.4)# web:8080
-  Web UI + API service 'web:8080' enabled on VIP 169.254.1.4 (listening on 169.254.1.4:8080)
-nfty(config-vip:169.254.1.4-svc:8080)# key new rw
-  Generated new read-write (rw) API key on 169.254.1.4:8080:
-    nfty_rw_7b3c91a04e2d8f16c5a4b3d2e1f09876
-nfty(config-vip:169.254.1.4-svc:8080)# key new ro
-  Generated new read-only (ro) API key on 169.254.1.4:8080:
-    nfty_ro_5a2d949e15250c395c4b9683833c5bc3
-nfty(config-vip:169.254.1.4-svc:8080)# hostname nfty.local
-nfty(config-vip:169.254.1.4-svc:8080)# apply
+nfty(config)# vip 192.168.1.4
+nfty(config-vip:192.168.1.4)# web:8000
+  ✔ [vip 192.168.1.4] + web:8000 (192.168.1.4:8000)
+nfty(config-service:192.168.1.4:8000)# allow 192.168.0.0/16
+  ✔ [service web:8000 (192.168.1.4:8000)] allow 192.168.0.0/16
+nfty(config-service:192.168.1.4:8000)# apply
 ```
 
-### 2.3 Relationship Between `web:<port>` and `api:<port>`
-- Both `web:<port>` and `api:<port>` are local control-plane services bound in [src/api.rs](file:///home/gsmith/nfty/src/api.rs) and protected by the kernel `nftables` `input` chain in [src/compiler.rs](file:///home/gsmith/nfty/src/compiler.rs).
-- **`api:<port>`**: Headless API endpoint (`GET /` returns JSON service metadata or minimal status; `/api/v1/*` serves REST JSON).
-- **`web:<port>`**: Full Web UI + API endpoint (`GET /`, `/app`, `/app.js`, `/app.css` serve the interactive JavaScript SPA, and `/api/v1/*` serves the exact same authenticated REST API on the same port so the browser frontend requires zero CORS or cross-port configuration).
+### 2.3 Strict Separation Between `web:<port>` and `api:<port>`
+- Both `web:<port>` and `api:<port>` are bound dynamically by `spawn_api_server` in [src/api.rs](file:///home/gsmith/nfty/src/api.rs) and enforced in kernel `nftables` (`src/compiler.rs`).
+- **`web:<port>`**: Serves the interactive JavaScript Web Console on `GET /` (`/ui`, `/dashboard`, `/index.html`) and `/api/v1/*` on the same port.
+- **`api:<port>`**: Strictly a headless JSON Control API (`GET /` returns `404 Not Found` JSON; `/api/v1/*` requires a valid `ro` or `rw` API key).
 
 ---
 
@@ -188,7 +180,7 @@ Grouped by **VIP Container** (`vip 192.168.1.4`, `vip sonarr`, etc.) plus standa
 
 ### 5.4 Tab 3: WireGuard Gateways & Tunnels (`#/gateways`)
 - **Gateway Cards** (e.g., `gateway 192.168.1.10`):
-  - Shows VIP interface (`eth0/21`), `balance` (`round-robin` / `sticky`), `killswitch` (`on` / `off` toggle in `rw` mode), attached gateway services (`privoxy:8118`, `socks5:1080`, `dns:53`, `ssh:22`, `web:8081`), and inbound port forwards (`forward 31743 to qbittorrent:31743`).
+  - Shows VIP interface (`eth0/21`), `balance` (`round-robin` / `sticky`), `killswitch` (`on` / `off` toggle in `rw` mode), attached gateway services (`privoxy:8118`, `socks5:1080`, `dns:53`, `ssh:22`, `web:8000`), and inbound port forwards (`forward 31743 to qbittorrent:31743`).
   - **ECMP Tunnel Table (`wg0`..`wgN`)**:
     - Shows profile name (`ca-van-wg-201.conf`), kernel interface (`wg0`), tunnel IP (`10.75.241.44/32`), peer endpoint (`104.193.135.196:51820`), probe health & latency (`UP 2.5ms`), weight, and live packet/byte counters.
     - Note: In `ro` mode, `private_key` and `preshared_key` are redacted (`<redacted>`) by the backend.
@@ -279,7 +271,8 @@ Grouped by **VIP Container** (`vip 192.168.1.4`, `vip sonarr`, etc.) plus standa
 ## 7. Verification & Test Plan
 
 1. **AST & Parser Round-Trip Tests**:
-   - Verify `vip 169.254.1.4 { web:8080 { hostname nfty.local; key new ro; key new rw } }` and `gateway 169.254.1.10 { web:8081 { key new ro } }` parse, compile to `nftables` `input` rules, and round-trip losslessly through `format_nftyfile()`.
+   - Verify `vip 192.168.1.4 { web:8000 { allow { 192.168.0.0/16 } } }` parses, compiles to `nftables` `prerouting` set `@allow_192_168_1_4_8000`, and round-trips losslessly through `format_nftyfile()`.
+   - Verify `Config::is_web_port(Some(8000)) == true` and `Config::is_web_port(Some(8080)) == false` so `api:<port>` never serves the HTML Web UI.
 2. **Scope & Security Tests**:
    - Verify `GET /api/v1/auth/whoami` returns `scope: "ro"` for `ro` keys and `scope: "rw"` for `rw` keys.
    - Verify `ro` keys can load all read-only dashboard tabs (`/api/v1/status`, `/api/v1/config`, `/api/v1/flows`, `/api/v1/nft`, `/api/v1/wg`, `/api/v1/allow`) with `rw` keys and WireGuard private keys redacted, while any write action returns `403 Forbidden`.
