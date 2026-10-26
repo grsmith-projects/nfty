@@ -146,26 +146,75 @@ pub async fn probe_backend(backend: &Backend, check: Option<&HealthCheckConfig>)
                 },
             }
         }
+        HealthCheckKind::Disabled => ProbeOutcome {
+            endpoint,
+            state: HealthState::Up,
+            latency_ms: None,
+            error: None,
+        },
     }
 }
 
 pub async fn run_all_probes_once(shared: &SharedState) -> Vec<ProbeOutcome> {
+    run_probes_internal(shared, true).await
+}
+
+pub async fn run_due_probes_once(shared: &SharedState) -> Vec<ProbeOutcome> {
+    run_probes_internal(shared, false).await
+}
+
+async fn run_probes_internal(shared: &SharedState, force_all: bool) -> Vec<ProbeOutcome> {
     let (targets, wg_targets): (
         Vec<(Backend, Option<HealthCheckConfig>)>,
         Vec<(String, String)>,
     ) = {
         let st = shared.read().unwrap();
         let cfg = st.active_config();
+        let now = Instant::now();
         let mut list = Vec::new();
         for svc in cfg.services.values() {
+            if matches!(
+                svc.check.as_ref().map(|c| &c.kind),
+                Some(HealthCheckKind::Disabled)
+            ) || (svc.check.is_none() && svc.proto == crate::ast::Proto::Udp)
+            {
+                continue;
+            }
+            let interval_secs = svc.check.as_ref().map(|c| c.interval_secs.max(1)).unwrap_or(5);
             for b in &svc.backends {
-                list.push((b.clone(), svc.check.clone()));
+                let due = force_all
+                    || st
+                        .runtime
+                        .get(&b.endpoint())
+                        .and_then(|rt| rt.last_checked)
+                        .map(|last| now.duration_since(last).as_secs() >= interval_secs)
+                        .unwrap_or(true);
+                if due {
+                    list.push((b.clone(), svc.check.clone()));
+                }
             }
         }
         let mut wgs = Vec::new();
         for gw in cfg.gateways.values() {
+            if matches!(
+                gw.check.as_ref().map(|c| &c.kind),
+                Some(HealthCheckKind::Disabled)
+            ) {
+                continue;
+            }
+            let interval_secs = gw.check.as_ref().map(|c| c.interval_secs.max(1)).unwrap_or(5);
             for t in &gw.tunnels {
-                wgs.push((t.endpoint_key(), t.iface.clone()));
+                let ep_key = t.endpoint_key();
+                let due = force_all
+                    || st
+                        .runtime
+                        .get(&ep_key)
+                        .and_then(|rt| rt.last_checked)
+                        .map(|last| now.duration_since(last).as_secs() >= interval_secs)
+                        .unwrap_or(true);
+                if due {
+                    wgs.push((ep_key, t.iface.clone()));
+                }
             }
         }
         (list, wgs)
@@ -276,6 +325,13 @@ pub async fn refresh_allowlist_hosts(shared: &SharedState) {
                     .values()
                     .chain(st.candidate.services.values())
                     .flat_map(|s| s.allow.iter()),
+            )
+            .chain(
+                st.running
+                    .gateways
+                    .values()
+                    .chain(st.candidate.gateways.values())
+                    .flat_map(|g| g.allow.iter()),
             )
         {
             if expand_ip_wildcard_to_cidr(entry).is_none() && !entry.contains('*') {
@@ -458,10 +514,10 @@ pub fn spawn_background_tasks(shared: SharedState) {
                 poll_kernel_counters(&shared, 2.0);
             }
 
-            // 3. Run health checks & DNS/wildcard allow-list sync every 5 seconds
+            // 3. Run due health checks every second (respecting per-service/gateway interval_secs) & DNS/wildcard allow-list sync every 5 seconds
+            let _ = run_due_probes_once(&shared).await;
             if tick_count % 5 == 0 {
                 refresh_allowlist_hosts(&shared).await;
-                let _ = run_all_probes_once(&shared).await;
             }
         }
     });

@@ -81,15 +81,15 @@ pub fn print_context_help(level: &ShellLevel) {
                 "scan [host|subnet]".yellow()
             );
             println!(
-                "  {:<32} Adopt discovered service (e.g. 'adopt 1' or 'adopt sonarr vip 192.168.1.4')",
+                "  {:<32} Adopt discovered service (e.g. 'adopt 1' or 'adopt sonarr vip 169.254.1.4')",
                 "adopt <# | name> [vip <vip>]".yellow()
             );
             println!(
-                "  {:<32} Create/enter a static or DHCP VIP container (e.g. 'vip 192.168.1.4' or 'vip sonarr')",
+                "  {:<32} Create/enter a static or DHCP VIP container (e.g. 'vip 169.254.1.4' or 'vip sonarr')",
                 "vip <ipv4[/cidr]|name>".yellow()
             );
             println!(
-                "  {:<32} Create/enter a Virtual Gateway (static IP or DHCP, e.g. 'gateway 192.168.1.10' or 'gateway mullvad')",
+                "  {:<32} Create/enter a Virtual Gateway (static IP or DHCP, e.g. 'gateway 169.254.1.10' or 'gateway mullvad')",
                 "gateway <ipv4[/cidr]|name>".yellow()
             );
             println!(
@@ -101,7 +101,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 "bootstrap <ip[/24]>...".yellow()
             );
             println!(
-                "  {:<32} Enter global allow-list block (supports wildcards e.g. '*.office.lan', '192.168.1.*')",
+                "  {:<32} Enter global allow-list block (supports wildcards e.g. '*.office.lan', '169.254.1.*')",
                 "allow [pattern...]".yellow()
             );
             println!(
@@ -192,6 +192,10 @@ pub fn print_context_help(level: &ShellLevel) {
                 "dns:53 (or 'dns')".yellow()
             );
             println!(
+                "  {:<32} Enable HTTP Control API on this VIP & configure keys",
+                "api:9090 (or 'api')".yellow()
+            );
+            println!(
                 "  {:<32} Lease VIP via DHCP + register hostname with UDM DNS",
                 "dhcp [eth0|off]".yellow()
             );
@@ -257,7 +261,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 "<*.domain.tld>".yellow()
             );
             println!(
-                "  {:<32} Allow IP wildcard (e.g. '192.168.1.*')",
+                "  {:<32} Allow IP wildcard (e.g. '169.254.1.*')",
                 "<a.b.c.*>".yellow()
             );
             println!(
@@ -385,6 +389,10 @@ pub fn print_context_help(level: &ShellLevel) {
                 "cloudflare-auth <rule...>".yellow()
             );
             println!(
+                "  {:<32} Generate or add scoped API key ('ro' or 'rw') for api:<port>",
+                "key <new | token> [ro|rw]".yellow()
+            );
+            println!(
                 "  {:<32} Load balance strategy",
                 "balance <round-robin|sticky>".yellow()
             );
@@ -410,7 +418,7 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!(
                 "  {:<32} Remove a directive or backend",
-                "no <vip|hostname|check|limit|allow|to <ip>>".yellow()
+                "no <vip|hostname|key|check|limit|allow|to <ip>>".yellow()
             );
             println!("  {:<32} Show this service block", "show".yellow());
             println!(
@@ -429,7 +437,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 .cyan()
             );
             println!(
-                "  {:<32} Add backend (e.g. 'plex:32400' or '192.168.1.60:9000')",
+                "  {:<32} Add backend (e.g. 'plex:32400' or '169.254.1.60:9000')",
                 "<ip|host[:port]>".yellow()
             );
             println!(
@@ -459,7 +467,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 .cyan()
             );
             println!(
-                "  {:<32} Allow wildcard domain, IP wildcard, host, or CIDR (e.g. '*.office.lan', '192.168.1.*')",
+                "  {:<32} Allow wildcard domain, IP wildcard, host, or CIDR (e.g. '*.office.lan', '169.254.1.*')",
                 "<pattern>".yellow()
             );
             println!("  {:<32} Remove source pattern", "no <pattern>".yellow());
@@ -496,6 +504,10 @@ pub fn print_context_help(level: &ShellLevel) {
                 "dns:53 (or 'dns')".yellow()
             );
             println!(
+                "  {:<32} Enable HTTP Control API on this gateway & configure keys",
+                "api:9090 (or 'api')".yellow()
+            );
+            println!(
                 "  {:<32} Forward inbound tunnel port (TCP+UDP) to LAN host",
                 "forward <port> to <host:port>".yellow()
             );
@@ -525,7 +537,7 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!(
                 "  {:<32} Remove a tunnel, service, or directive",
-                "no <privoxy|socks5|ssh|tunnel <name>|vip|killswitch>".yellow()
+                "no <privoxy|socks5|ssh|api|tunnel <name>|vip|killswitch>".yellow()
             );
             println!("  {:<32} Show this gateway block", "show".yellow());
             println!(
@@ -556,9 +568,46 @@ pub fn print_context_help(level: &ShellLevel) {
                 "ssh:22 (or 'ssh')".yellow()
             );
             println!(
-                "  {:<32} Disable a gateway service",
-                "no <privoxy|socks5|ssh>".yellow()
+                "  {:<32} Enable HTTP Control API on this gateway IP",
+                "api:9090 (or 'api')".yellow()
             );
+            println!(
+                "  {:<32} Disable a gateway service",
+                "no <privoxy|socks5|ssh|api>".yellow()
+            );
+            println!(
+                "  {:<32} Return to gateway {} prompt",
+                ".. / up / exit".yellow(),
+                k
+            );
+        }
+        ShellLevel::GatewayApi(k, p) => {
+            println!(
+                "{}",
+                format!(
+                    "Gateway '{}' API Service Mode (nfty(config-gateway:{}-api:{})#):",
+                    k, k, p
+                )
+                .bold()
+                .cyan()
+            );
+            println!(
+                "  {:<32} Generate new read-only API key",
+                "key new ro".yellow()
+            );
+            println!(
+                "  {:<32} Generate new read-write API key",
+                "key new rw".yellow()
+            );
+            println!(
+                "  {:<32} Add explicit API key with scope ('ro' or 'rw')",
+                "key <token> [ro|rw]".yellow()
+            );
+            println!(
+                "  {:<32} Remove an API key (or all keys)",
+                "no key [<token>]".yellow()
+            );
+            println!("  {:<32} Show this gateway block", "show".yellow());
             println!(
                 "  {:<32} Return to gateway {} prompt",
                 ".. / up / exit".yellow(),

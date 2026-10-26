@@ -244,7 +244,7 @@ impl Completer for NftyHelper {
                 }
                 "scan" => {
                     let mut list = self.known_hosts();
-                    list.push("192.168.1.0/24".to_string());
+                    list.push("169.254.1.0/24".to_string());
                     let matches = list
                         .into_iter()
                         .filter(|c| c.starts_with(prefix))
@@ -498,6 +498,7 @@ impl Completer for NftyHelper {
                     "443",
                     "ssh:22",
                     "dns:53",
+                    "api:9090",
                     "dhcp",
                     "vlan",
                     "interface",
@@ -546,6 +547,7 @@ impl Completer for NftyHelper {
                 list.push("cloudflare-auth".to_string());
                 list.push("auth".to_string());
                 list.push("ssh:22".to_string());
+                list.push("api:9090".to_string());
                 list
             }
             (ShellLevel::Service(_), 0) => vec![
@@ -556,6 +558,7 @@ impl Completer for NftyHelper {
                 "cloudflare-dns",
                 "cloudflare-auth",
                 "auth",
+                "key",
                 "balance",
                 "mode",
                 "interface",
@@ -577,6 +580,14 @@ impl Completer for NftyHelper {
             .into_iter()
             .map(String::from)
             .collect(),
+            (ShellLevel::Service(_), 1) if cmd0 == "key" => vec![
+                "new ro".to_string(),
+                "new rw".to_string(),
+                "new".to_string(),
+            ],
+            (ShellLevel::Service(_), 2) if cmd0 == "key" => {
+                vec!["ro".to_string(), "rw".to_string()]
+            }
             (ShellLevel::Service(_), 1) if cmd0 == "to" => self.known_host_ports(),
             (ShellLevel::Service(_), 1) if cmd0 == "hostname" => self
                 .known_hosts()
@@ -622,6 +633,7 @@ impl Completer for NftyHelper {
                     "cloudflare-dns".to_string(),
                     "cloudflare-auth".to_string(),
                     "auth".to_string(),
+                    "key".to_string(),
                     "check".to_string(),
                     "limit".to_string(),
                     "allow".to_string(),
@@ -641,6 +653,8 @@ impl Completer for NftyHelper {
                 "socks5:1080",
                 "ssh:22",
                 "dns:53",
+                "api:9090",
+                "key",
                 "forward",
                 "service",
                 "tunnels",
@@ -667,6 +681,11 @@ impl Completer for NftyHelper {
             .into_iter()
             .map(String::from)
             .collect(),
+            (ShellLevel::Gateway(_), 1) if cmd0 == "key" => vec![
+                "new ro".to_string(),
+                "new rw".to_string(),
+                "new".to_string(),
+            ],
             (ShellLevel::Gateway(_), 1) if cmd0 == "tunnel" || cmd0 == "tunnels" => {
                 self.wg_conf_files()
             }
@@ -681,6 +700,9 @@ impl Completer for NftyHelper {
                     "privoxy".to_string(),
                     "socks5".to_string(),
                     "ssh".to_string(),
+                    "dns".to_string(),
+                    "api".to_string(),
+                    "key".to_string(),
                     "forward".to_string(),
                     "killswitch".to_string(),
                     "hostname".to_string(),
@@ -709,6 +731,7 @@ impl Completer for NftyHelper {
                 "socks5:1080",
                 "ssh:22",
                 "dns:53",
+                "api:9090",
                 "no",
                 "show",
                 "top",
@@ -720,6 +743,34 @@ impl Completer for NftyHelper {
             .into_iter()
             .map(String::from)
             .collect(),
+            (ShellLevel::GatewayApi(_, _), 0) => vec![
+                "key",
+                "port",
+                "no",
+                "show",
+                "diff",
+                "test",
+                "apply",
+                "top",
+                "..",
+                "up",
+                "exit",
+                "help",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            (ShellLevel::GatewayApi(_, _), 1) if cmd0 == "key" => vec![
+                "new ro".to_string(),
+                "new rw".to_string(),
+                "new".to_string(),
+            ],
+            (ShellLevel::GatewayApi(_, _), 2) if cmd0 == "key" => {
+                vec!["ro".to_string(), "rw".to_string()]
+            }
+            (ShellLevel::GatewayApi(_, _), 1) if cmd0 == "no" => {
+                vec!["key".to_string()]
+            }
             (ShellLevel::ServiceTo(k), 0) => {
                 let st = self.state.read().unwrap();
                 let mut list = self.known_host_ports();
@@ -737,8 +788,8 @@ impl Completer for NftyHelper {
                 let mut list = self.known_hosts();
                 for pat in [
                     "*.office.lan",
-                    "192.168.1.*",
-                    "192.168.0.0/16",
+                    "169.254.1.*",
+                    "169.254.0.0/16",
                     "10.0.0.0/8",
                     "..",
                     "up",

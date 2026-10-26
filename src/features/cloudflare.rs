@@ -72,6 +72,11 @@ pub fn save_cloudflare_config(cfg: &CloudflareConfig) -> Result<()> {
     let _ = fs::create_dir_all("/data");
     let json_str = serde_json::to_string_pretty(cfg)?;
     fs::write(CF_CONFIG_PATH, json_str)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(CF_CONFIG_PATH, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -484,7 +489,7 @@ pub fn start_or_ensure_cloudflared_daemon(tunnel_token: &str) -> Result<u32> {
     if !Path::new("/etc/resolv.conf").exists() {
         let _ = fs::write(
             "/etc/resolv.conf",
-            "nameserver 192.168.1.1\nnameserver 1.1.1.1\n",
+            "nameserver 1.1.1.1\nnameserver 9.9.9.9\n",
         );
     }
     if !fs::read_to_string("/etc/hosts")

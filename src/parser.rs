@@ -1,8 +1,8 @@
 use crate::ast::{
-    Backend, BalanceStrategy, Config, DnsBlocklist, DnsConfig, DnsForwardZone, DnsNftAction,
-    DnsNftRule, DnsRecord, ForwardMode, Gateway, GatewayPortForward, GatewayService,
-    GatewayServiceKind, HealthCheckConfig, HealthCheckKind, Proto, RateLimit, RateUnit, Service,
-    VipConfig, WgTunnel,
+    generate_api_key, ApiKey, ApiKeyScope, Backend, BalanceStrategy, Config, DnsBlocklist,
+    DnsConfig, DnsForwardZone, DnsNftAction, DnsNftRule, DnsRecord, ForwardMode, Gateway,
+    GatewayPortForward, GatewayService, GatewayServiceKind, HealthCheckConfig, HealthCheckKind,
+    Proto, RateLimit, RateUnit, Service, VipConfig, WgTunnel,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::net::Ipv4Addr;
@@ -66,6 +66,9 @@ pub fn parse_service_spec(raw: &str) -> Result<(String, Option<Ipv4Addr>, u16, P
 
 pub fn resolve_hostname_sync(host: &str) -> Option<Ipv4Addr> {
     let h_lower = host.trim().to_ascii_lowercase();
+    if let Ok(ip) = h_lower.parse::<Ipv4Addr>() {
+        return Some(ip);
+    }
     if h_lower == "localhost" {
         return Some(Ipv4Addr::new(127, 0, 0, 1));
     }
@@ -251,7 +254,7 @@ pub fn parse_vip(raw: &str) -> Result<VipConfig> {
 /// Parses a `vip <ipv4[/cidr] | hostname> [dhcp [iface]] [vlan <id>]` header
 pub fn parse_vip_header(tokens: &[&str]) -> Result<(String, Option<Ipv4Addr>, VipConfig)> {
     if tokens.is_empty() {
-        bail!("Expected VIP IPv4 address or DHCP hostname (e.g. 'vip 192.168.1.4' or 'vip sonarr')");
+        bail!("Expected VIP IPv4 address or DHCP hostname (e.g. 'vip 169.254.1.4' or 'vip sonarr')");
     }
     let first = tokens[0].trim();
     let (key, ip_opt, mut vip_cfg) = if let Ok((ip, cidr_opt)) = parse_ip_and_optional_cidr(first) {
@@ -273,7 +276,7 @@ pub fn parse_vip_header(tokens: &[&str]) -> Result<(String, Option<Ipv4Addr>, Vi
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
         if !valid_name {
             bail!(
-                "Invalid VIP IPv4 or DHCP hostname '{}' (expected e.g. '192.168.1.4' or 'sonarr')",
+                "Invalid VIP IPv4 or DHCP hostname '{}' (expected e.g. '169.254.1.4' or 'sonarr')",
                 first
             );
         }
@@ -298,9 +301,11 @@ pub fn parse_vip_header(tokens: &[&str]) -> Result<(String, Option<Ipv4Addr>, Vi
                 if idx + 1 < tokens.len()
                     && !matches!(
                         tokens[idx + 1].to_ascii_lowercase().as_str(),
-                        "vlan" | "service" | "services" | "ssh"
+                        "vlan" | "service" | "services" | "ssh" | "dns" | "api"
                     )
                     && !tokens[idx + 1].starts_with("ssh:")
+                    && !tokens[idx + 1].starts_with("dns:")
+                    && !tokens[idx + 1].starts_with("api:")
                 {
                     idx += 1;
                     let (base, vid) = split_iface_and_vlan(tokens[idx]);
@@ -400,8 +405,12 @@ pub fn parse_health_check(tokens: &[&str]) -> Result<HealthCheckConfig> {
                 interval_secs,
             })
         }
+        "off" | "none" | "disable" | "disabled" => Ok(HealthCheckConfig {
+            kind: HealthCheckKind::Disabled,
+            interval_secs: 5,
+        }),
         other => bail!(
-            "Unknown health check type '{}' (expected tcp, http, or ping)",
+            "Unknown health check type '{}' (expected tcp, http, ping, or off)",
             other
         ),
     }
@@ -463,11 +472,115 @@ pub fn parse_rate_limit(tokens: &[&str]) -> Result<RateLimit> {
     })
 }
 
+/// Parses a `key` directive inside an `api:<port>` block on a VIP or Gateway:
+/// - `key new` -> generates a new read-write API key
+/// - `key new ro` -> generates a new read-only API key
+/// - `key new rw` -> generates a new read-write API key
+/// - `key <key>` -> adds an explicit read-write API key
+/// - `key <key> ro` -> adds an explicit read-only API key
+/// - `key <key> rw` -> adds an explicit read-write API key
+/// Returns `(ApiKey, was_generated)`.
+pub fn parse_api_key_directive(tokens: &[&str]) -> Result<(ApiKey, bool)> {
+    if tokens.is_empty() {
+        bail!("Expected 'key new [ro|rw]' or 'key <token> [ro|rw]'");
+    }
+
+    fn parse_scope(tok: &str) -> Option<ApiKeyScope> {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "ro" | "readonly" | "read-only" | "read_only" => Some(ApiKeyScope::ReadOnly),
+            "rw" | "readwrite" | "read-write" | "read_write" => Some(ApiKeyScope::ReadWrite),
+            _ => None,
+        }
+    }
+
+    if tokens.len() == 1 {
+        let t0 = tokens[0].trim();
+        if matches!(t0.to_ascii_lowercase().as_str(), "new" | "generate" | "gen") {
+            let scope = ApiKeyScope::ReadWrite;
+            return Ok((
+                ApiKey {
+                    key: generate_api_key(scope),
+                    scope,
+                },
+                true,
+            ));
+        }
+        if let Some(scope) = parse_scope(t0) {
+            return Ok((
+                ApiKey {
+                    key: generate_api_key(scope),
+                    scope,
+                },
+                true,
+            ));
+        }
+        return Ok((
+            ApiKey {
+                key: t0.to_string(),
+                scope: ApiKeyScope::ReadWrite,
+            },
+            false,
+        ));
+    }
+
+    let t0 = tokens[0].trim();
+    let t1 = tokens[1].trim();
+
+    if matches!(t0.to_ascii_lowercase().as_str(), "new" | "generate" | "gen") {
+        let scope = parse_scope(t1).ok_or_else(|| {
+            anyhow!(
+                "Invalid API key scope '{}' (expected 'ro' or 'rw', e.g. 'key new ro' or 'key new rw')",
+                t1
+            )
+        })?;
+        return Ok((
+            ApiKey {
+                key: generate_api_key(scope),
+                scope,
+            },
+            true,
+        ));
+    }
+
+    if let Some(scope) = parse_scope(t0) {
+        if matches!(t1.to_ascii_lowercase().as_str(), "new" | "generate" | "gen") {
+            return Ok((
+                ApiKey {
+                    key: generate_api_key(scope),
+                    scope,
+                },
+                true,
+            ));
+        }
+        return Ok((
+            ApiKey {
+                key: t1.to_string(),
+                scope,
+            },
+            false,
+        ));
+    }
+
+    let scope = parse_scope(t1).ok_or_else(|| {
+        anyhow!(
+            "Invalid API key scope '{}' (expected 'ro' or 'rw', e.g. 'key <token> ro' or 'key <token> rw')",
+            t1
+        )
+    })?;
+    Ok((
+        ApiKey {
+            key: t0.to_string(),
+            scope,
+        },
+        false,
+    ))
+}
+
 /// Validates and normalizes an allow-list entry:
 /// Supports:
-/// - Exact IPv4: `192.168.1.50`
-/// - CIDR: `192.168.1.0/24`
-/// - IPv4 Wildcard: `192.168.1.*`, `10.0.*.*`, `*`
+/// - Exact IPv4: `169.254.1.50`
+/// - CIDR: `169.254.1.0/24`
+/// - IPv4 Wildcard: `169.254.1.*`, `10.0.*.*`, `*`
 /// - Hostname: `admin.office.lan`, `plex.local`
 /// - Hostname Wildcard: `*.office.lan`, `*.trusted.example.com`, `web-*.corp.lan`
 pub fn validate_allow_entry(raw: &str) -> Result<String> {
@@ -498,7 +611,7 @@ pub fn validate_allow_entry(raw: &str) -> Result<String> {
         return Ok(ip.to_string());
     }
 
-    // 3. Check IPv4 wildcard (e.g. "192.168.1.*" or "10.*.*.*")
+    // 3. Check IPv4 wildcard (e.g. "169.254.1.*" or "10.*.*.*")
     let dot_parts: Vec<&str> = trimmed.split('.').collect();
     if dot_parts.len() == 4
         && dot_parts
@@ -514,7 +627,7 @@ pub fn validate_allow_entry(raw: &str) -> Result<String> {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*'));
     if !valid_chars || trimmed.starts_with('.') || trimmed.ends_with('.') {
         bail!(
-            "Invalid allow-list host/IP/wildcard '{}'. Examples: '192.168.1.0/24', '192.168.1.*', '*.office.lan', 'laptop.lan'",
+            "Invalid allow-list host/IP/wildcard '{}'. Examples: '169.254.1.0/24', '169.254.1.*', '*.office.lan', 'laptop.lan'",
             raw
         );
     }
@@ -522,7 +635,7 @@ pub fn validate_allow_entry(raw: &str) -> Result<String> {
     Ok(trimmed)
 }
 
-/// Converts an IPv4 wildcard like `192.168.1.*` or `10.*.*.*` into a CIDR (`192.168.1.0/24`, `10.0.0.0/8`),
+/// Converts an IPv4 wildcard like `169.254.1.*` or `10.*.*.*` into a CIDR (`169.254.1.0/24`, `10.0.0.0/8`),
 /// or returns `None` if it's a hostname / hostname wildcard.
 pub fn expand_ip_wildcard_to_cidr(entry: &str) -> Option<String> {
     if entry == "*" {
@@ -584,6 +697,56 @@ pub fn wildcard_host_matches(pattern: &str, hostname: &str) -> bool {
     true
 }
 
+pub fn strip_inline_comment_preserving_quotes(raw_line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in raw_line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_quotes {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if ch == '#' && !in_quotes {
+            return &raw_line[..idx];
+        }
+    }
+    raw_line
+}
+
+pub fn split_statements_preserving_quotes(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_quotes {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if ch == ';' && !in_quotes {
+            out.push(&line[start..idx]);
+            start = idx + ch.len_utf8();
+        }
+    }
+    out.push(&line[start..]);
+    out
+}
+
 /// Parses a full Nftyfile text into a `Config`
 pub fn parse_nftyfile(input: &str) -> Result<Config> {
     let mut config = Config::new();
@@ -603,6 +766,7 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
         Gateway(Gateway),
         GatewayTunnels(Gateway),
         GatewayService(Gateway),
+        GatewayServiceItem(Gateway, GatewayService, bool),
         GatewayAllow(Gateway),
         Dns,
     }
@@ -611,12 +775,12 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
 
     for (line_idx, raw_line) in input.lines().enumerate() {
         let line_no = line_idx + 1;
-        let line = raw_line.split('#').next().unwrap_or("").trim();
+        let line = strip_inline_comment_preserving_quotes(raw_line).trim();
         if line.is_empty() {
             continue;
         }
 
-        for stmt in line.split(';') {
+        for stmt in split_statements_preserving_quotes(line) {
             let stmt = stmt.trim();
             if stmt.is_empty() {
                 continue;
@@ -646,7 +810,7 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         } else if tokens[0].eq_ignore_ascii_case("vip") {
                             if tokens.len() < 2 {
                                 bail!(
-                                    "Line {}: expected VIP IPv4 address or DHCP hostname after 'vip' (e.g. 'vip 192.168.1.4' or 'vip sonarr')",
+                                    "Line {}: expected VIP IPv4 address or DHCP hostname after 'vip' (e.g. 'vip 169.254.1.4' or 'vip sonarr')",
                                     line_no
                                 );
                             }
@@ -781,18 +945,23 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                                 s.vip = Some(updated.clone());
                             }
                             ParseContext::Vip(vip_key)
-                        } else if tokens[0].eq_ignore_ascii_case("ssh")
+                        } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api")
                             || tokens[0].to_ascii_lowercase().starts_with("ssh:")
+                            || tokens[0].to_ascii_lowercase().starts_with("dns:")
+                            || tokens[0].to_ascii_lowercase().starts_with("api:")
                             || (tokens[0].eq_ignore_ascii_case("local") && tokens.len() >= 2)
                         {
-                            let spec = if tokens[0].eq_ignore_ascii_case("local") {
-                                tokens[1]
-                            } else if tokens[0].eq_ignore_ascii_case("ssh") && tokens.len() >= 2 && tokens[1].parse::<u16>().is_ok() {
-                                &format!("ssh:{}", tokens[1])
+                            let spec_owned: String = if tokens[0].eq_ignore_ascii_case("local") {
+                                tokens[1].to_string()
+                            } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api")
+                                && tokens.len() >= 2
+                                && tokens[1].parse::<u16>().is_ok()
+                            {
+                                format!("{}:{}", tokens[0].to_ascii_lowercase(), tokens[1])
                             } else {
-                                tokens[0]
+                                tokens[0].to_string()
                             };
-                            let key = create_or_find_vip_service_by_key(&mut config, &vip_key, spec)
+                            let key = create_or_find_vip_service_by_key(&mut config, &vip_key, &spec_owned)
                                 .with_context(|| format!("Line {}", line_no))?;
                             if stmt.ends_with('{') {
                                 let svc = config.services.remove(&key).unwrap();
@@ -962,6 +1131,32 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         ParseContext::GatewayService(gw)
                     } else if stmt == "allow {" || stmt == "allow" {
                         ParseContext::GatewayAllow(gw)
+                    } else if stmt.ends_with('{') {
+                        let without_brace = stmt.strip_suffix('{').unwrap_or(stmt).trim();
+                        let tokens: Vec<&str> = without_brace.split_whitespace().collect();
+                        let svc_tok = if !tokens.is_empty()
+                            && matches!(
+                                tokens[0].to_ascii_lowercase().as_str(),
+                                "service" | "services" | "local"
+                            )
+                            && tokens.len() >= 2
+                        {
+                            tokens[1..].join(":")
+                        } else if tokens.len() == 2 && tokens[1].parse::<u16>().is_ok() {
+                            format!("{}:{}", tokens[0], tokens[1])
+                        } else {
+                            without_brace.to_string()
+                        };
+                        let parsed = parse_gateway_service(&svc_tok)
+                            .with_context(|| format!("Line {}", line_no))?;
+                        let gs = if let Some(pos) = gw.services.iter().position(|x| x.kind == parsed.kind) {
+                            let mut existing = gw.services.remove(pos);
+                            existing.port = parsed.port;
+                            existing
+                        } else {
+                            parsed
+                        };
+                        ParseContext::GatewayServiceItem(gw, gs, false)
                     } else {
                         apply_gateway_directive(&mut gw, stmt)
                             .with_context(|| format!("Line {}", line_no))?;
@@ -971,17 +1166,39 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                 ParseContext::GatewayService(mut gw) => {
                     if stmt == "}" {
                         ParseContext::Gateway(gw)
+                    } else if stmt.ends_with('{') {
+                        let without_brace = stmt.strip_suffix('{').unwrap_or(stmt).trim();
+                        let parsed = parse_gateway_service(without_brace)
+                            .with_context(|| format!("Line {}", line_no))?;
+                        let gs = if let Some(pos) = gw.services.iter().position(|x| x.kind == parsed.kind) {
+                            let mut existing = gw.services.remove(pos);
+                            existing.port = parsed.port;
+                            existing
+                        } else {
+                            parsed
+                        };
+                        ParseContext::GatewayServiceItem(gw, gs, true)
                     } else {
                         for tok in stmt.split_whitespace() {
                             let gs = parse_gateway_service(tok)
                                 .with_context(|| format!("Line {}", line_no))?;
-                            if let Some(existing) = gw.services.iter_mut().find(|x| x.kind == gs.kind) {
-                                *existing = gs;
-                            } else {
-                                gw.services.push(gs);
-                            }
+                            upsert_gateway_service(&mut gw, gs);
                         }
                         ParseContext::GatewayService(gw)
+                    }
+                }
+                ParseContext::GatewayServiceItem(mut gw, mut gs, in_sub) => {
+                    if stmt == "}" {
+                        upsert_gateway_service(&mut gw, gs);
+                        if in_sub {
+                            ParseContext::GatewayService(gw)
+                        } else {
+                            ParseContext::Gateway(gw)
+                        }
+                    } else {
+                        apply_gateway_service_directive(&mut gs, stmt)
+                            .with_context(|| format!("Line {}", line_no))?;
+                        ParseContext::GatewayServiceItem(gw, gs, in_sub)
                     }
                 }
                 ParseContext::GatewayTunnels(mut gw) => {
@@ -1048,6 +1265,10 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
         | ParseContext::GatewayTunnels(gw)
         | ParseContext::GatewayService(gw)
         | ParseContext::GatewayAllow(gw) => {
+            config.gateways.insert(gw.key.clone(), gw);
+        }
+        ParseContext::GatewayServiceItem(mut gw, gs, _) => {
+            upsert_gateway_service(&mut gw, gs);
             config.gateways.insert(gw.key.clone(), gw);
         }
     }
@@ -1256,7 +1477,7 @@ pub fn create_or_find_vip_service_by_key(
         }
     }
 
-    // 2. Built-in `ssh` / `ssh:22` and `dns` / `dns:53`
+    // 2. Built-in `ssh` / `ssh:22`, `dns` / `dns:53`, and `api` / `api:9090`
     let lower = spec.to_ascii_lowercase();
     if lower == "ssh" || lower.starts_with("ssh:") {
         let port = if let Some((_, p_str)) = lower.split_once(':') {
@@ -1302,6 +1523,36 @@ pub fn create_or_find_vip_service_by_key(
             backup: false,
         });
         config.dns.get_or_insert_with(DnsConfig::default);
+        config.services.insert(key.clone(), svc);
+        return Ok(key);
+    }
+    if lower == "api" || lower.starts_with("api:") {
+        let port = if let Some((_, p_str)) = lower.split_once(':') {
+            p_str
+                .parse::<u16>()
+                .with_context(|| format!("Invalid API port '{}'", p_str))?
+        } else {
+            9090
+        };
+        if port == 0 {
+            bail!("API port cannot be 0");
+        }
+        let key = format!("{}:{}", vip_key, port);
+        if let Some(existing) = config.services.get_mut(&key) {
+            existing.name = Some(format!("api:{}", port));
+            return Ok(key);
+        }
+        let mut svc = Service::new(key.clone(), vip_ip_opt, port, Proto::Tcp);
+        svc.vip_id = Some(vip_key.to_string());
+        svc.name = Some(format!("api:{}", port));
+        svc.vip = vip_cfg;
+        svc.backends.push(Backend {
+            host: None,
+            ip: Ipv4Addr::new(127, 0, 0, 1),
+            port: 9090,
+            weight: 1,
+            backup: false,
+        });
         config.services.insert(key.clone(), svc);
         return Ok(key);
     }
@@ -1517,11 +1768,19 @@ pub fn apply_service_directive(svc: &mut Service, stmt: &str) -> Result<()> {
                 }
             }
         }
+        "key" | "api-key" | "apikey" => {
+            let (api_key, _generated) = parse_api_key_directive(&tokens[1..])?;
+            if let Some(existing) = svc.api_keys.iter_mut().find(|k| k.key == api_key.key) {
+                existing.scope = api_key.scope;
+            } else {
+                svc.api_keys.push(api_key);
+            }
+        }
         "no" | "delete" | "remove" => {
             apply_service_no_directive(svc, &tokens[1..])?;
         }
         other => bail!(
-            "Unknown service directive '{}'. Valid directives: port, proto, to, hostname, cloudflare-dns, cloudflare-auth, auth, balance, mode, vip, check, limit, allow, no",
+            "Unknown service directive '{}'. Valid directives: port, proto, to, hostname, cloudflare-dns, cloudflare-auth, auth, key, balance, mode, vip, check, limit, allow, no",
             other
         ),
     }
@@ -1530,7 +1789,7 @@ pub fn apply_service_directive(svc: &mut Service, stmt: &str) -> Result<()> {
 
 pub fn apply_service_no_directive(svc: &mut Service, tokens: &[&str]) -> Result<()> {
     if tokens.is_empty() {
-        bail!("Expected item to remove after 'no' (e.g. 'no vip', 'no cloudflare-dns', 'no cloudflare-auth', 'no auth', 'no check', 'no limit', 'no allow <host>', 'no to <ip>')");
+        bail!("Expected item to remove after 'no' (e.g. 'no vip', 'no key <key>', 'no cloudflare-dns', 'no cloudflare-auth', 'no auth', 'no check', 'no limit', 'no allow <host>', 'no to <ip>')");
     }
     match tokens[0].to_ascii_lowercase().as_str() {
         "vip" => svc.vip = None,
@@ -1555,6 +1814,15 @@ pub fn apply_service_no_directive(svc: &mut Service, tokens: &[&str]) -> Result<
             } else {
                 let target = tokens[1].trim();
                 svc.auth.retain(|x| !x.eq_ignore_ascii_case(target));
+            }
+        }
+        "key" | "api-key" | "apikey" => {
+            if tokens.len() == 1 {
+                svc.api_keys.clear();
+            } else {
+                let target = tokens[1].trim();
+                svc.api_keys
+                    .retain(|k| k.key != target && k.scope.as_str() != target);
             }
         }
         "check" => svc.check = None,
@@ -1660,6 +1928,17 @@ pub fn parse_wg_tunnel(tokens: &[&str], index_hint: usize) -> Result<WgTunnel> {
             ),
         }
         idx += 1;
+    }
+
+    let any_inline =
+        address.is_some() || private_key.is_some() || peer_pubkey.is_some() || endpoint.is_some();
+    let all_inline =
+        address.is_some() && private_key.is_some() && peer_pubkey.is_some() && endpoint.is_some();
+    if any_inline && !all_inline {
+        bail!(
+            "Inline WireGuard tunnel '{}' requires all four parameters: address, privkey, peer, and endpoint",
+            name
+        );
     }
 
     Ok(WgTunnel {
@@ -1772,15 +2051,30 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
         }
         "service" | "services" | "local" => {
             if tokens.len() < 2 {
-                bail!("Expected gateway service (e.g. 'privoxy:8118', 'socks5:1080', or 'ssh:22')");
+                bail!("Expected gateway service (e.g. 'privoxy:8118', 'socks5:1080', 'ssh:22', 'dns:53', or 'api:9090')");
             }
             for tok in &tokens[1..] {
                 let gs = parse_gateway_service(tok)?;
-                if let Some(existing) = gw.services.iter_mut().find(|x| x.kind == gs.kind) {
-                    *existing = gs;
-                } else {
-                    gw.services.push(gs);
-                }
+                upsert_gateway_service(gw, gs);
+            }
+        }
+        "key" | "api-key" | "apikey" => {
+            let (api_key, _generated) = parse_api_key_directive(&tokens[1..])?;
+            let gs = if let Some(existing) = gw
+                .services
+                .iter_mut()
+                .find(|s| s.kind == GatewayServiceKind::Api)
+            {
+                existing
+            } else {
+                gw.services
+                    .push(GatewayService::new(GatewayServiceKind::Api, 9090));
+                gw.services.last_mut().unwrap()
+            };
+            if let Some(existing_key) = gs.api_keys.iter_mut().find(|k| k.key == api_key.key) {
+                existing_key.scope = api_key.scope;
+            } else {
+                gs.api_keys.push(api_key);
             }
         }
         "forward" | "port-forward" | "fwd" => {
@@ -1799,12 +2093,22 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
             apply_gateway_no_directive(gw, &tokens[1..])?;
         }
         other => {
-            if let Ok(gs) = parse_gateway_service(other) {
-                if let Some(existing) = gw.services.iter_mut().find(|x| x.kind == gs.kind) {
-                    *existing = gs;
-                } else {
-                    gw.services.push(gs);
+            if let Ok(mut gs) = parse_gateway_service(other) {
+                if tokens.len() >= 2 && matches!(tokens[1].to_ascii_lowercase().as_str(), "key" | "api-key" | "apikey") {
+                    let (api_key, _gen) = parse_api_key_directive(&tokens[2..])?;
+                    gs.api_keys.push(api_key);
                 }
+                upsert_gateway_service(gw, gs);
+            } else if tokens.len() >= 2
+                && tokens[1].parse::<u16>().is_ok()
+                && parse_gateway_service(&format!("{}:{}", other, tokens[1])).is_ok()
+            {
+                let mut gs = parse_gateway_service(&format!("{}:{}", other, tokens[1]))?;
+                if tokens.len() >= 3 && matches!(tokens[2].to_ascii_lowercase().as_str(), "key" | "api-key" | "apikey") {
+                    let (api_key, _gen) = parse_api_key_directive(&tokens[3..])?;
+                    gs.api_keys.push(api_key);
+                }
+                upsert_gateway_service(gw, gs);
             } else if let Ok(fwd) = parse_gateway_forward(&tokens) {
                 if let Some(existing) = gw
                     .forwards
@@ -1817,13 +2121,84 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                 }
             } else {
                 bail!(
-                    "Unknown gateway directive '{}'. Valid directives: vip, hostname, balance, killswitch, check, forward, privoxy:8118, socks5:1080, ssh:22, tunnel, allow, no",
+                    "Unknown gateway directive '{}'. Valid directives: vip, hostname, balance, killswitch, check, forward, privoxy:8118, socks5:1080, ssh:22, dns:53, api:9090, key, tunnel, allow, no",
                     other
                 );
             }
         }
     }
     Ok(())
+}
+
+pub fn upsert_gateway_service(gw: &mut Gateway, gs: GatewayService) {
+    if let Some(existing) = gw.services.iter_mut().find(|x| x.kind == gs.kind) {
+        existing.port = gs.port;
+        for k in gs.api_keys {
+            if let Some(ek) = existing.api_keys.iter_mut().find(|x| x.key == k.key) {
+                ek.scope = k.scope;
+            } else {
+                existing.api_keys.push(k);
+            }
+        }
+    } else {
+        gw.services.push(gs);
+    }
+}
+
+pub fn apply_gateway_service_directive(
+    gs: &mut GatewayService,
+    stmt: &str,
+) -> Result<Option<(ApiKey, bool)>> {
+    let tokens: Vec<&str> = stmt.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    match tokens[0].to_ascii_lowercase().as_str() {
+        "port" | "listen" => {
+            if tokens.len() < 2 {
+                bail!("Expected port number after '{}'", tokens[0]);
+            }
+            let p: u16 = tokens[1]
+                .parse()
+                .with_context(|| format!("Invalid port '{}'", tokens[1]))?;
+            if p == 0 {
+                bail!("Port cannot be 0");
+            }
+            gs.port = p;
+            Ok(None)
+        }
+        "key" | "api-key" | "apikey" => {
+            let (api_key, generated) = parse_api_key_directive(&tokens[1..])?;
+            if let Some(existing) = gs.api_keys.iter_mut().find(|k| k.key == api_key.key) {
+                existing.scope = api_key.scope;
+            } else {
+                gs.api_keys.push(api_key.clone());
+            }
+            Ok(Some((api_key, generated)))
+        }
+        "no" | "delete" | "remove" => {
+            if tokens.len() < 2 {
+                bail!("Expected 'key [<token>]' after 'no'");
+            }
+            match tokens[1].to_ascii_lowercase().as_str() {
+                "key" | "api-key" | "apikey" => {
+                    if tokens.len() == 2 {
+                        gs.api_keys.clear();
+                    } else {
+                        let target = tokens[2].trim();
+                        gs.api_keys
+                            .retain(|k| k.key != target && k.scope.as_str() != target);
+                    }
+                    Ok(None)
+                }
+                other => bail!("Unknown 'no {}' inside gateway service", other),
+            }
+        }
+        other => bail!(
+            "Unknown gateway service directive '{}' (expected 'key new [ro|rw]', 'key <token> [ro|rw]', 'no key [<token>]', or 'port <N>')",
+            other
+        ),
+    }
 }
 
 pub fn parse_gateway_forward(tokens: &[&str]) -> Result<GatewayPortForward> {
@@ -1887,24 +2262,28 @@ pub fn parse_gateway_service(raw: &str) -> Result<GatewayService> {
     };
 
     match name_part {
-        "privoxy" | "http-proxy" | "proxy" => Ok(GatewayService {
-            kind: GatewayServiceKind::Privoxy,
-            port: port_opt.unwrap_or(8118),
-        }),
-        "socks5" | "socks" => Ok(GatewayService {
-            kind: GatewayServiceKind::Socks5,
-            port: port_opt.unwrap_or(1080),
-        }),
-        "ssh" => Ok(GatewayService {
-            kind: GatewayServiceKind::Ssh,
-            port: port_opt.unwrap_or(22),
-        }),
-        "dns" | "dnsmasq" => Ok(GatewayService {
-            kind: GatewayServiceKind::Dns,
-            port: port_opt.unwrap_or(53),
-        }),
+        "privoxy" | "http-proxy" | "proxy" => Ok(GatewayService::new(
+            GatewayServiceKind::Privoxy,
+            port_opt.unwrap_or(8118),
+        )),
+        "socks5" | "socks" => Ok(GatewayService::new(
+            GatewayServiceKind::Socks5,
+            port_opt.unwrap_or(1080),
+        )),
+        "ssh" => Ok(GatewayService::new(
+            GatewayServiceKind::Ssh,
+            port_opt.unwrap_or(22),
+        )),
+        "dns" | "dnsmasq" => Ok(GatewayService::new(
+            GatewayServiceKind::Dns,
+            port_opt.unwrap_or(53),
+        )),
+        "api" => Ok(GatewayService::new(
+            GatewayServiceKind::Api,
+            port_opt.unwrap_or(9090),
+        )),
         other => bail!(
-            "Unknown gateway service '{}' (valid gateway services: 'privoxy[:8118]', 'socks5[:1080]', 'ssh[:22]', 'dns[:53]')",
+            "Unknown gateway service '{}' (valid gateway services: 'privoxy[:8118]', 'socks5[:1080]', 'ssh[:22]', 'dns[:53]', 'api[:9090]')",
             other
         ),
     }
@@ -1912,7 +2291,7 @@ pub fn parse_gateway_service(raw: &str) -> Result<GatewayService> {
 
 pub fn apply_gateway_no_directive(gw: &mut Gateway, tokens: &[&str]) -> Result<()> {
     if tokens.is_empty() {
-        bail!("Expected item after 'no' (e.g. 'no vip', 'no killswitch', 'no service privoxy', 'no tunnel <name>')");
+        bail!("Expected item after 'no' (e.g. 'no vip', 'no killswitch', 'no service privoxy', 'no api', 'no key <key>', 'no tunnel <name>')");
     }
     match tokens[0].to_ascii_lowercase().as_str() {
         "vip" => gw.vip = None,
@@ -1924,6 +2303,17 @@ pub fn apply_gateway_no_directive(gw: &mut Gateway, tokens: &[&str]) -> Result<(
         "hostname" | "host" | "domain" | "mdns" => gw.hostname = None,
         "killswitch" | "kill-switch" => gw.killswitch = false,
         "check" => gw.check = None,
+        "key" | "api-key" | "apikey" => {
+            for gs in gw.services.iter_mut() {
+                if tokens.len() == 1 {
+                    gs.api_keys.clear();
+                } else {
+                    let target = tokens[1].trim();
+                    gs.api_keys
+                        .retain(|k| k.key != target && k.scope.as_str() != target);
+                }
+            }
+        }
         "service" | "services" => {
             if tokens.len() == 1 {
                 gw.services.clear();
@@ -2175,11 +2565,27 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
                 bail!("Usage: txt <name> <text...>");
             }
             let name = tokens[1].trim().to_ascii_lowercase();
-            let text = tokens[2..]
-                .join(" ")
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_string();
+            let raw_text = tokens[2..].join(" ");
+            let trimmed_text = if (raw_text.starts_with('"') && raw_text.ends_with('"'))
+                || (raw_text.starts_with('\'') && raw_text.ends_with('\''))
+            {
+                &raw_text[1..raw_text.len().saturating_sub(1)]
+            } else {
+                raw_text.as_str()
+            };
+            let mut text = String::with_capacity(trimmed_text.len());
+            let mut chars = trimmed_text.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\\' {
+                    if let Some(next_ch) = chars.next() {
+                        text.push(next_ch);
+                    } else {
+                        text.push('\\');
+                    }
+                } else {
+                    text.push(ch);
+                }
+            }
             dns.records
                 .retain(|r| !matches!(r, DnsRecord::Txt { name: n, .. } if n == &name));
             dns.records.push(DnsRecord::Txt { name, text });
@@ -2368,7 +2774,34 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
             if tokens.len() < 2 {
                 bail!("Expected raw dnsmasq option after 'raw' (e.g. 'raw localise-queries')");
             }
-            let opt = tokens[1..].join(" ").trim_matches('"').to_string();
+            let opt = tokens[1..].join(" ").trim_matches('"').trim().to_string();
+            if opt.contains('\n') || opt.contains('\r') {
+                bail!("Raw dnsmasq option cannot contain newlines");
+            }
+            let opt_key = opt
+                .split(['=', ' ', '\t'])
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('-')
+                .to_ascii_lowercase();
+            if matches!(
+                opt_key.as_str(),
+                "dhcp-script"
+                    | "dhcp-luascript"
+                    | "conf-file"
+                    | "conf-dir"
+                    | "servers-file"
+                    | "addn-hosts"
+                    | "hostsdir"
+                    | "user"
+                    | "group"
+                    | "pid-file"
+            ) {
+                bail!(
+                    "Raw dnsmasq option '{}' is restricted for security reasons",
+                    opt_key
+                );
+            }
             if !opt.is_empty() && !dns.raw_options.contains(&opt) {
                 dns.raw_options.push(opt);
             }

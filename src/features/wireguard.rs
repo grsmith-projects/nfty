@@ -132,6 +132,7 @@ pub fn apply_wireguard_gateways(cfg: &Config) -> Vec<String> {
     let _ = fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", "2\n");
     let _ = fs::write("/proc/sys/net/ipv4/conf/default/rp_filter", "2\n");
 
+    let mut active_wg_ifaces = std::collections::BTreeSet::new();
     let mut global_idx = 0usize;
     for gw in cfg.gateways.values() {
         for t in &gw.tunnels {
@@ -140,6 +141,7 @@ pub fn apply_wireguard_gateways(cfg: &Config) -> Vec<String> {
             } else {
                 t.iface.clone()
             };
+            active_wg_ifaces.insert(iface.clone());
             let table_id = 101 + global_idx;
             let fwmark = 0x101 + global_idx;
             global_idx += 1;
@@ -161,6 +163,11 @@ pub fn apply_wireguard_gateways(cfg: &Config) -> Vec<String> {
             }
             let run_conf_path = format!("/run/nfty-{}.conf", iface);
             let _ = fs::write(&run_conf_path, wg_conf);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&run_conf_path, fs::Permissions::from_mode(0o600));
+            }
 
             let _ = Command::new("ip")
                 .args(["link", "add", "dev", &iface, "type", "wireguard"])
@@ -172,7 +179,7 @@ pub fn apply_wireguard_gateways(cfg: &Config) -> Vec<String> {
                 .args(["addr", "replace", &parsed.address, "dev", &iface])
                 .output();
             let _ = Command::new("ip")
-                .args(["link", "set", "mtu", "1420", " up", "dev", &iface])
+                .args(["link", "set", "mtu", "1420", "up", "dev", &iface])
                 .output();
             let _ = Command::new("ip")
                 .args(["link", "set", "dev", &iface, "up"])
@@ -248,6 +255,32 @@ pub fn apply_wireguard_gateways(cfg: &Config) -> Vec<String> {
                 Err(e) => {
                     logs.push(format!("WARN: failed to invoke 'wg' for {}: {}", iface, e));
                 }
+            }
+        }
+    }
+
+    // Clean up any stale wg* interfaces and policy routing rules that are no longer configured
+    if let Ok(entries) = fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("wg") && !active_wg_ifaces.contains(&name) {
+                if let Some(idx_str) = name.strip_prefix("wg") {
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        let table_str = (101 + idx).to_string();
+                        let mark_hex = format!("0x{:x}", 0x101 + idx);
+                        let _ = Command::new("ip")
+                            .args(["rule", "del", "fwmark", &mark_hex, "table", &table_str])
+                            .output();
+                        let _ = Command::new("ip")
+                            .args(["route", "flush", "table", &table_str])
+                            .output();
+                    }
+                }
+                let _ = Command::new("ip")
+                    .args(["link", "del", "dev", &name])
+                    .output();
+                let _ = fs::remove_file(format!("/run/nfty-{}.conf", name));
+                logs.push(format!("Removed stale WireGuard interface {}", name));
             }
         }
     }

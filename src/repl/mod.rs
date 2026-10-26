@@ -6,17 +6,18 @@ pub use completer::NftyHelper;
 pub use help::print_context_help;
 pub use status::{handle_show, print_config_diff, print_status, print_status_table};
 
-use crate::ast::{DnsConfig, Gateway, Service};
+use crate::ast::{DnsConfig, Gateway, GatewayService, GatewayServiceKind, Service};
 use crate::compiler::{
     apply_vip_commands, generate_vip_commands, reconcile_dhcp_and_vlan_vips,
     reload_kernel_from_state, validate_config,
 };
 use crate::health::{refresh_allowlist_hosts, run_all_probes_once};
 use crate::parser::{
-    apply_dns_directive, apply_gateway_directive, apply_service_directive,
-    create_or_find_vip_service_by_key, parse_backend, parse_gateway_service,
-    parse_ip_and_optional_cidr, parse_nftyfile, parse_service_spec, parse_vip, parse_vip_header,
-    parse_vlan_id, parse_wg_tunnel, remove_backend_from_service, validate_allow_entry,
+    apply_dns_directive, apply_gateway_directive, apply_gateway_service_directive,
+    apply_service_directive, create_or_find_vip_service_by_key, parse_backend,
+    parse_gateway_service, parse_ip_and_optional_cidr, parse_nftyfile, parse_service_spec,
+    parse_vip, parse_vip_header, parse_vlan_id, parse_wg_tunnel, remove_backend_from_service,
+    upsert_gateway_service, validate_allow_entry,
 };
 use crate::state::{HealthState, PendingConfirm, SharedState};
 use crate::tui::run_watch_dashboard;
@@ -43,6 +44,7 @@ pub enum ShellLevel {
     Gateway(String),
     GatewayTunnels(String),
     GatewayService(String),
+    GatewayApi(String, u16),
 }
 
 impl ShellLevel {
@@ -60,6 +62,7 @@ impl ShellLevel {
             ShellLevel::Gateway(k) => format!("nfty(config-gateway:{})# ", k),
             ShellLevel::GatewayTunnels(k) => format!("nfty(config-gateway:{}-tunnels)# ", k),
             ShellLevel::GatewayService(k) => format!("nfty(config-gateway:{}-service)# ", k),
+            ShellLevel::GatewayApi(k, p) => format!("nfty(config-gateway:{}-api:{})# ", k, p),
         }
     }
 }
@@ -118,6 +121,7 @@ pub async fn run_repl(shared: SharedState) -> Result<()> {
                     | ShellLevel::Gateway(_)
                     | ShellLevel::GatewayTunnels(_)
                     | ShellLevel::GatewayService(_)
+                    | ShellLevel::GatewayApi(_, _)
                     | ShellLevel::GlobalAllow
                     | ShellLevel::Dns => {
                         *lvl = ShellLevel::ConfigRoot;
@@ -198,9 +202,9 @@ pub async fn handle_line(
                     }
                 }
                 ShellLevel::VipService(k) => ShellLevel::Vip(k.clone()),
-                ShellLevel::GatewayTunnels(k) | ShellLevel::GatewayService(k) => {
-                    ShellLevel::Gateway(k.clone())
-                }
+                ShellLevel::GatewayTunnels(k)
+                | ShellLevel::GatewayService(k)
+                | ShellLevel::GatewayApi(k, _) => ShellLevel::Gateway(k.clone()),
                 ShellLevel::Vip(_)
                 | ShellLevel::Gateway(_)
                 | ShellLevel::GlobalAllow
@@ -235,7 +239,9 @@ pub async fn handle_line(
                 ShellLevel::VipService(k) => {
                     *lvl = ShellLevel::Vip(k.clone());
                 }
-                ShellLevel::GatewayTunnels(k) | ShellLevel::GatewayService(k) => {
+                ShellLevel::GatewayTunnels(k)
+                | ShellLevel::GatewayService(k)
+                | ShellLevel::GatewayApi(k, _) => {
                     *lvl = ShellLevel::Gateway(k.clone());
                 }
                 ShellLevel::Vip(_)
@@ -513,6 +519,11 @@ pub async fn handle_line(
                 eprintln!("{} {}", "Error:".red().bold(), e);
             }
         }
+        ShellLevel::GatewayApi(gw_key, port) => {
+            if let Err(e) = handle_gateway_api_command(&gw_key, port, trimmed, level, shared) {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+            }
+        }
     }
 
     false
@@ -520,7 +531,7 @@ pub async fn handle_line(
 
 fn handle_host_mapping(args: &[&str], shared: &SharedState) -> Result<()> {
     if args.len() < 2 {
-        bail!("Usage: host <hostname> <ipv4> [ipv4...] (e.g. 'host laptop.office.lan 192.168.1.77')");
+        bail!("Usage: host <hostname> <ipv4> [ipv4...] (e.g. 'host laptop.office.lan 169.254.1.77')");
     }
     let host = args[0].trim().to_ascii_lowercase();
     let mut ips = Vec::new();
@@ -566,7 +577,7 @@ fn handle_host_mapping(args: &[&str], shared: &SharedState) -> Result<()> {
 /// - Applies the VIP and ruleset so you can bootstrap as many IPs as you want
 pub fn handle_bootstrap(args: &[&str], shared: &SharedState) -> Result<()> {
     if args.is_empty() {
-        bail!("Usage: bootstrap <ip[/prefix]> [ip2...] (e.g. 'bootstrap 192.168.4.250')");
+        bail!("Usage: bootstrap <ip[/prefix]> [ip2...] (e.g. 'bootstrap 169.254.4.250')");
     }
 
     let mut iface = "eth0".to_string();
@@ -593,7 +604,7 @@ pub fn handle_bootstrap(args: &[&str], shared: &SharedState) -> Result<()> {
     }
 
     if ip_specs.is_empty() {
-        bail!("Expected at least one IPv4 address to bootstrap (e.g. 'bootstrap 192.168.4.250')");
+        bail!("Expected at least one IPv4 address to bootstrap (e.g. 'bootstrap 169.254.4.250')");
     }
 
     let mut parsed_targets = Vec::new();
@@ -737,7 +748,7 @@ fn handle_config_root_command(
         }
         "vip" => {
             if tokens.len() < 2 {
-                bail!("Usage: vip <ipv4[/cidr] | hostname> [dhcp [iface]] [vlan <id>] (e.g. 'vip 192.168.1.4' or 'vip sonarr')");
+                bail!("Usage: vip <ipv4[/cidr] | hostname> [dhcp [iface]] [vlan <id>] (e.g. 'vip 169.254.1.4' or 'vip sonarr')");
             }
             let (key, _ip_opt, parsed_vip) = parse_vip_header(&tokens[1..])?;
             {
@@ -777,9 +788,11 @@ fn handle_config_root_command(
                         if idx < tokens.len()
                             && !matches!(
                                 tokens[idx].to_ascii_lowercase().as_str(),
-                                "vlan" | "service" | "services" | "ssh"
+                                "vlan" | "service" | "services" | "ssh" | "dns" | "api"
                             )
                             && !tokens[idx].starts_with("ssh:")
+                            && !tokens[idx].starts_with("dns:")
+                            && !tokens[idx].starts_with("api:")
                         {
                             idx += 1;
                         }
@@ -800,7 +813,7 @@ fn handle_config_root_command(
         }
         "gateway" => {
             if tokens.len() < 2 {
-                bail!("Usage: gateway <ipv4[/cidr] | hostname> [dhcp [iface]] [vlan <id>] (e.g. 'gateway 192.168.1.10' or 'gateway mullvad')");
+                bail!("Usage: gateway <ipv4[/cidr] | hostname> [dhcp [iface]] [vlan <id>] (e.g. 'gateway 169.254.1.10' or 'gateway mullvad')");
             }
             let (key, ip_opt, parsed_vip) = parse_vip_header(&tokens[1..])?;
             {
@@ -838,8 +851,9 @@ fn handle_config_root_command(
                         if idx < tokens.len()
                             && !matches!(
                                 tokens[idx].to_ascii_lowercase().as_str(),
-                                "vlan" | "service" | "services" | "tunnel" | "tunnels"
+                                "vlan" | "service" | "services" | "tunnel" | "tunnels" | "api"
                             )
+                            && !tokens[idx].starts_with("api:")
                         {
                             idx += 1;
                         }
@@ -854,23 +868,13 @@ fn handle_config_root_command(
                 *level.lock().unwrap() = ShellLevel::Gateway(key);
             } else {
                 let rest = tokens[idx..].join(" ");
-                let mut st = shared.write().unwrap();
-                if let Some(gw) = st.candidate.gateways.get_mut(&key) {
-                    apply_gateway_directive(gw, &rest)?;
-                    println!(
-                        "  {} Updated gateway {}: {}",
-                        "✔".green().bold(),
-                        key.bold(),
-                        rest
-                    );
-                }
-                st.sync_runtime_entries();
+                handle_gateway_level_command(&key, &rest, level, shared)?;
             }
             Ok(())
         }
         "service" => {
             if tokens.len() < 2 {
-                bail!("Usage: service <port | ip:port[/proto]> (e.g. 'service 9000' or 'service 192.168.1.240:443')");
+                bail!("Usage: service <port | ip:port[/proto]> (e.g. 'service 9000' or 'service 169.254.1.240:443')");
             }
             let (key, listen_ip, port, proto) = parse_service_spec(tokens[1])?;
             {
@@ -1248,6 +1252,55 @@ fn handle_vip_level_command(
                 vip_key.cyan(),
                 spec.bold()
             );
+            return Ok(());
+        }
+        "api" => {
+            let (spec, rest_start) = if tokens.len() >= 2 && tokens[1].parse::<u16>().is_ok() {
+                (format!("api:{}", tokens[1]), 2)
+            } else {
+                ("api:9090".to_string(), 1)
+            };
+            let svc_key = {
+                let mut st = shared.write().unwrap();
+                let k = create_or_find_vip_service_by_key(&mut st.candidate, vip_key, &spec)?;
+                st.sync_runtime_entries();
+                k
+            };
+            if tokens.len() <= rest_start {
+                *level.lock().unwrap() = ShellLevel::Service(svc_key.clone());
+                println!(
+                    "  {} [vip {}] + {} ({})",
+                    "✔".green().bold(),
+                    vip_key.cyan(),
+                    spec.bold(),
+                    svc_key
+                );
+            } else {
+                let rest_cmd = tokens[rest_start..].join(" ");
+                handle_service_level_command(&svc_key, &rest_cmd, level, shared)?;
+            }
+            return Ok(());
+        }
+        _ if first_lower.starts_with("api:") => {
+            let svc_key = {
+                let mut st = shared.write().unwrap();
+                let k = create_or_find_vip_service_by_key(&mut st.candidate, vip_key, tokens[0])?;
+                st.sync_runtime_entries();
+                k
+            };
+            if tokens.len() == 1 {
+                *level.lock().unwrap() = ShellLevel::Service(svc_key.clone());
+                println!(
+                    "  {} [vip {}] + {} ({})",
+                    "✔".green().bold(),
+                    vip_key.cyan(),
+                    tokens[0].bold(),
+                    svc_key
+                );
+            } else {
+                let rest_cmd = tokens[1..].join(" ");
+                handle_service_level_command(&svc_key, &rest_cmd, level, shared)?;
+            }
             return Ok(());
         }
         _ if first_lower.starts_with("ssh:") || first_lower.starts_with("dns:") => {
@@ -1745,21 +1798,38 @@ fn handle_service_level_command(
             .services
             .remove(svc_key)
             .ok_or_else(|| anyhow::anyhow!("Service '{}' no longer exists", svc_key))?;
+        let prev_keys_len = svc.api_keys.len();
         if let Err(e) = apply_service_directive(&mut svc, trimmed) {
             st.candidate.services.insert(svc_key.to_string(), svc);
             return Err(e);
         }
         let updated_key = svc.key.clone();
         let label = svc.display_name();
+        let added_key = if svc.api_keys.len() > prev_keys_len {
+            svc.api_keys.last().cloned()
+        } else {
+            None
+        };
         st.candidate.services.insert(updated_key.clone(), svc);
         st.sync_runtime_entries();
-        println!(
-            "  {} [service {} ({})] {}",
-            "✔".green().bold(),
-            label.cyan(),
-            updated_key,
-            trimmed
-        );
+        if let Some(ak) = added_key {
+            println!(
+                "  {} [service {} ({})] key {} ({})",
+                "✔".green().bold(),
+                label.cyan(),
+                updated_key,
+                ak.key.green().bold(),
+                ak.scope.as_str().yellow().bold()
+            );
+        } else {
+            println!(
+                "  {} [service {} ({})] {}",
+                "✔".green().bold(),
+                label.cyan(),
+                updated_key,
+                trimmed
+            );
+        }
         updated_key
     };
     if new_key != svc_key {
@@ -1782,7 +1852,7 @@ fn handle_service_to_command(
     let first_lower = tokens[0].to_ascii_lowercase();
     if matches!(
         first_lower.as_str(),
-        "balance" | "check" | "vip" | "mode" | "limit" | "allow" | "service"
+        "balance" | "check" | "vip" | "mode" | "limit" | "allow" | "service" | "key"
     ) {
         *level.lock().unwrap() = ShellLevel::Service(svc_key.to_string());
         return handle_service_level_command(svc_key, trimmed, level, shared);
@@ -1797,7 +1867,7 @@ fn handle_service_to_command(
 
     if matches!(first_lower.as_str(), "no" | "delete" | "remove") {
         if tokens.len() < 2 {
-            bail!("Usage: no <ip[:port]> (e.g. 'no 192.168.1.60:9000')");
+            bail!("Usage: no <ip[:port]> (e.g. 'no 169.254.1.60:9000')");
         }
         if remove_backend_from_service(svc, tokens[1])? {
             println!(
@@ -1918,13 +1988,51 @@ fn handle_gateway_level_command(
         return Ok(());
     }
 
-    match tokens[0].to_ascii_lowercase().as_str() {
+    let first_lower = tokens[0].to_ascii_lowercase();
+    match first_lower.as_str() {
         "tunnels" | "to" if tokens.len() == 1 => {
             *level.lock().unwrap() = ShellLevel::GatewayTunnels(gw_key.to_string());
             return Ok(());
         }
         "service" | "services" if tokens.len() == 1 => {
             *level.lock().unwrap() = ShellLevel::GatewayService(gw_key.to_string());
+            return Ok(());
+        }
+        "api" | _ if first_lower == "api" || first_lower.starts_with("api:") => {
+            let (spec, rest_start) = if first_lower == "api"
+                && tokens.len() >= 2
+                && tokens[1].parse::<u16>().is_ok()
+            {
+                (format!("api:{}", tokens[1]), 2)
+            } else if first_lower == "api" {
+                ("api:9090".to_string(), 1)
+            } else {
+                (tokens[0].to_string(), 1)
+            };
+            let gs = parse_gateway_service(&spec)?;
+            let port = gs.port;
+            {
+                let mut st = shared.write().unwrap();
+                let gw = st
+                    .candidate
+                    .gateways
+                    .get_mut(gw_key)
+                    .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
+                upsert_gateway_service(gw, gs);
+                st.sync_runtime_entries();
+            }
+            if tokens.len() <= rest_start {
+                *level.lock().unwrap() = ShellLevel::GatewayApi(gw_key.to_string(), port);
+                println!(
+                    "  {} [gateway {}] + api:{}",
+                    "✔".green().bold(),
+                    gw_key.cyan(),
+                    port
+                );
+            } else {
+                let rest_cmd = tokens[rest_start..].join(" ");
+                handle_gateway_api_command(gw_key, port, &rest_cmd, level, shared)?;
+            }
             return Ok(());
         }
         "gateway" => {
@@ -1934,19 +2042,124 @@ fn handle_gateway_level_command(
     }
 
     let mut st = shared.write().unwrap();
-    let gw = st
-        .candidate
-        .gateways
-        .get_mut(gw_key)
-        .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
-    apply_gateway_directive(gw, trimmed)?;
+    let generated_key = {
+        let gw = st
+            .candidate
+            .gateways
+            .get_mut(gw_key)
+            .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
+        apply_gateway_directive(gw, trimmed)?;
+        if first_lower == "key" || first_lower == "api-key" || first_lower == "apikey" {
+            gw.services
+                .iter()
+                .find(|s| s.kind == GatewayServiceKind::Api)
+                .and_then(|gs| gs.api_keys.last().map(|ak| (gs.port, ak.clone())))
+        } else {
+            None
+        }
+    };
     st.sync_runtime_entries();
+    if let Some((port, ak)) = generated_key {
+        println!(
+            "  {} [gateway {} -> api:{}] key {} ({})",
+            "✔".green().bold(),
+            gw_key.cyan(),
+            port,
+            ak.key.green().bold(),
+            ak.scope.as_str().yellow().bold()
+        );
+        return Ok(());
+    }
     println!(
         "  {} [gateway {}] {}",
         "✔".green().bold(),
         gw_key.cyan(),
         trimmed
     );
+    Ok(())
+}
+
+fn handle_gateway_api_command(
+    gw_key: &str,
+    port: u16,
+    trimmed: &str,
+    level: &Arc<Mutex<ShellLevel>>,
+    shared: &SharedState,
+) -> Result<()> {
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let first_lower = tokens[0].to_ascii_lowercase();
+    if matches!(
+        first_lower.as_str(),
+        "tunnels"
+            | "tunnel"
+            | "vip"
+            | "hostname"
+            | "balance"
+            | "killswitch"
+            | "check"
+            | "allow"
+            | "gateway"
+            | "service"
+            | "services"
+            | "forward"
+            | "privoxy"
+            | "socks5"
+            | "ssh"
+            | "dns"
+    ) || first_lower.starts_with("privoxy:")
+        || first_lower.starts_with("socks5:")
+        || first_lower.starts_with("ssh:")
+        || first_lower.starts_with("dns:")
+    {
+        *level.lock().unwrap() = ShellLevel::Gateway(gw_key.to_string());
+        return handle_gateway_level_command(gw_key, trimmed, level, shared);
+    }
+
+    let mut st = shared.write().unwrap();
+    let gw = st
+        .candidate
+        .gateways
+        .get_mut(gw_key)
+        .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
+    let gs = if let Some(existing) = gw
+        .services
+        .iter_mut()
+        .find(|s| s.kind == GatewayServiceKind::Api)
+    {
+        existing
+    } else {
+        gw.services
+            .push(GatewayService::new(GatewayServiceKind::Api, port));
+        gw.services.last_mut().unwrap()
+    };
+
+    let added = apply_gateway_service_directive(gs, trimmed)?;
+    let new_port = gs.port;
+    st.sync_runtime_entries();
+    if new_port != port {
+        *level.lock().unwrap() = ShellLevel::GatewayApi(gw_key.to_string(), new_port);
+    }
+    if let Some((ak, _generated)) = added {
+        println!(
+            "  {} [gateway {} -> api:{}] key {} ({})",
+            "✔".green().bold(),
+            gw_key.cyan(),
+            new_port,
+            ak.key.green().bold(),
+            ak.scope.as_str().yellow().bold()
+        );
+    } else {
+        println!(
+            "  {} [gateway {} -> api:{}] {}",
+            "✔".green().bold(),
+            gw_key.cyan(),
+            new_port,
+            trimmed
+        );
+    }
     Ok(())
 }
 
@@ -1978,6 +2191,10 @@ fn handle_gateway_service_command(
         return handle_gateway_level_command(gw_key, trimmed, level, shared);
     }
 
+    if first_lower == "api" || first_lower.starts_with("api:") {
+        return handle_gateway_level_command(gw_key, trimmed, level, shared);
+    }
+
     let mut st = shared.write().unwrap();
     let gw = st
         .candidate
@@ -1987,7 +2204,7 @@ fn handle_gateway_service_command(
 
     if matches!(first_lower.as_str(), "no" | "delete" | "remove") {
         if tokens.len() < 2 {
-            bail!("Usage: no <privoxy|socks5|ssh|dns>");
+            bail!("Usage: no <privoxy|socks5|ssh|dns|api>");
         }
         let gs = parse_gateway_service(tokens[1])?;
         let before = gw.services.len();
@@ -2008,17 +2225,18 @@ fn handle_gateway_service_command(
     for tok in tokens {
         let gs = parse_gateway_service(tok)?;
         let label = gs.to_string();
-        if let Some(existing) = gw.services.iter_mut().find(|x| x.kind == gs.kind) {
-            *existing = gs;
-        } else {
-            gw.services.push(gs);
-        }
+        let kind = gs.kind;
+        let port = gs.port;
+        upsert_gateway_service(gw, gs);
         println!(
             "  {} [gateway {} -> service] + {}",
             "✔".green().bold(),
             gw_key.cyan(),
             label.bold()
         );
+        if kind == GatewayServiceKind::Api {
+            *level.lock().unwrap() = ShellLevel::GatewayApi(gw_key.to_string(), port);
+        }
     }
     Ok(())
 }

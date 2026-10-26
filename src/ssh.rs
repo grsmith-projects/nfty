@@ -54,20 +54,45 @@ fn auth_path() -> &'static str {
 
 pub fn load_auth_config() -> AuthConfig {
     let p = auth_path();
-    if let Ok(raw) = fs::read_to_string(p) {
-        if let Ok(cfg) = serde_json::from_str::<AuthConfig>(&raw) {
-            return cfg;
+    match fs::read_to_string(p) {
+        Ok(raw) => match serde_json::from_str::<AuthConfig>(&raw) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("[nfty-ssh] Warning: corrupt auth file {}: {}", p, e);
+                AuthConfig {
+                    username: "nfty".to_string(),
+                    password_sha256: "locked-corrupt-auth-file".to_string(),
+                    must_change_password: false,
+                }
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let def = AuthConfig::default();
+            let _ = save_auth_config(&def);
+            def
+        }
+        Err(e) => {
+            eprintln!("[nfty-ssh] Warning: failed to read auth file {}: {}", p, e);
+            AuthConfig {
+                username: "nfty".to_string(),
+                password_sha256: "locked-corrupt-auth-file".to_string(),
+                must_change_password: false,
+            }
         }
     }
-    let def = AuthConfig::default();
-    let _ = save_auth_config(&def);
-    def
 }
 
 pub fn save_auth_config(cfg: &AuthConfig) -> Result<()> {
     let p = auth_path();
+    let tmp = format!("{}.tmp.{}", p, std::process::id());
     let txt = serde_json::to_string_pretty(cfg)?;
-    fs::write(p, txt)?;
+    fs::write(&tmp, txt)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&tmp, p)?;
     Ok(())
 }
 
@@ -229,12 +254,14 @@ struct PtySession {
 #[derive(Clone)]
 struct NftySshServer {
     sessions: Arc<Mutex<HashMap<ChannelId, PtySession>>>,
+    pending_dims: Arc<Mutex<HashMap<ChannelId, (u32, u32)>>>,
 }
 
 impl NftySshServer {
     fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            pending_dims: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -279,6 +306,10 @@ impl Handler for NftySshServer {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        {
+            let mut dims = self.pending_dims.lock().await;
+            dims.insert(channel, (col_width, row_height));
+        }
         let mut guard = self.sessions.lock().await;
         if let Some(s) = guard.get_mut(&channel) {
             s.cols = col_width;
@@ -298,6 +329,10 @@ impl Handler for NftySshServer {
         _pix_height: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        {
+            let mut dims = self.pending_dims.lock().await;
+            dims.insert(channel, (col_width, row_height));
+        }
         let mut guard = self.sessions.lock().await;
         if let Some(s) = guard.get_mut(&channel) {
             s.cols = col_width;
@@ -312,7 +347,11 @@ impl Handler for NftySshServer {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let (master_fd, slave_fd) = open_pty(80, 24)?;
+        let (cols, rows) = {
+            let mut dims = self.pending_dims.lock().await;
+            dims.remove(&channel).unwrap_or((80, 24))
+        };
+        let (master_fd, slave_fd) = open_pty(cols, rows)?;
         let exe = std::env::current_exe().unwrap_or_else(|_| "/bin/nfty".into());
 
         // Spawn `/bin/nfty --ssh-session` attached to the slave PTY
@@ -354,14 +393,15 @@ impl Handler for NftySshServer {
                 PtySession {
                     master_writer,
                     master_fd,
-                    cols: 80,
-                    rows: 24,
+                    cols,
+                    rows,
                 },
             );
         }
 
         session.channel_success(channel);
         let handle = session.handle();
+        let sessions_cleanup = self.sessions.clone();
 
         // Forward PTY output -> SSH channel, and close channel when child exits
         tokio::spawn(async move {
@@ -380,11 +420,35 @@ impl Handler for NftySshServer {
                     }
                 }
             }
-            let _ = child.wait();
+            let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+            {
+                let mut guard = sessions_cleanup.lock().await;
+                guard.remove(&channel);
+            }
             let _ = handle.eof(channel).await;
             let _ = handle.close(channel).await;
         });
 
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let mut guard = self.sessions.lock().await;
+        guard.remove(&channel);
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let mut guard = self.sessions.lock().await;
+        guard.remove(&channel);
         Ok(())
     }
 

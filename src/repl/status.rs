@@ -117,7 +117,10 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
                 println!("(Service {} not found)", k);
             }
         }
-        ShellLevel::Gateway(k) | ShellLevel::GatewayTunnels(k) | ShellLevel::GatewayService(k) => {
+        ShellLevel::Gateway(k)
+        | ShellLevel::GatewayTunnels(k)
+        | ShellLevel::GatewayService(k)
+        | ShellLevel::GatewayApi(k, _) => {
             if let Some(gw) = st.candidate.gateways.get(k) {
                 print!("{}", gw.format_block());
                 if st.candidate.services.len() + st.candidate.gateways.len() > 1 {
