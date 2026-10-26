@@ -102,7 +102,7 @@ pub struct AppState {
     pub candidate: Config,
     pub history: Vec<Config>,
     pub config_path: PathBuf,
-    /// Keyed by "ip:port" (e.g., "192.168.1.60:9000")
+    /// Keyed by "ip:port" (e.g., "10.0.1.60:9000")
     pub runtime: BTreeMap<String, BackendRuntime>,
     /// Live DNS & Host cache mapping hostname -> resolved IPv4 addresses.
     /// Automatically kept updated by background DNS/hosts resolver + API registrations.
@@ -299,7 +299,22 @@ impl AppState {
             return non_drained;
         }
 
-        backends.iter().collect()
+        let non_drained_backups: Vec<&Backend> = backends
+            .iter()
+            .filter(|b| {
+                b.backup
+                    && self
+                        .runtime
+                        .get(&b.endpoint())
+                        .map(|rt| !rt.drained)
+                        .unwrap_or(true)
+            })
+            .collect();
+        if !non_drained_backups.is_empty() {
+            return non_drained_backups;
+        }
+
+        Vec::new()
     }
 }
 

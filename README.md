@@ -380,7 +380,7 @@ To run `nfty` on an existing Linux server or router without the PID-1 unikernel 
 sudo ./dist/standalone/nfty --file /etc/nfty/Nftyfile --api-bind 127.0.0.1:9090
 
 # Or run headless under systemd (see packaging/standalone/nfty.service)
-sudo ./dist/standalone/nfty --file /etc/nfty/Nftyfile --apply --daemon
+sudo ./dist/standalone/nfty --file /etc/nfty/Nftyfile daemon
 ```
 
 ### 4. Build and Flash a Bare-Metal RK3588S / ARM64 Unikernel Image

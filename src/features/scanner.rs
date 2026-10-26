@@ -432,7 +432,7 @@ pub fn print_scan_table(discovered: &[crate::state::DiscoveredService], shared: 
     if discovered.is_empty() {
         println!(
             "  {}",
-            "(No open container/LAN services discovered; try 'scan <hostname>' or 'scan 192.168.1.0/24')"
+            "(No open container/LAN services discovered; try 'scan <hostname>' or 'scan 169.254.1.0/24')"
                 .dimmed()
         );
         return;
@@ -467,6 +467,6 @@ pub fn print_scan_table(discovered: &[crate::state::DiscoveredService], shared: 
         "\n  {} Run {} to create a dedicated DHCP VIP on port 80, or {} to attach to an existing VIP.",
         "Tip:".cyan().bold(),
         "adopt <# | host:port>".bold(),
-        "adopt <#> vip 192.168.1.4".bold()
+        "adopt <#> vip 169.254.1.4".bold()
     );
 }
