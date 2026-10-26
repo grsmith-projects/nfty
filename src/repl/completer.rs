@@ -499,6 +499,7 @@ impl Completer for NftyHelper {
                     "ssh:22",
                     "dns:53",
                     "api:9090",
+                    "web:8000",
                     "dhcp",
                     "vlan",
                     "interface",
@@ -548,6 +549,7 @@ impl Completer for NftyHelper {
                 list.push("auth".to_string());
                 list.push("ssh:22".to_string());
                 list.push("api:9090".to_string());
+                list.push("web:8000".to_string());
                 list
             }
             (ShellLevel::Service(_), 0) => vec![
@@ -654,6 +656,7 @@ impl Completer for NftyHelper {
                 "ssh:22",
                 "dns:53",
                 "api:9090",
+                "web:8000",
                 "key",
                 "forward",
                 "service",

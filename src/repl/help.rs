@@ -196,6 +196,10 @@ pub fn print_context_help(level: &ShellLevel) {
                 "api:9090 (or 'api')".yellow()
             );
             println!(
+                "  {:<32} Enable Web UI Console on this VIP (supports allow-lists & keys)",
+                "web:8000 (or 'web')".yellow()
+            );
+            println!(
                 "  {:<32} Lease VIP via DHCP + register hostname with UDM DNS",
                 "dhcp [eth0|off]".yellow()
             );

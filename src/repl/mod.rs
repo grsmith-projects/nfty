@@ -1254,11 +1254,13 @@ fn handle_vip_level_command(
             );
             return Ok(());
         }
-        "api" => {
+        "api" | "web" => {
+            let prefix = if first_lower == "web" { "web" } else { "api" };
+            let default_port = if first_lower == "web" { 8000 } else { 9090 };
             let (spec, rest_start) = if tokens.len() >= 2 && tokens[1].parse::<u16>().is_ok() {
-                (format!("api:{}", tokens[1]), 2)
+                (format!("{}:{}", prefix, tokens[1]), 2)
             } else {
-                ("api:9090".to_string(), 1)
+                (format!("{}:{}", prefix, default_port), 1)
             };
             let svc_key = {
                 let mut st = shared.write().unwrap();
@@ -1281,7 +1283,7 @@ fn handle_vip_level_command(
             }
             return Ok(());
         }
-        _ if first_lower.starts_with("api:") => {
+        _ if first_lower.starts_with("api:") || first_lower.starts_with("web:") => {
             let svc_key = {
                 let mut st = shared.write().unwrap();
                 let k = create_or_find_vip_service_by_key(&mut st.candidate, vip_key, tokens[0])?;
@@ -1998,18 +2000,26 @@ fn handle_gateway_level_command(
             *level.lock().unwrap() = ShellLevel::GatewayService(gw_key.to_string());
             return Ok(());
         }
-        "api" | _ if first_lower == "api" || first_lower.starts_with("api:") => {
-            let (spec, rest_start) = if first_lower == "api"
+        "api" | "web" | _
+            if first_lower == "api"
+                || first_lower.starts_with("api:")
+                || first_lower == "web"
+                || first_lower.starts_with("web:") =>
+        {
+            let (spec, rest_start) = if (first_lower == "api" || first_lower == "web")
                 && tokens.len() >= 2
                 && tokens[1].parse::<u16>().is_ok()
             {
-                (format!("api:{}", tokens[1]), 2)
+                (format!("{}:{}", first_lower, tokens[1]), 2)
             } else if first_lower == "api" {
                 ("api:9090".to_string(), 1)
+            } else if first_lower == "web" {
+                ("web:8000".to_string(), 1)
             } else {
                 (tokens[0].to_string(), 1)
             };
             let gs = parse_gateway_service(&spec)?;
+            let kind = gs.kind;
             let port = gs.port;
             {
                 let mut st = shared.write().unwrap();
@@ -2024,9 +2034,10 @@ fn handle_gateway_level_command(
             if tokens.len() <= rest_start {
                 *level.lock().unwrap() = ShellLevel::GatewayApi(gw_key.to_string(), port);
                 println!(
-                    "  {} [gateway {}] + api:{}",
+                    "  {} [gateway {}] + {}:{}",
                     "✔".green().bold(),
                     gw_key.cyan(),
+                    kind,
                     port
                 );
             } else {
@@ -2124,10 +2135,14 @@ fn handle_gateway_api_command(
         .gateways
         .get_mut(gw_key)
         .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
-    let gs = if let Some(existing) = gw
+    let gs = if let Some(existing) = gw.services.iter_mut().find(|s| {
+        matches!(s.kind, GatewayServiceKind::Api | GatewayServiceKind::Web) && s.port == port
+    }) {
+        existing
+    } else if let Some(existing) = gw
         .services
         .iter_mut()
-        .find(|s| s.kind == GatewayServiceKind::Api)
+        .find(|s| matches!(s.kind, GatewayServiceKind::Api | GatewayServiceKind::Web))
     {
         existing
     } else {
@@ -2191,7 +2206,11 @@ fn handle_gateway_service_command(
         return handle_gateway_level_command(gw_key, trimmed, level, shared);
     }
 
-    if first_lower == "api" || first_lower.starts_with("api:") {
+    if first_lower == "api"
+        || first_lower.starts_with("api:")
+        || first_lower == "web"
+        || first_lower.starts_with("web:")
+    {
         return handle_gateway_level_command(gw_key, trimmed, level, shared);
     }
 
