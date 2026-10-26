@@ -230,6 +230,45 @@ pub fn ensure_primary_eth0_up() -> String {
     "eth0".to_string()
 }
 
+fn is_blank_unpartitioned_disk(disk_name: &str) -> bool {
+    let dev_path = format!("/dev/{}", disk_name);
+    let sys_dir = format!("/sys/class/block/{}", disk_name);
+    if !Path::new(&dev_path).exists() || !Path::new(&sys_dir).exists() {
+        return false;
+    }
+    let ro = fs::read_to_string(format!("{}/ro", sys_dir)).unwrap_or_else(|_| "1".to_string());
+    if ro.trim() != "0" {
+        return false;
+    }
+    let sectors: u64 = fs::read_to_string(format!("{}/size", sys_dir))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if sectors < 32768 {
+        return false;
+    }
+    if let Ok(entries) = fs::read_dir(&sys_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(disk_name) {
+                return false;
+            }
+        }
+    }
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(&dev_path) else {
+        return false;
+    };
+    let mut buf = vec![0u8; 1024 * 1024];
+    let Ok(n) = f.read(&mut buf) else {
+        return false;
+    };
+    if n < 65536 {
+        return false;
+    }
+    buf[..n].iter().all(|&b| b == 0)
+}
+
 pub fn init_unikernel_appliance() -> Option<PathBuf> {
     if std::env::var("PATH")
         .map(|p| !p.contains("/sbin") || !p.contains("/usr/sbin"))
@@ -350,9 +389,12 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
                 "/dev/sda1",
                 "/dev/vdb",
                 "/dev/sdb",
+                "/dev/vda",
+                "/dev/sda",
+                "/dev/nvme0n1",
             ];
+            let mut mounted = false;
             for _ in 0..4 {
-                let mut mounted = false;
                 let mut any_dev = false;
                 for dev in data_devs {
                     if Path::new(dev).exists() {
@@ -371,6 +413,40 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(200));
+            }
+
+            // If booting from ISO with a brand-new blank virtual disk (e.g. LXD VM root disk /dev/sda or /dev/vda),
+            // automatically initialize it with ext4 and mount it at /data so configuration persists across reboots.
+            if !mounted && Path::new("/sbin/mke2fs").exists() {
+                for disk_name in ["vda", "sda", "nvme0n1", "vdb", "sdb"] {
+                    if is_blank_unpartitioned_disk(disk_name) {
+                        let dev_path = format!("/dev/{}", disk_name);
+                        eprintln!(
+                            "[nfty-unikernel] Initializing blank virtual disk {} with ext4 for persistent /data...",
+                            dev_path
+                        );
+                        let status = Command::new("/sbin/mke2fs")
+                            .args(["-t", "ext4", "-F", "-q", "-L", "nfty-data", &dev_path])
+                            .status();
+                        if status.map(|s| s.success()).unwrap_or(false)
+                            && sys_mount(&dev_path, "/data", "ext4", 0)
+                        {
+                            eprintln!(
+                                "[nfty-unikernel] Formatted and mounted persistent storage {} at /data (ext4)",
+                                dev_path
+                            );
+                            mounted = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !mounted {
+                let _ = fs::write("/run/nfty-ephemeral-storage", "1\n");
+                eprintln!(
+                    "[nfty-unikernel] WARNING: No persistent disk mounted at /data — running in ephemeral RAM! Attach a virtual disk to persist configuration across reboots."
+                );
             }
         }
 
@@ -436,6 +512,12 @@ pub fn persist_to_storage(shared: &SharedState) {
     };
 
     let pid = std::process::id();
+
+    if Path::new("/run/nfty-ephemeral-storage").exists() {
+        eprintln!(
+            "nfty: warning: /data is running in ephemeral RAM (no persistent virtual disk attached to VM); changes will not survive a reboot."
+        );
+    }
 
     if config_path.starts_with("/data") || Path::new("/data").exists() {
         let target = if config_path.starts_with("/data") {

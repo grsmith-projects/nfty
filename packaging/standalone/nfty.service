@@ -1,5 +1,5 @@
 [Unit]
-Description=nfty — Caddy-style L4 Service Load Balancer & Port Router for nftables
+Description=nfty — L4 Service Load Balancer & Port Router for nftables
 After=network-online.target nftables.service
 Wants=network-online.target
 

@@ -92,7 +92,7 @@ Use this mode to run `nfty` on an existing Debian, Ubuntu, Arch, Fedora, or Alpi
 3. **Inspect the systemd unit (`/etc/systemd/system/nfty.service`)**:
    ```ini
    [Unit]
-   Description=nfty — Caddy-style L4 Service Load Balancer & Port Router for nftables
+   Description=nfty — L4 Service Load Balancer & Port Router for nftables
    After=network-online.target nftables.service
    Wants=network-online.target
 
@@ -315,7 +315,7 @@ New password for 'nfty': ************
 Confirm new password: ************
   ✔ Password for 'nfty' updated and saved!
 
-Welcome to nfty — Caddy-style L4 Service Load Balancer & Port Router for nftables
+Welcome to nfty — L4 Service Load Balancer & Port Router for nftables
 1:1 Control API listening on http://0.0.0.0:9090 (endpoints: /api/v1/allow, /api/v1/cli, /api/v1/status)
 Type configure to enter config mode, status for live status, watch for live TUI, or ? for help.
 

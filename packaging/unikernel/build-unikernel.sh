@@ -61,6 +61,12 @@ USERLAND_APKS=(
     "libunistring-1.2-r0.apk"
     "libnfnetlink-1.0.2-r3.apk"
     "libnetfilter_conntrack-1.0.9-r3.apk"
+    "e2fsprogs-1.47.1-r1.apk"
+    "e2fsprogs-libs-1.47.1-r1.apk"
+    "libcom_err-1.47.1-r1.apk"
+    "libblkid-2.40.4-r1.apk"
+    "libuuid-2.40.4-r1.apk"
+    "libeconf-0.6.3-r0.apk"
 )
 
 HOST_TOOL_APKS=(

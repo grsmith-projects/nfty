@@ -36,7 +36,7 @@ use std::time::Duration;
 #[command(
     name = "nfty",
     version = "0.1.0",
-    about = "Caddy-style L4 Service Load Balancer & Port Router shell, API, and Unikernel for nftables"
+    about = "L4 Service Load Balancer & Port Router shell, API, and Unikernel for nftables"
 )]
 struct Cli {
     /// Path to Nftyfile configuration

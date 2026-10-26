@@ -77,7 +77,7 @@ pub async fn run_repl(shared: SharedState) -> Result<()> {
     let api_bind = shared.read().unwrap().api_bind.clone();
     println!(
         "{}",
-        "Welcome to nfty — Caddy-style L4 Service Load Balancer & Port Router for nftables"
+        "Welcome to nfty — L4 Service Load Balancer & Port Router for nftables"
             .bold()
             .cyan()
     );
@@ -92,6 +92,14 @@ pub async fn run_repl(shared: SharedState) -> Result<()> {
         "watch".cyan(),
         "?".magenta()
     );
+    if std::path::Path::new("/run/nfty-ephemeral-storage").exists() {
+        println!(
+            "{}\n",
+            "WARNING: No persistent virtual disk is mounted at /data — configuration is running in ephemeral RAM and will be lost on reboot. Attach a virtual disk to persist changes."
+                .yellow()
+                .bold()
+        );
+    }
 
     loop {
         let current_level = level.lock().unwrap().clone();
