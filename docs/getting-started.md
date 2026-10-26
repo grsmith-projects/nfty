@@ -236,15 +236,17 @@ zcat dist/rk3588s/nfty-rk3588s.img.gz | sudo dd of=/dev/sdX bs=4M status=progres
 When the RK3588S board powers on:
 1. Rockchip U-Boot (`idbloader.img` at sector 64, `u-boot.itb` at sector 16384) or `edk2-rk3588` UEFI loads Linux 6.18 LTS and `nfty-rk3588s-initramfs.cpio.gz`.
 2. `nfty` boots as PID 1 (`/init`), loads kernel modules (`nf_tables`, `wireguard`, `8021q`, `macvlan`, `r8169`, `stmmac`, `nvme`), and mounts Partition 2 (`LABEL=nfty-data`) at `/data`.
-3. `eth0` automatically acquires an IPv4 lease via `udhcpc`, and the console shell starts on serial UART (`ttyS2` / `ttyFIQ0` at `1500000` baud) and HDMI (`tty0`).
+3. `eth0` link is brought up and IPs are assigned strictly from `/data/Nftyfile` (starting with the pre-seeded `gateway default { dhcp eth0; ssh:22 }`), and the console shell starts on serial UART (`ttyS2` / `ttyFIQ0` at `1500000` baud) and HDMI (`tty0`).
 
 ---
 
 ## 3. First-Boot Default DHCP Gateway & SSH Login
 
-### Default Out-of-the-Box Gateway (`gateway default`)
+### Default Out-of-the-Box Gateway (`gateway default`) & Config-Driven IP Assignment
 
-Every fresh unikernel and container appliance ships with a pre-seeded `/data/Nftyfile` defining a DHCP gateway named `default` with SSH (`ssh:22`) enabled:
+`nfty` does not grab an unconfigured base OS IP on `eth0` behind your back—every IP address on the appliance (static or DHCP) is declared in `/data/Nftyfile`.
+
+To ensure fresh unikernel and container appliances are reachable on first boot, `/data/Nftyfile` is pre-seeded with a DHCP gateway named `default` with SSH (`ssh:22`) enabled:
 
 ```hcl
 gateway default {
@@ -253,12 +255,14 @@ gateway default {
 }
 ```
 
-When the appliance boots, `nfty` automatically creates the `mv-default` `macvlan` interface on `eth0`, acquires a DHCP lease (advertising hostname `default`), applies the kernel `nftables` ruleset, and exposes SSH on port 22 so you can always connect right away:
+When the appliance boots with `gateway default`, `nfty` acquires a DHCP lease directly on `eth0`, applies the kernel `nftables` ruleset, and exposes SSH on port 22 so you can always connect right away:
 
 ```bash
 ssh nfty@default
-# or connect to the leased IP shown in `show gateways` / `show interfaces`
+# or connect to the leased IP shown in `status` / `debug interfaces`
 ```
+
+Once you configure your own static VIPs or gateways and remove `gateway default`, `nfty` automatically stops `udhcpc` on `eth0` and removes the unconfigured DHCP IP (while preserving your default gateway route and `promote_secondaries=1`) so only the IPs in your `Nftyfile` exist on `eth0`.
 
 ### Step 1 (Optional): Bootstrap a Static Virtual IP
 
@@ -301,6 +305,7 @@ ssh nfty@169.254.10.10
 
 - **Default Username**: `nfty`
 - **Default Initial Password**: `nfty`
+- **Post-Quantum Key Exchange (`mlkem768x25519-sha256`)**: The embedded SSH2 server (`russh 0.65`) negotiates hybrid post-quantum key exchange (`mlkem768x25519-sha256`) out of the box so modern OpenSSH 10+ clients connect without post-quantum warnings.
 - **Host Key Persistence**: On first boot, `nfty` generates an Ed25519 SSH host key and stores it at `/data/ssh_host_ed25519_key` (`0600` permissions) so SSH clients never see host-key warnings across reboots or container rebuilds.
 
 Upon logging in for the first time while the default password (`nfty`) is still active, `nfty` enforces an interactive password change before granting access to the shell:
@@ -316,8 +321,7 @@ Confirm new password: ************
   ✔ Password for 'nfty' updated and saved!
 
 Welcome to nfty — L4 Service Load Balancer & Port Router for nftables
-1:1 Control API listening on http://0.0.0.0:9090 (endpoints: /api/v1/allow, /api/v1/cli, /api/v1/status)
-Type configure to enter config mode, status for live status, watch for live TUI, or ? for help.
+Type configure to enter config mode, debug for troubleshooting tools, status for live status, watch for live TUI, or ? for help.
 
 nfty>
 ```

@@ -112,42 +112,57 @@ pub struct AllowStatusResponse {
     pub expanded_service_sets: BTreeMap<String, Vec<String>>,
 }
 
-pub fn spawn_api_server(shared: SharedState, bind_addr: String) {
-    let shared_main = shared.clone();
-    tokio::spawn(async move {
-        let listener = match TcpListener::bind(&bind_addr).await {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        loop {
-            if let Ok((stream, _)) = listener.accept().await {
-                let st = shared_main.clone();
-                tokio::spawn(async move {
-                    let _ = handle_http_connection(stream, st).await;
-                });
-            }
+pub fn spawn_api_server(shared: SharedState, bind_addr: Option<String>) {
+    let mut explicit_port: Option<u16> = None;
+    if let Some(addr) = bind_addr.filter(|s| !s.trim().is_empty()) {
+        if let Some((_, p)) = addr.rsplit_once(':') {
+            explicit_port = p.parse::<u16>().ok();
         }
-    });
-
-    // Dynamically bind any custom `api:<port>` ports configured on VIPs or Gateways
-    tokio::spawn(async move {
-        let mut bound_ports: HashSet<u16> = HashSet::new();
-        bound_ports.insert(9090);
-        loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let desired_ports = {
-                let Ok(st) = shared.read() else { continue };
-                st.active_config().api_ports()
+        let shared_main = shared.clone();
+        tokio::spawn(async move {
+            let listener = match TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(_) => return,
             };
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let st = shared_main.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_http_connection(stream, st).await;
+                    });
+                }
+            }
+        });
+    }
+
+    // Dynamically bind any `api:<port>` or `web:<port>` ports configured on VIPs or Gateways
+    tokio::spawn(async move {
+        let mut bound_tasks: std::collections::HashMap<u16, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        loop {
+            let desired_ports: HashSet<u16> = {
+                if let Ok(st) = shared.read() {
+                    st.active_config().api_ports().into_iter().collect()
+                } else {
+                    HashSet::new()
+                }
+            };
+            bound_tasks.retain(|port, handle| {
+                if desired_ports.contains(port) {
+                    true
+                } else {
+                    handle.abort();
+                    false
+                }
+            });
             for port in desired_ports {
-                if bound_ports.contains(&port) {
+                if Some(port) == explicit_port || bound_tasks.contains_key(&port) {
                     continue;
                 }
                 let addr = format!("0.0.0.0:{}", port);
                 if let Ok(listener) = TcpListener::bind(&addr).await {
-                    bound_ports.insert(port);
                     let st_clone = shared.clone();
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         loop {
                             if let Ok((stream, _)) = listener.accept().await {
                                 let s = st_clone.clone();
@@ -157,8 +172,10 @@ pub fn spawn_api_server(shared: SharedState, bind_addr: String) {
                             }
                         }
                     });
+                    bound_tasks.insert(port, handle);
                 }
             }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 }
@@ -1703,11 +1720,11 @@ const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
           <div class="section-body">
             <div class="form-row">
               <label>Gateway IP or DHCP Name</label>
-              <input type="text" id="gw-quick-ip" placeholder="192.168.1.10">
+              <input type="text" id="gw-quick-ip" placeholder="169.254.1.10">
             </div>
             <div class="form-row">
-              <label>Directive (e.g. <code>killswitch on</code>, <code>privoxy:8118</code>, <code>forward 51413 to 192.168.1.50:51413</code>, <code>tunnel ca-van.conf</code>)</label>
-              <input type="text" id="gw-quick-cmd" placeholder="forward 51413 to 192.168.1.50:51413">
+              <label>Directive (e.g. <code>killswitch on</code>, <code>privoxy:8118</code>, <code>forward 51413 to 169.254.1.50:51413</code>, <code>tunnel wg0.conf</code>)</label>
+              <input type="text" id="gw-quick-cmd" placeholder="forward 51413 to 169.254.1.50:51413">
             </div>
             <button class="btn btn-success rw-only" onclick="runGatewayQuickCmd()">Apply to Gateway</button>
           </div>
@@ -1756,8 +1773,8 @@ const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
               </select>
             </div>
             <div class="form-row">
-              <label>Arguments (e.g. <code>nas.lan 192.168.1.50</code> or <code>*.netflix.com via 192.168.1.10</code>)</label>
-              <input type="text" id="dns-cmd-args" placeholder="nas.lan 192.168.1.50">
+              <label>Arguments (e.g. <code>nas.lan 169.254.1.50</code> or <code>*.netflix.com via 169.254.1.10</code>)</label>
+              <input type="text" id="dns-cmd-args" placeholder="nas.lan 169.254.1.50">
             </div>
             <button class="btn btn-primary rw-only" onclick="addDnsDirective()">Add &amp; Apply DNS Rule</button>
           </div>
@@ -1793,12 +1810,12 @@ const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
           </div>
           <div class="section-body">
             <div class="form-row">
-              <label>Target Scope (leave empty for Global Allow-List, or enter Service Key like <code>192.168.1.4:8000</code>)</label>
-              <input type="text" id="allow-service-key" placeholder="Global (or e.g. 192.168.1.4:8000)">
+              <label>Target Scope (leave empty for Global Allow-List, or enter Service Key like <code>169.254.1.4:8000</code>)</label>
+              <input type="text" id="allow-service-key" placeholder="Global (or e.g. 169.254.1.4:8000)">
             </div>
             <div class="form-row">
-              <label>Source CIDR / IP Wildcard / Hostname (e.g. <code>192.168.0.0/16</code>, <code>*.office.lan</code>, <code>10.0.0.0/8</code>)</label>
-              <input type="text" id="allow-host-pattern" placeholder="192.168.0.0/16">
+              <label>Source CIDR / IP Wildcard / Hostname (e.g. <code>169.254.0.0/16</code>, <code>*.office.lan</code>, <code>10.0.0.0/8</code>)</label>
+              <input type="text" id="allow-host-pattern" placeholder="169.254.0.0/16">
             </div>
             <button class="btn btn-primary rw-only" onclick="addAllowEntry()">+ Add to Allow-List &amp; Apply</button>
           </div>
@@ -1815,7 +1832,7 @@ const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
             </div>
             <div class="form-row">
               <label>IPv4 Address(es) (comma or space separated)</label>
-              <input type="text" id="reg-host-ips" placeholder="192.168.1.99">
+              <input type="text" id="reg-host-ips" placeholder="169.254.1.99">
             </div>
             <button class="btn btn-success rw-only" onclick="registerHostMapping()">Register Host IP</button>
           </div>
@@ -1854,7 +1871,7 @@ const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
         <div class="section-header">
           <span>LAN &amp; LXD Container Service Discovery</span>
           <div style="display:flex;gap:10px;align-items:center">
-            <input type="text" id="scan-target" placeholder="Optional subnet/host (e.g. 192.168.1.0/24)" style="width:270px">
+            <input type="text" id="scan-target" placeholder="Optional subnet/host (e.g. 169.254.1.0/24)" style="width:270px">
             <button class="btn btn-primary rw-only" id="btn-scan" onclick="runNetworkScan()">🔍 Scan Network</button>
           </div>
         </div>
@@ -1898,10 +1915,10 @@ const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
         <button class="btn btn-sm" onclick="toggleCliDrawer()">✕ Close</button>
       </div>
     </div>
-    <div id="cli-output" class="cli-output"># Type any nfty CLI command below (e.g. 'vip 192.168.1.4; web:8000; allow 192.168.0.0/16; apply')</div>
+    <div id="cli-output" class="cli-output"># Type any nfty CLI command below (e.g. 'vip 169.254.1.4; web:8000; allow 169.254.0.0/16; apply')</div>
     <div class="cli-input-row">
       <span class="cli-prompt">nfty(config)#</span>
-      <input type="text" id="cli-input" placeholder="vip 192.168.1.4; web:8000; allow 192.168.0.0/16; apply" onkeydown="if(event.key==='Enter')sendCliCommand()">
+      <input type="text" id="cli-input" placeholder="vip 169.254.1.4; web:8000; allow 169.254.0.0/16; apply" onkeydown="if(event.key==='Enter')sendCliCommand()">
       <button class="btn btn-sm btn-primary" onclick="sendCliCommand()">Run</button>
     </div>
   </div>
@@ -1940,16 +1957,16 @@ const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
     <h3>Add or Update VIP Service</h3>
     <p>Configure a forwarded backend service, local <code>web:8000</code> console, <code>api:9090</code>, <code>ssh:22</code>, or <code>dns:53</code> on a Virtual IP.</p>
     <div class="form-row">
-      <label>VIP Address or DHCP Name (e.g. <code>192.168.1.4</code> or <code>sonarr</code>)</label>
-      <input type="text" id="svc-modal-vip" placeholder="192.168.1.4">
+      <label>VIP Address or DHCP Name (e.g. <code>169.254.1.4</code> or <code>web-app</code>)</label>
+      <input type="text" id="svc-modal-vip" placeholder="169.254.1.4">
     </div>
     <div class="form-row">
-      <label>Service Spec (e.g. <code>80 to 192.168.3.18:5055</code>, <code>web:8000</code>, <code>api:8080</code>, <code>ssh:22</code>)</label>
-      <input type="text" id="svc-modal-spec" placeholder="80 to 192.168.3.18:5055">
+      <label>Service Spec (e.g. <code>80 to 169.254.20.10:5055</code>, <code>web:8000</code>, <code>api:8080</code>, <code>ssh:22</code>)</label>
+      <input type="text" id="svc-modal-spec" placeholder="80 to 169.254.20.10:5055">
     </div>
     <div class="form-row">
-      <label>Optional Allow-List CIDR / Hostname (e.g. <code>192.168.0.0/16</code>)</label>
-      <input type="text" id="svc-modal-allow" placeholder="192.168.0.0/16">
+      <label>Optional Allow-List CIDR / Hostname (e.g. <code>169.254.0.0/16</code>)</label>
+      <input type="text" id="svc-modal-allow" placeholder="169.254.0.0/16">
     </div>
     <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
       <button class="btn" onclick="closeAddServiceModal()">Cancel</button>

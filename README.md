@@ -23,8 +23,10 @@
   - `cloudflare-dns <fqdn>` provisions a remotely-managed Cloudflare Tunnel, ingress rule, and proxied CNAME record via the Cloudflare API and supervises `cloudflared`.
   - `cloudflare-auth <email...>` configures Cloudflare Zero Trust Access self-hosted applications and email/domain allow policies (`user@example.com`, `*@example.com`).
   - `auth <user:pass | nfty>` enforces HTTP Basic Authentication directly in `nfty` across both Cloudflare Tunnel traffic and local VIP requests.
-- **PID-1 Appliance Runtime**:
-  - Runs as `/sbin/init` (PID 1): mounts `/proc`, `/sys`, `/dev`, and `/data`, brings up networking, starts an embedded SSH2 server (`russh`) on port 22, and persists configuration atomically to `/data`.
+- **PID-1 Appliance Runtime & 100% Config-Driven IP Assignment**:
+  - Runs as `/sbin/init` (PID 1): mounts `/proc`, `/sys`, `/dev`, and `/data`, brings up link layer on `eth0` without grabbing an unconfigured base OS IP, starts an embedded post-quantum SSH2 server (`russh` with `mlkem768x25519-sha256`) on port 22, and persists configuration atomically to `/data`. Every IP address on the appliance (static or DHCP) is strictly declared in `/data/Nftyfile`.
+  - No default `:9090` Control API listener is bound unless explicitly configured via `api:<port>` / `web:<port>` on a VIP/Gateway (or `--api-bind`).
+  - Includes a dedicated **`debug` mode (`nfty(debug)#`)** and top-level `ping` (capped at `-c 5`) and `traceroute` commands for live network diagnostics (`ping`, `traceroute`, `tcp`, `dns`, `arping`, `interfaces`, `routes`, `arp`, `sockets`, `wg`, `nft`, `flows`, `dmesg`).
 
 ---
 
@@ -39,7 +41,7 @@ gateway default {
 }
 ```
 
-On first boot, `nfty` automatically creates the `mv-default` `macvlan` interface on `eth0`, acquires a DHCP lease with hostname `default`, applies the kernel `nftables` ruleset, and exposes the embedded SSH server on port 22 so you can connect immediately (`ssh nfty@default` or `ssh nfty@<leased-ip>`, inspectable via `show gateways` or `show interfaces`).
+On first boot, `nfty` automatically acquires a DHCP lease on `eth0` (because `gateway default` is named `default`), applies the kernel `nftables` ruleset, and exposes the embedded SSH server on port 22 so you can connect immediately (`ssh nfty@default` or `ssh nfty@<leased-ip>`, inspectable via `status` or `debug interfaces`). Once you replace `gateway default` with your own static VIPs or gateways, `nfty` automatically stops `udhcpc` on `eth0` and removes the unconfigured DHCP lease so only your configured IPs remain on `eth0`.
 
 If you prefer a static Virtual IP instead, run `bootstrap` to assign a static VIP to `eth0` and replace the starter config.
 
@@ -303,17 +305,32 @@ nfty# dns status
 nfty# dns test sonarr.lan
 ```
 
-### 7. Service Discovery (`scan` / `adopt`) and Safe Rollbacks
+### 7. Service Discovery (`scan` / `adopt`), Troubleshooting (`debug`), and Safe Rollbacks
 
 Scan the local subnet/ARP table for running containers and adopt a discovered service directly into a VIP:
 
 ```text
-nfty# scan
-nfty# adopt 1 vip 169.254.10.10
+nfty> scan
+nfty> adopt 1 vip 169.254.10.10
 nfty(config-vip:169.254.10.10)# apply confirm 60
   ✔ Applied ruleset to kernel nftables
   Safety rollback timer active for 60s! Type 'confirm' to keep changes.
 nfty(config-vip:169.254.10.10)# confirm
+```
+
+Run `ping` (automatically capped at 5 packets) and `traceroute` directly from `nfty>`, or enter `debug` mode (`nfty(debug)#`) for interactive network troubleshooting:
+
+```text
+nfty> ping 1.1.1.1
+nfty> traceroute 1.1.1.1
+nfty> debug
+nfty(debug)# interfaces
+nfty(debug)# routes
+nfty(debug)# tcp 169.254.20.10:8080
+nfty(debug)# wg
+nfty(debug)# nft
+nfty(debug)# dmesg
+nfty(debug)# exit
 ```
 
 ---
@@ -443,6 +460,7 @@ src/
 │   └── flows.rs             # Kernel conntrack (/proc/net/nf_conntrack) flow viewer
 └── repl/
     ├── mod.rs               # Interactive shell loop, drill-down contexts, command handlers
+    ├── debug.rs             # Troubleshooting & diagnostics mode (nfty(debug)#, ping, traceroute)
     ├── completer.rs         # Context-aware tab completion (rustyline)
     ├── status.rs            # status, show, and diff formatters
     └── help.rs              # Context-sensitive CLI help

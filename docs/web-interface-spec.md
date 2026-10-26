@@ -8,7 +8,7 @@
 ## 1. Overview
 
 `nfty` separates its two HTTP control-plane directives by port role:
-- **`web:<port>`** (default `:8000`): Serves the interactive single-page JavaScript Web Console (`GET /`, `/ui`, `/dashboard`, `/index.html`) and its backing `/api/v1/*` JSON endpoints on the same port. It is typically secured via an IP/CIDR/hostname `allow` list (e.g., `allow 192.168.0.0/16`).
+- **`web:<port>`** (default `:8000`): Serves the interactive single-page JavaScript Web Console (`GET /`, `/ui`, `/dashboard`, `/index.html`) and its backing `/api/v1/*` JSON endpoints on the same port. It is typically secured via an IP/CIDR `allow` list (e.g., `allow 169.254.0.0/16`).
 - **`api:<port>`** (default `:9090`): Serves only the headless `/api/v1/*` JSON Control API (`GET /` returns `404 Not Found` JSON), secured via scoped `ro` / `rw` API keys.
 
 Core properties:
@@ -17,7 +17,7 @@ Core properties:
    - Kernel `nftables` `prerouting` and `input` chains enforce any attached `allow` CIDR/hostname sets (`@allow_<id>`) and `limit` meters (`@meter_<id>`) before accepting traffic to the local `web:<port>` listener.
 2. **Required IP Allow-List, with Optional Token/Login Auth**:
    - **Allow-List Required**: Every `web:<port>` and `api:<port>` listener must be covered by at least one IP, CIDR, or IPv4-wildcard `allow` entry (its own, its gateway's, or the global allow-list). `validate`, `apply`, `bootstrap`, `PUT /api/v1/config`, and allow-list updates with `"apply": true` refuse configs that break this rule. Hostname entries (e.g. `*.office.lan`) are rejected on these listeners because DHCP clients choose their own names. If a config loaded at boot breaks the rule, the dataplane still starts, but remote access to the listener is denied (`403`). Loopback clients (the local CLI) are not affected.
-   - **IP Allow-List Auth**: Clients matching the allow-list of a listener with no API keys receive `rw` access (`authenticate_api_request_with_context`). If the listener has API keys, allow-listed clients must also present a key. Remote clients connecting to a port with no `web:`/`api:` listener (including the default `--api-bind 0.0.0.0:9090` when `api:9090` is not configured) are denied.
+   - **IP Allow-List Auth**: Clients matching the allow-list of a listener with no API keys receive `rw` access (`authenticate_api_request_with_context`). If the listener has API keys, allow-listed clients must also present a key. Remote clients connecting to a port with no `web:`/`api:` listener are denied.
    - **Appliance Login & Scoped API Keys**: Operators can also authenticate using the appliance username/password (`nfty` / `/data/auth.json` via `POST /api/v1/auth/login`) or switch to an `nfty_ro_...` / `nfty_rw_...` API key via the **Switch Key / Login** modal.
 3. **Self-Contained Static Assets**:
    - Compiled directly into the `nfty` binary (`WEB_CONSOLE_HTML` in `src/api.rs`) with no external runtime or CDN dependencies.
@@ -28,24 +28,24 @@ Core properties:
 
 ### 2.1 `Nftyfile` Examples
 
-#### Example A: Web Console on `192.168.1.4:8000` with IP Allow-List + Separate `api:8080`
+#### Example A: Web Console on `169.254.1.4:8000` with IP Allow-List + Separate `api:8080`
 ```hcl
-vip 192.168.1.4 {
+vip 169.254.1.4 {
     ssh:22
     web:8000 {
         allow {
-            192.168.0.0/16
+            169.254.0.0/16
         }
     }
     api:8080 {
         allow {
-            192.168.0.0/16
+            169.254.0.0/16
         }
         key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
     }
-    seer:5055 {
-        hostname seer.local
-        cloudflare-dns seer.smith.gr
+    app-backend:5055 {
+        hostname app.local
+        cloudflare-dns app.example.com
         check tcp 5s
     }
 }
@@ -53,17 +53,17 @@ vip 192.168.1.4 {
 
 #### Example B: Exposing `web:<port>` on a WireGuard Gateway with an Allow-List
 ```hcl
-gateway 192.168.1.10 {
+gateway 169.254.1.10 {
     balance round-robin
     killswitch on
     privoxy:8118
     web:8000
     allow {
-        192.168.0.0/16
+        169.254.0.0/16
     }
     tunnels {
-        ca-van-wg-201.conf
-        ca-van-wg-202.conf
+        wg-exit-01.conf
+        wg-exit-02.conf
     }
 }
 ```
@@ -71,12 +71,12 @@ gateway 192.168.1.10 {
 ### 2.2 Interactive CLI Workflow
 ```text
 nfty> configure
-nfty(config)# vip 192.168.1.4
-nfty(config-vip:192.168.1.4)# web:8000
-  [vip 192.168.1.4] + web:8000 (192.168.1.4:8000)
-nfty(config-service:192.168.1.4:8000)# allow 192.168.0.0/16
-  [service web:8000 (192.168.1.4:8000)] allow 192.168.0.0/16
-nfty(config-service:192.168.1.4:8000)# apply
+nfty(config)# vip 169.254.1.4
+nfty(config-vip:169.254.1.4)# web:8000
+  [vip 169.254.1.4] + web:8000 (169.254.1.4:8000)
+nfty(config-service:169.254.1.4:8000)# allow 169.254.0.0/16
+  [service web:8000 (169.254.1.4:8000)] allow 169.254.0.0/16
+nfty(config-service:169.254.1.4:8000)# apply
 ```
 
 ### 2.3 Port Separation Between `web:<port>` and `api:<port>`

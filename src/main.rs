@@ -35,7 +35,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "nfty",
-    version = "0.1.0",
+    version = "0.5.0",
     about = "L4 Service Load Balancer & Port Router shell, API, and Unikernel for nftables"
 )]
 struct Cli {
@@ -43,9 +43,9 @@ struct Cli {
     #[arg(short, long, default_value = "Nftyfile")]
     file: PathBuf,
 
-    /// Bind address for the 1:1 HTTP/JSON Control API
-    #[arg(long, default_value = "0.0.0.0:9090")]
-    api_bind: String,
+    /// Optional explicit bind address for the HTTP/JSON Control API (otherwise only `api:<port>` / `web:<port>` in Nftyfile are bound)
+    #[arg(long)]
+    api_bind: Option<String>,
 
     /// Bind address for the embedded SSH2 appliance server
     #[arg(long, default_value = "0.0.0.0:22")]
@@ -136,9 +136,11 @@ async fn main() -> Result<()> {
 
     let mut app_state = AppState::new(initial_cfg, effective_file.clone());
     app_state.api_bind = cli.api_bind.clone();
-    // Boot still applies the dataplane; listeners without an allow-list stay locked at request time.
-    for error in app_state.candidate.control_allow_list_errors() {
-        eprintln!("nfty: web/API access blocked: {}", error);
+    if !cli.ssh_session && cli.command.is_none() {
+        // Boot still applies the dataplane; listeners without an allow-list stay locked at request time.
+        for error in app_state.candidate.control_allow_list_errors() {
+            eprintln!("nfty: web/API access blocked: {}", error);
+        }
     }
 
     // Load persisted wildcard host resolutions from /data/hosts.json if present
@@ -171,8 +173,12 @@ async fn main() -> Result<()> {
         }
         crate::features::spawn_advanced_feature_daemons(shared.clone());
     }
-    spawn_background_tasks(shared.clone());
-    spawn_api_server(shared.clone(), cli.api_bind.clone());
+    if cli.command.is_none() {
+        spawn_background_tasks(shared.clone());
+    }
+    if !cli.ssh_session && cli.command.is_none() {
+        spawn_api_server(shared.clone(), cli.api_bind.clone());
+    }
 
     if cli.ssh_session {
         enforce_first_login_password_change_if_needed()?;
@@ -212,11 +218,15 @@ async fn main() -> Result<()> {
                 let _ = reload_kernel_from_state(&mut st);
             }
             persist_to_storage(&shared);
-            println!(
-                "nfty daemon running (API: http://{}, Config: {})",
-                cli.api_bind,
-                effective_file.display()
-            );
+            if let Some(ref bind) = cli.api_bind {
+                println!(
+                    "nfty daemon running (API: http://{}, Config: {})",
+                    bind,
+                    effective_file.display()
+                );
+            } else {
+                println!("nfty daemon running (Config: {})", effective_file.display());
+            }
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
@@ -994,16 +1004,16 @@ vip 169.254.1.4 {
     #[test]
     fn test_web_service_with_allowlist_and_roundtrip() {
         let raw = r#"
-vip 192.168.1.4 {
+vip 169.254.1.4 {
     ssh:22
     web:8000 {
         allow {
-            192.168.0.0/16
+            169.254.0.0/16
         }
     }
     api:8080 {
         allow {
-            192.168.0.0/16
+            169.254.0.0/16
         }
         key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
     }
@@ -1012,27 +1022,27 @@ vip 192.168.1.4 {
         let cfg = parse_nftyfile(raw).unwrap();
         let formatted = cfg.format_nftyfile();
         assert!(formatted.contains("web:8000 {"));
-        assert!(formatted.contains("192.168.0.0/16"));
+        assert!(formatted.contains("169.254.0.0/16"));
         let reparsed = parse_nftyfile(&formatted).unwrap();
         assert_eq!(cfg, reparsed);
 
         let app_state = AppState::new(cfg.clone(), PathBuf::from("Nftyfile"));
         let shared: SharedState = Arc::new(RwLock::new(app_state));
 
-        // 1. Client inside 192.168.0.0/16 accessing web:8000 without API key -> ReadWrite allowed
+        // 1. Client inside 169.254.0.0/16 accessing web:8000 without API key -> ReadWrite allowed
         assert_eq!(
             crate::api::authenticate_api_request_with_context(
                 &shared,
                 false,
                 false,
                 None,
-                Some("192.168.1.50".parse().unwrap()),
+                Some("169.254.1.50".parse().unwrap()),
                 Some(8000),
             ),
             Ok(crate::ast::ApiKeyScope::ReadWrite)
         );
 
-        // 2. Client outside 192.168.0.0/16 accessing web:8000 -> 403 Forbidden
+        // 2. Client outside 169.254.0.0/16 accessing web:8000 -> 403 Forbidden
         assert_eq!(
             crate::api::authenticate_api_request_with_context(
                 &shared,
@@ -1054,7 +1064,7 @@ vip 192.168.1.4 {
                 false,
                 false,
                 None,
-                Some("192.168.1.50".parse().unwrap()),
+                Some("169.254.1.50".parse().unwrap()),
                 Some(8080),
             )
             .unwrap_err()
@@ -1066,12 +1076,12 @@ vip 192.168.1.4 {
         assert!(cfg.is_web_port(Some(8000)));
         assert!(!cfg.is_web_port(Some(8080)));
 
-        // 5. Compiled nftables ruleset enforces @allow_192_168_1_4_8000 on tcp dport 8000
+        // 5. Compiled nftables ruleset enforces @allow_169_254_1_4_8000 on tcp dport 8000
         let st = shared.read().unwrap();
         let nft = compile_nft_ruleset(&cfg, Some(&st));
-        assert!(nft.contains("set allow_192_168_1_4_8000"));
-        assert!(nft.contains("elements = { 192.168.0.0/16 }"));
-        assert!(nft.contains("ip daddr 192.168.1.4 tcp dport 8000 ip saddr @allow_192_168_1_4_8000 counter redirect to :8000"));
+        assert!(nft.contains("set allow_169_254_1_4_8000"));
+        assert!(nft.contains("elements = { 169.254.0.0/16 }"));
+        assert!(nft.contains("ip daddr 169.254.1.4 tcp dport 8000 ip saddr @allow_169_254_1_4_8000 counter redirect to :8000"));
     }
 
     fn control_auth(
@@ -1099,7 +1109,7 @@ vip 192.168.1.4 {
     fn test_web_and_api_listeners_require_ip_allow_list() {
         // No allow-list anywhere: not appliable, and remote clients are denied at runtime.
         let open = r#"
-vip 192.168.1.4 {
+vip 169.254.1.4 {
     web:8000
     api:8080
 }
@@ -1109,8 +1119,8 @@ vip 192.168.1.4 {
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(errors.iter().all(|e| e.contains("requires an IP allow-list")));
         let shared = shared_from(open);
-        assert_eq!(control_auth(&shared, "192.168.1.50", 8000).unwrap_err().0, 403);
-        assert_eq!(control_auth(&shared, "192.168.1.50", 8080).unwrap_err().0, 403);
+        assert_eq!(control_auth(&shared, "169.254.1.50", 8000).unwrap_err().0, 403);
+        assert_eq!(control_auth(&shared, "169.254.1.50", 8080).unwrap_err().0, 403);
         // Loopback (local CLI / IPC) keeps working.
         assert_eq!(
             control_auth(&shared, "127.0.0.1", 8000),
@@ -1119,7 +1129,7 @@ vip 192.168.1.4 {
 
         // Hostname entries are rejected for web/api listeners and never grant access.
         let hostname = r#"
-vip 192.168.1.4 {
+vip 169.254.1.4 {
     web:8000 {
         allow {
             *.office.lan
@@ -1136,13 +1146,13 @@ vip 192.168.1.4 {
             .write()
             .unwrap()
             .resolved_hosts
-            .insert("laptop.office.lan".to_string(), vec!["192.168.1.50".parse().unwrap()]);
-        assert_eq!(control_auth(&shared, "192.168.1.50", 8000).unwrap_err().0, 403);
+            .insert("laptop.office.lan".to_string(), vec!["169.254.1.50".parse().unwrap()]);
+        assert_eq!(control_auth(&shared, "169.254.1.50", 8000).unwrap_err().0, 403);
 
         // A global IP allow-list satisfies the requirement.
         let global = r#"
-allow 192.168.0.0/16
-vip 192.168.1.4 {
+allow 169.254.0.0/16
+vip 169.254.1.4 {
     web:8000
     api:8080 {
         key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
@@ -1153,19 +1163,19 @@ vip 192.168.1.4 {
         assert!(cfg.control_allow_list_errors().is_empty());
         let shared = shared_from(global);
         assert_eq!(
-            control_auth(&shared, "192.168.1.50", 8000),
+            control_auth(&shared, "169.254.1.50", 8000),
             Ok(crate::ast::ApiKeyScope::ReadWrite)
         );
         assert_eq!(control_auth(&shared, "10.0.0.50", 8000).unwrap_err().0, 403);
         // Allow-listed but keyed: a key is still required.
-        assert_eq!(control_auth(&shared, "192.168.1.50", 8080).unwrap_err().0, 401);
-        // A port with no web/api listener (e.g. the default --api-bind 0.0.0.0:9090) is closed to remote clients.
-        assert_eq!(control_auth(&shared, "192.168.1.50", 9090).unwrap_err().0, 403);
+        assert_eq!(control_auth(&shared, "169.254.1.50", 8080).unwrap_err().0, 401);
+        // A port with no web/api listener is closed to remote clients.
+        assert_eq!(control_auth(&shared, "169.254.1.50", 9090).unwrap_err().0, 403);
     }
 
     #[test]
     fn test_validate_rejects_web_listener_without_allow_list() {
-        let cfg = parse_nftyfile("vip 192.168.1.4 {\n    web:8000\n}\n").unwrap();
+        let cfg = parse_nftyfile("vip 169.254.1.4 {\n    web:8000\n}\n").unwrap();
         let report = validate_config(&cfg, None);
         assert!(!report.valid);
         assert!(report.errors.iter().any(|e| e.contains("web:8000") && e.contains("requires an IP allow-list")));
@@ -1181,7 +1191,7 @@ gateway default {
     dhcp eth0
     ssh:22
 }
-gateway 192.168.1.10 {
+gateway 169.254.1.10 {
     killswitch on
     tunnels {
         wg0.conf
@@ -1196,5 +1206,39 @@ gateway 192.168.1.10 {
         assert!(nft.contains("meta pkttype { broadcast, multicast } drop"));
         assert!(nft.contains("oifname { \"eth0\", \"mv-*\" } ip daddr { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } drop"));
         assert!(nft.contains("oifname \"eth0\" ip saddr != 127.0.0.0/8 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter masquerade comment \"nfty:direct-gw-nat\""));
+    }
+
+    #[tokio::test]
+    async fn test_debug_mode_and_non24_prefix_persistence() {
+        let state = AppState::new(Config::new(), PathBuf::from("Nftyfile"));
+        assert_eq!(state.api_bind, None);
+
+        let shared: SharedState = Arc::new(RwLock::new(state));
+        let level = Arc::new(Mutex::new(ShellLevel::Operational));
+
+        handle_line("debug", &level, &shared).await;
+        assert_eq!(*level.lock().unwrap(), ShellLevel::Debug);
+        assert_eq!(level.lock().unwrap().prompt(), "nfty(debug)# ");
+
+        handle_line("..", &level, &shared).await;
+        assert_eq!(*level.lock().unwrap(), ShellLevel::Operational);
+
+        handle_line("debug", &level, &shared).await;
+        assert_eq!(*level.lock().unwrap(), ShellLevel::Debug);
+
+        handle_line("configure", &level, &shared).await;
+        assert_eq!(*level.lock().unwrap(), ShellLevel::ConfigRoot);
+
+        handle_line("vip 169.254.1.4/21", &level, &shared).await;
+        handle_line("ssh:22", &level, &shared).await;
+        handle_line("..", &level, &shared).await;
+        handle_line("gateway 169.254.1.10/21", &level, &shared).await;
+        handle_line("ssh:22", &level, &shared).await;
+
+        let formatted = shared.read().unwrap().candidate.format_nftyfile();
+        assert!(
+            formatted.contains("interface eth0/21"),
+            "Formatted Nftyfile must always preserve non-/24 prefix: {formatted}"
+        );
     }
 }

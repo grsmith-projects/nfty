@@ -1,10 +1,12 @@
 use anyhow::{bail, Context, Result};
-use async_trait::async_trait;
 use colored::Colorize;
-use russh::server::{Auth, Handler, Msg, Server as _, Session};
-use russh::{Channel, ChannelId, CryptoVec};
-use russh_keys::key::{KeyPair, PublicKey};
-use russh_keys::PublicKeyBase64;
+use russh::keys::{
+    Algorithm, HashAlg, PrivateKey, PublicKey, PublicKeyBase64,
+};
+use russh::server::{
+    Auth, ChannelOpenHandle, Handler, Msg, PublicKeyOffer, Server as _, Session, VerifiedPublicKey,
+};
+use russh::{Channel, ChannelId, MethodSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -285,13 +287,10 @@ pub fn parse_ssh_pubkey_str(name: &str, raw: &str) -> Result<(ParsedSshPubKey, P
             );
         };
 
-        let pubkey = russh_keys::parse_public_key_base64(b64_token)
+        let pubkey = russh::keys::parse_public_key_base64(b64_token)
             .with_context(|| "Failed to decode OpenSSH public key")?;
-        let algorithm = match &pubkey {
-            PublicKey::RSA { .. } => "ssh-rsa".to_string(),
-            other => other.name().to_string(),
-        };
-        let fingerprint = format!("SHA256:{}", pubkey.fingerprint());
+        let algorithm = pubkey.algorithm().as_str().to_string();
+        let fingerprint = pubkey.fingerprint(HashAlg::Sha256).to_string();
         let key_base64 = pubkey.public_key_base64();
         let raw_line = match &comment {
             Some(c) if !c.is_empty() => format!("{} {} {}", algorithm, key_base64, c),
@@ -392,7 +391,7 @@ pub fn verify_ssh_public_key(offered: &PublicKey) -> Option<String> {
                             continue;
                         }
                         if let Ok((meta, pk)) = parse_ssh_pubkey_str(fname, trimmed) {
-                            if &pk == offered {
+                            if pk.key_data() == offered.key_data() {
                                 return Some(meta.name);
                             }
                         }
@@ -727,6 +726,7 @@ fn open_pty(cols: u32, rows: u32) -> Result<(RawFd, RawFd)> {
         if master_fd < 0 {
             bail!("posix_openpt failed");
         }
+        let _ = libc::fcntl(master_fd, libc::F_SETFD, libc::FD_CLOEXEC);
         if libc::grantpt(master_fd) != 0 || libc::unlockpt(master_fd) != 0 {
             libc::close(master_fd);
             bail!("grantpt/unlockpt failed");
@@ -790,7 +790,6 @@ impl russh::server::Server for NftySshServer {
     }
 }
 
-#[async_trait]
 impl Handler for NftySshServer {
     type Error = anyhow::Error;
 
@@ -799,47 +798,43 @@ impl Handler for NftySshServer {
             self.used_publickey = false;
             Ok(Auth::Accept)
         } else {
-            Ok(Auth::Reject {
-                proceed_with_methods: None,
-            })
+            Ok(Auth::reject())
         }
     }
 
     async fn auth_publickey_offered(
         &mut self,
         _user: &str,
-        public_key: &PublicKey,
+        offer: PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
-        if verify_ssh_public_key(public_key).is_some() {
+        if verify_ssh_public_key(offer.public_key).is_some() {
             Ok(Auth::Accept)
         } else {
-            Ok(Auth::Reject {
-                proceed_with_methods: None,
-            })
+            Ok(Auth::reject())
         }
     }
 
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        public_key: &PublicKey,
+        key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        if verify_ssh_public_key(public_key).is_some() {
+        if verify_ssh_public_key(key.public_key).is_some() {
             self.used_publickey = true;
             Ok(Auth::Accept)
         } else {
-            Ok(Auth::Reject {
-                proceed_with_methods: None,
-            })
+            Ok(Auth::reject())
         }
     }
 
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
     }
 
     async fn pty_request(
@@ -863,7 +858,7 @@ impl Handler for NftySshServer {
             s.rows = row_height;
             set_pty_winsize(s.master_fd, col_width, row_height);
         }
-        session.channel_success(channel);
+        let _ = session.channel_success(channel);
         Ok(())
     }
 
@@ -929,7 +924,13 @@ impl Handler for NftySshServer {
             libc::close(slave_fd);
         }
 
-        let master_read_fd = unsafe { libc::dup(master_fd) };
+        let master_read_fd = unsafe {
+            let dup_fd = libc::dup(master_fd);
+            if dup_fd >= 0 {
+                let _ = libc::fcntl(dup_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            dup_fd
+        };
         let mut master_reader =
             tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_fd(master_read_fd) });
         let master_writer = Arc::new(Mutex::new(tokio::fs::File::from_std(unsafe {
@@ -949,7 +950,7 @@ impl Handler for NftySshServer {
             );
         }
 
-        session.channel_success(channel);
+        let _ = session.channel_success(channel);
         let handle = session.handle();
         let sessions_cleanup = self.sessions.clone();
 
@@ -961,7 +962,7 @@ impl Handler for NftySshServer {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if handle
-                            .data(channel, CryptoVec::from_slice(&buf[..n]))
+                            .data(channel, buf[..n].to_vec())
                             .await
                             .is_err()
                         {
@@ -1029,17 +1030,18 @@ fn ssh_host_key_path() -> &'static str {
     }
 }
 
-pub fn load_or_create_ssh_host_key() -> KeyPair {
+pub fn load_or_create_ssh_host_key() -> PrivateKey {
     let path = ssh_host_key_path();
     if Path::new(path).exists() {
-        if let Ok(kp) = russh_keys::load_secret_key(path, None) {
+        if let Ok(kp) = russh::keys::load_secret_key(path, None) {
             return kp;
         }
     }
 
-    let kp = KeyPair::generate_ed25519();
+    let kp = PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519)
+        .expect("Failed to generate Ed25519 SSH host key");
     let mut pem_buf = Vec::new();
-    if russh_keys::encode_pkcs8_pem(&kp, &mut pem_buf).is_ok() {
+    if russh::keys::encode_pkcs8_pem(&kp, &mut pem_buf).is_ok() {
         let _ = fs::write(path, &pem_buf);
         #[cfg(unix)]
         {
@@ -1060,6 +1062,12 @@ pub fn spawn_ssh_server(bind_addr: String) {
             let mut config = russh::server::Config::default();
             config.keys.push(load_or_create_ssh_host_key());
             config.inactivity_timeout = Some(std::time::Duration::from_secs(3600));
+            config.auth_rejection_time = std::time::Duration::from_secs(1);
+            config.auth_rejection_time_initial = Some(std::time::Duration::from_millis(0));
+            config.methods = MethodSet::from(&[
+                russh::MethodKind::PublicKey,
+                russh::MethodKind::Password,
+            ][..]);
             let config = Arc::new(config);
 
             let mut server = NftySshServer::new();
@@ -1081,8 +1089,9 @@ mod tests {
         let _ = fs::remove_dir_all(&test_dir);
         std::env::set_var("NFTY_SSH_KEYS_DIR", &test_dir);
 
-        let kp = KeyPair::generate_ed25519();
-        let pubkey = kp.clone_public_key().expect("clone_public_key");
+        let kp = PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519)
+            .expect("generate ed25519");
+        let pubkey = kp.public_key().clone();
         let b64 = pubkey.public_key_base64();
         let line = format!("ssh-ed25519 {} admin@workstation.example.com", b64);
 
@@ -1096,8 +1105,9 @@ mod tests {
         assert!(listed.contains_key("workstation.pub"));
         assert_eq!(verify_ssh_public_key(&pubkey).as_deref(), Some("workstation.pub"));
 
-        let other_kp = KeyPair::generate_ed25519();
-        let other_pubkey = other_kp.clone_public_key().expect("other clone_public_key");
+        let other_kp = PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519)
+            .expect("generate other ed25519");
+        let other_pubkey = other_kp.public_key().clone();
         assert!(verify_ssh_public_key(&other_pubkey).is_none());
 
         let deleted = delete_ssh_pubkey_file("workstation").expect("delete_ssh_pubkey_file");

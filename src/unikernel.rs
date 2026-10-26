@@ -455,20 +455,18 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
             .args(["addr", "replace", "127.0.0.1/8", "dev", "lo"])
             .status();
 
-        let primary_iface = ensure_primary_eth0_up();
-
-        // Automatically acquire IPv4 address via DHCP on eth0
-        if Path::new("/bin/udhcpc").exists() && Path::new(&format!("/sys/class/net/{}", primary_iface)).exists() {
-            let pid_file = format!("/run/udhcpc-{}.pid", primary_iface);
-            let _ = Command::new("/bin/udhcpc")
-                .args(["-i", &primary_iface, "-p", &pid_file, "-s", "/bin/udhcpc-hook", "-b", "-q"])
-                .status();
-        }
+        // Bring physical link(s) up without acquiring an unconfigured base OS IP;
+        // all IPv4 addresses (static or DHCP) are bound strictly from Nftyfile.
+        let _ = ensure_primary_eth0_up();
     }
 
-    // Enable kernel IPv4 packet forwarding and disable ICMP redirects / ARP flux on shared bridges
+    // Enable kernel IPv4 packet forwarding, secondary IP promotion, and disable ICMP redirects / ARP flux
     let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1\n");
     for scope in ["all", "default", "eth0"] {
+        let _ = fs::write(
+            format!("/proc/sys/net/ipv4/conf/{}/promote_secondaries", scope),
+            "1\n",
+        );
         let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", scope), "1\n");
         let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_announce", scope), "2\n");
         let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_filter", scope), "1\n");
@@ -505,12 +503,28 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
 /// Automatically persists the running configuration & resolved hosts to `/data` (if writable)
 /// and syncs with PID 1's local API (`127.0.0.1:9090`) if invoked from a secondary `lxc exec` shell.
 pub fn persist_to_storage(shared: &SharedState) {
-    let (cfg_txt, is_empty_cfg, config_path, resolved_hosts) = {
+    let (cfg_txt, is_empty_cfg, config_path, resolved_hosts, ipc_ports) = {
         let mut st = shared.write().unwrap();
         let is_empty = st.running.is_empty();
         let txt = st.running.format_nftyfile();
         st.last_disk_nftyfile = txt.clone();
-        (txt, is_empty, st.config_path.clone(), st.resolved_hosts.clone())
+        let mut ports = st.running.api_ports();
+        if let Some(ref bind) = st.api_bind {
+            if let Some((_, p_str)) = bind.rsplit_once(':') {
+                if let Ok(p) = p_str.parse::<u16>() {
+                    if !ports.contains(&p) {
+                        ports.push(p);
+                    }
+                }
+            }
+        }
+        (
+            txt,
+            is_empty,
+            st.config_path.clone(),
+            st.resolved_hosts.clone(),
+            ports,
+        )
     };
 
     let pid = std::process::id();
@@ -565,18 +579,21 @@ pub fn persist_to_storage(shared: &SharedState) {
         }
     }
 
-    // If this is a secondary `lxc exec` or `--ssh-session` shell (PID != 1), push config to PID 1's local control API
-    if pid != 1 && !is_empty_cfg {
+    // If this is a secondary `lxc exec` or `--ssh-session` shell (PID != 1), push config to PID 1's local control API if one is configured
+    if pid != 1 && !is_empty_cfg && !ipc_ports.is_empty() {
         let body = cfg_txt;
+        let port = ipc_ports[0];
         std::thread::spawn(move || {
             use std::io::{Read, Write};
+            let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
             if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-                &"127.0.0.1:9090".parse().unwrap(),
+                &addr,
                 Duration::from_millis(500),
             ) {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                 let req = format!(
-                    "PUT /api/v1/config HTTP/1.1\r\nHost: 127.0.0.1:9090\r\nX-Nfty-Internal-IPC: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "PUT /api/v1/config HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Nfty-Internal-IPC: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    port,
                     body.len(),
                     body
                 );

@@ -10,7 +10,7 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
     if let Some(first) = args.first() {
         match first.to_ascii_lowercase().as_str() {
             "nft" | "nftables" | "rules" => {
-                let cfg = if *level == ShellLevel::Operational {
+                let cfg = if matches!(level, ShellLevel::Operational | ShellLevel::Debug) {
                     st.active_config()
                 } else {
                     &st.candidate
@@ -57,7 +57,7 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
                 return;
             }
             "dns" => {
-                let cfg = if *level == ShellLevel::Operational {
+                let cfg = if matches!(level, ShellLevel::Operational | ShellLevel::Debug) {
                     st.active_config()
                 } else {
                     &st.candidate
@@ -78,7 +78,7 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
     }
 
     match level {
-        ShellLevel::Operational => {
+        ShellLevel::Operational | ShellLevel::Debug => {
             print!("{}", st.active_config().format_nftyfile());
         }
         ShellLevel::ConfigRoot | ShellLevel::GlobalAllow => {

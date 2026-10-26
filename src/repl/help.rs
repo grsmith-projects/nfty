@@ -19,6 +19,18 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!("  {:<26} Enter configuration mode", "configure".yellow());
             println!(
+                "  {:<26} Enter troubleshooting & diagnostics mode",
+                "debug".yellow()
+            );
+            println!(
+                "  {:<26} Send 5 ICMP echo pings (supports -I <src>)",
+                "ping <host>".yellow()
+            );
+            println!(
+                "  {:<26} Trace route hops to destination host",
+                "traceroute <host>".yellow()
+            );
+            println!(
                 "  {:<26} Show service, gateway & backend health table",
                 "status".yellow()
             );
@@ -85,6 +97,74 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!("  {:<26} Change nfty login password", "password".yellow());
             println!("  {:<26} Exit nfty", "exit".yellow());
+        }
+        ShellLevel::Debug => {
+            println!(
+                "{}",
+                "Debug & Troubleshooting Mode Commands (nfty(debug)#):"
+                    .bold()
+                    .cyan()
+            );
+            println!(
+                "  {:<32} Send 5 ICMP echo pings (capped at -c 5)",
+                "ping <host> [-I <ip|iface>]".yellow()
+            );
+            println!(
+                "  {:<32} Trace route hops to destination host",
+                "traceroute <host> [-i <iface>]".yellow()
+            );
+            println!(
+                "  {:<32} Test TCP connectivity & handshake latency",
+                "tcp <host:port>".yellow()
+            );
+            println!(
+                "  {:<32} Resolve hostname via system or specific DNS server",
+                "dns <host> [server]".yellow()
+            );
+            println!(
+                "  {:<32} Send 3 ARP requests on local LAN interface",
+                "arping <ip> [-I <iface>]".yellow()
+            );
+            println!(
+                "  {:<32} Show live kernel network interfaces & IPs",
+                "interfaces (or 'ip')".yellow()
+            );
+            println!(
+                "  {:<32} Show main, policy rules & WireGuard routing tables",
+                "routes (or 'route')".yellow()
+            );
+            println!(
+                "  {:<32} Show kernel ARP / L2 neighbor cache",
+                "arp (or 'neigh')".yellow()
+            );
+            println!(
+                "  {:<32} Show active listening TCP/UDP sockets",
+                "sockets (or 'ports')".yellow()
+            );
+            println!(
+                "  {:<32} Show live WireGuard tunnel handshakes & transfer",
+                "wg [wg0]".yellow()
+            );
+            println!(
+                "  {:<32} Show live kernel nftables ruleset & counters",
+                "nft".yellow()
+            );
+            println!(
+                "  {:<32} Show active conntrack flows & NAT translations",
+                "flows (or 'conntrack')".yellow()
+            );
+            println!(
+                "  {:<32} Show recent kernel ring buffer messages",
+                "dmesg [lines]".yellow()
+            );
+            println!(
+                "  {:<32} Run active health probes across all backends",
+                "probe".yellow()
+            );
+            println!(
+                "  {:<32} Exit back to operational mode",
+                "exit / ..".yellow()
+            );
         }
         ShellLevel::ConfigRoot => {
             println!("{}", "Config Root Commands (nfty(config)#):".bold().cyan());

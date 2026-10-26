@@ -271,13 +271,65 @@ impl Completer for NftyHelper {
                 }
                 "scan" => {
                     let mut list = self.known_hosts();
-                    list.push("192.168.1.0/24".to_string());
+                    list.push("169.254.1.0/24".to_string());
                     let matches = list
                         .into_iter()
                         .filter(|c| c.starts_with(prefix))
                         .map(|c| Pair {
                             display: c.clone(),
                             replacement: c,
+                        })
+                        .collect();
+                    return Ok((start_pos, matches));
+                }
+                "ping" | "traceroute" | "tracepath" | "arping" => {
+                    let mut list = self.known_hosts();
+                    list.push("1.1.1.1".to_string());
+                    list.push("8.8.8.8".to_string());
+                    let matches = list
+                        .into_iter()
+                        .filter(|c| c.starts_with(prefix))
+                        .map(|c| Pair {
+                            display: c.clone(),
+                            replacement: c,
+                        })
+                        .collect();
+                    return Ok((start_pos, matches));
+                }
+                "tcp" => {
+                    let list = self.known_host_ports();
+                    let matches = list
+                        .into_iter()
+                        .filter(|c| c.starts_with(prefix))
+                        .map(|c| Pair {
+                            display: c.clone(),
+                            replacement: c,
+                        })
+                        .collect();
+                    return Ok((start_pos, matches));
+                }
+                "debug" | "troubleshoot" | "diag" => {
+                    let list = vec![
+                        "ping",
+                        "traceroute",
+                        "tcp",
+                        "dns",
+                        "arping",
+                        "interfaces",
+                        "routes",
+                        "arp",
+                        "sockets",
+                        "wg",
+                        "nft",
+                        "flows",
+                        "dmesg",
+                    ];
+                    let matches = list
+                        .into_iter()
+                        .filter(|c| c.starts_with(prefix))
+                        .map(|c| Pair {
+                            display: c.to_string(),
+                            replacement: c.to_string(),
                         })
                         .collect();
                     return Ok((start_pos, matches));
@@ -384,6 +436,10 @@ impl Completer for NftyHelper {
                 "adopt",
                 "bootstrap",
                 "configure",
+                "debug",
+                "ping",
+                "traceroute",
+                "arping",
                 "status",
                 "flows",
                 "dns",
@@ -398,6 +454,34 @@ impl Completer for NftyHelper {
                 "password",
                 "help",
                 "exit",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            (ShellLevel::Debug, 0) => vec![
+                "ping",
+                "traceroute",
+                "tcp",
+                "dns",
+                "arping",
+                "interfaces",
+                "routes",
+                "arp",
+                "sockets",
+                "wg",
+                "nft",
+                "flows",
+                "conntrack",
+                "dmesg",
+                "probe",
+                "status",
+                "watch",
+                "show",
+                "configure",
+                "..",
+                "up",
+                "exit",
+                "help",
             ]
             .into_iter()
             .map(String::from)
@@ -845,8 +929,8 @@ impl Completer for NftyHelper {
                 let mut list = self.known_hosts();
                 for pat in [
                     "*.office.lan",
-                    "192.168.1.*",
-                    "192.168.0.0/16",
+                    "169.254.1.*",
+                    "169.254.0.0/16",
                     "10.0.0.0/8",
                     "..",
                     "up",

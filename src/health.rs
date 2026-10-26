@@ -503,7 +503,13 @@ pub fn spawn_background_tasks(shared: SharedState) {
             let mut reverted = false;
             {
                 let mut st = shared.write().unwrap();
-                st.sync_from_disk_if_changed();
+                if let Some(old_running) = st.sync_from_disk_if_changed() {
+                    if std::process::id() == 1 {
+                        let vip_cmds = generate_vip_commands(&old_running, &st.running);
+                        let _ = apply_vip_commands(&vip_cmds);
+                        let _ = reload_kernel_from_state(&mut st);
+                    }
+                }
                 if let Some(pending) = &st.pending_confirm {
                     if Instant::now() >= pending.deadline {
                         let old_running = st.running.clone();

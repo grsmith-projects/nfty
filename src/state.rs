@@ -113,7 +113,7 @@ pub struct AppState {
     pub last_applied_nft: String,
     pub last_disk_nftyfile: String,
     pub kernel_applied: bool,
-    pub api_bind: String,
+    pub api_bind: Option<String>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -133,7 +133,7 @@ impl AppState {
             last_applied_nft: String::new(),
             last_disk_nftyfile: initial_txt,
             kernel_applied: false,
-            api_bind: "127.0.0.1:9090".to_string(),
+            api_bind: None,
         };
         s.sync_runtime_entries();
         s
@@ -150,18 +150,20 @@ impl AppState {
     }
 
     /// Reloads `/data/Nftyfile` (or `self.config_path`) if another session or API call updated it on disk.
-    pub fn sync_from_disk_if_changed(&mut self) {
+    /// Returns `Some(previous_running_config)` when an external disk update was detected and loaded.
+    pub fn sync_from_disk_if_changed(&mut self) -> Option<Config> {
         let path = if self.config_path.exists() {
             self.config_path.clone()
         } else if std::path::Path::new("/data/Nftyfile").exists() {
             PathBuf::from("/data/Nftyfile")
         } else {
-            return;
+            return None;
         };
 
         if let Ok(raw) = std::fs::read_to_string(&path) {
             if raw != self.last_disk_nftyfile {
                 if let Ok(mut parsed) = crate::parser::parse_nftyfile(&raw) {
+                    let old_running = self.running.clone();
                     // Preserve active DHCP leases on VIPs and Gateways
                     for (k, old_v) in &self.running.vips {
                         if let Some(lip) = old_v.leased_ip {
@@ -195,9 +197,11 @@ impl AppState {
                     }
                     self.last_disk_nftyfile = raw;
                     self.sync_runtime_entries();
+                    return Some(old_running);
                 }
             }
         }
+        None
     }
 
     pub fn sync_runtime_entries(&mut self) {

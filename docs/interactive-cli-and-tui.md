@@ -52,17 +52,21 @@ ssh admin@169.254.1.4 "show nft"
 
 ---
 
-## 2. Operational Mode vs. Configuration Mode
+## 2. Operational Mode, Debug Mode, and Configuration Mode
 
-The interactive shell separates **Operational Mode** (read-only inspection, health probing, draining, flow viewing, and LAN scanning) from **Configuration Mode** (editing the in-memory candidate AST, diffing, testing, and committing).
+The interactive shell separates **Operational Mode** (`nfty>`), **Debug & Troubleshooting Mode** (`nfty(debug)#`), and **Configuration Mode** (`nfty(config)#`).
 
 ```mermaid
 stateDiagram-v2
     [*] --> Operational: Login / nfty
+    Operational --> DebugMode: debug / troubleshoot / diag
+    DebugMode --> Operational: exit / .. / top / Ctrl-C
+    DebugMode --> ConfigRoot: configure / conf / edit
     Operational --> ConfigRoot: configure / conf / edit
     ConfigRoot --> Operational: exit / end / Ctrl-C
     
     state "Operational Mode (nfty>)" as Operational
+    state "Debug Mode (nfty(debug)#)" as DebugMode
     state "Configuration Mode" as ConfigMode {
         ConfigRoot: nfty(config)#
         AllowCtx: nfty(config-allow)#
@@ -91,7 +95,8 @@ The shell prompt dynamically reflects your exact location in the configuration h
 
 | Prompt | Context Level | Description |
 | :--- | :--- | :--- |
-| `nfty>` | Operational Mode | Default starting mode for status, flows, scanning, and runtime operations. |
+| `nfty>` | Operational Mode | Default starting mode for status, flows, scanning, `ping`, `traceroute`, and runtime operations. |
+| `nfty(debug)#` | Debug & Troubleshooting | Dedicated troubleshooting mode (`ping`, `traceroute`, `tcp`, `dns`, `arping`, `interfaces`, `routes`, `arp`, `sockets`, `wg`, `nft`, `flows`, `dmesg`). |
 | `nfty(config)#` | Root Configuration | Top-level candidate configuration context. |
 | `nfty(config-allow)#` | Global Allowlist | Editing global `allow` subnets, hosts, and VLANs. |
 | `nfty(config-dns)#` | Programmable DNS | Editing DNS listeners, zones, records, `nftset` routes, and blocklists. |
@@ -339,12 +344,33 @@ Run 'configure; diff; apply' to activate.
 | `cf stop` | Stops the supervised `cloudflared` tunnel process. |
 | `cf clear` | Removes stored Cloudflare credentials from `/data/cloudflare.env`. |
 
+### Troubleshooting & Diagnostics (`ping`, `traceroute`, and `debug` Mode)
+
+`ping`, `traceroute`, and `arping` can be run directly from `nfty>` (or any mode), and typing `debug` enters the dedicated **`nfty(debug)#`** troubleshooting prompt (or runs a single debug command via `debug <cmd>`):
+
+| Command | Mode | Description |
+| :--- | :--- | :--- |
+| `ping <host> [-I <ip\|iface>]` | Global (`nfty>`, `nfty(debug)#`) | Sends 5 ICMP echo requests (hard-capped at `-c 5` so the CLI never hangs indefinitely). Supports `-I <source-ip-or-iface>` to test routing from a specific VIP or WireGuard tunnel. |
+| `traceroute <host> [-i <iface>]` | Global (`nfty>`, `nfty(debug)#`) | Traces hop-by-hop UDP/ICMP route to `<host>` (max 20 hops, 2s wait per hop). |
+| `arping <ip> [-I <iface>]` | Global (`nfty>`, `nfty(debug)#`) | Sends 3 ARP requests on the LAN interface (`eth0` by default) to verify L2 neighbor reachability. |
+| `debug` (or `debug <cmd>`) | Global (`nfty>`) | Enters `nfty(debug)#` mode, or executes `<cmd>` directly as a one-shot diagnostic command. |
+| `tcp <host:port>` | `nfty(debug)#` | Tests TCP 3-way handshake connectivity to `<host:port>`, measures connection RTT in milliseconds, and reads any initial protocol banner. |
+| `dns <host> [server]` | `nfty(debug)#` | Resolves `<host>` via `dnsmasq` / system DNS or a specific upstream DNS server. |
+| `interfaces` (or `ip`, `addr`) | `nfty(debug)#` | Displays live kernel network interfaces, link states, MAC addresses, and assigned IPv4/IPv6 addresses (`ip -br link` & `ip -br addr`). |
+| `routes` (or `route`) | `nfty(debug)#` | Displays the main routing table (`ip route`), policy routing rules (`ip rule`), and per-tunnel WireGuard routing tables (`table 100..`). |
+| `arp` (or `neigh`) | `nfty(debug)#` | Displays the kernel ARP / L2 neighbor table (`ip neigh`). |
+| `sockets` (or `ports`, `netstat`) | `nfty(debug)#` | Displays active listening TCP and UDP sockets (`netstat -tulnp`). |
+| `wg [iface]` | `nfty(debug)#` | Displays live kernel WireGuard interface status, peer endpoints, latest handshakes, and transfer counters (`wg show`). |
+| `nft` (or `ruleset`) | `nfty(debug)#` | Displays the live kernel `nftables` ruleset and packet/byte counters (`nft list ruleset`). |
+| `flows` (or `conntrack`) | `nfty(debug)#` | Displays active NAT conntrack sessions from `/proc/net/nf_conntrack`. |
+| `dmesg` | `nfty(debug)#` | Displays the last 40 lines of the kernel ring buffer (`dmesg`). |
+
 ### Appliance Administration
 
 | Command | Description |
 | :--- | :--- |
-| `password` | Interactively changes the SSH `admin` login password (persisted as a salted hash in `/data/ssh/passwd`). |
-| `bootstrap` | Generates a starter `/data/Nftyfile` template by inspecting the host's primary interface and IP address. |
+| `password` | Interactively changes the SSH `nfty` login password (persisted as a salted hash in `/data/auth.json`). |
+| `bootstrap` | Bootstraps a static VIP and SSH service in `/data/Nftyfile`. |
 
 ---
 
@@ -354,7 +380,7 @@ Running `watch` inside the CLI (or `nfty watch` directly from your shell) launch
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ nfty v0.4.0 — Kernel-Native L4 Load Balancer               Uptime: 14d 06:22 │
+│ nfty v0.5.0 — Kernel-Native L4 Load Balancer               Uptime: 14d 06:22 │
 │ VIPs: 2 | Services: 4 | Backends: 7 UP / 1 DRAIN / 0 DOWN | Active Flows: 84 │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │   VIP / Service         Mode   Balance       Backend            State    RTT │

@@ -127,9 +127,10 @@ rm -f "$STAGE_DIR"/.PKGINFO "$STAGE_DIR"/.SIGN.* "$STAGE_DIR"/.post-*
 if [[ -f "$STAGE_DIR/bin/busybox.static" ]]; then
     mv "$STAGE_DIR/bin/busybox.static" "$STAGE_DIR/bin/busybox"
     chmod +x "$STAGE_DIR/bin/busybox"
-    for applet in ping mount umount udhcpc ifconfig route arping vi ls cat rm mkdir sleep dmesg uname; do
+    for applet in ping traceroute nslookup netstat arp arping nc mount umount udhcpc ifconfig route vi ls cat rm mkdir sleep dmesg uname ps free uptime head tail; do
         ln -sf /bin/busybox "$STAGE_DIR/bin/$applet"
         ln -sf /bin/busybox "$STAGE_DIR/sbin/$applet"
+        ln -sf /bin/busybox "$STAGE_DIR/usr/bin/$applet"
     done
 fi
 
@@ -197,7 +198,7 @@ properties:
   architecture: x86_64
   description: nfty Static Rust Appliance Container
   os: nfty-unikernel
-  release: 0.4.0
+  release: 0.5.0
 EOF
 tar -czf "$ROOT_DIR/dist/lxd-container/lxd.tar.gz" -C "$WORK_DIR/meta-ct" metadata.yaml
 tar -czf "$ROOT_DIR/dist/lxd-container/rootfs.tar.gz" -C "$STAGE_DIR" .
@@ -454,7 +455,7 @@ properties:
   architecture: x86_64
   description: nfty Rust Unikernel L4 Load Balancer (with 128MB persistent /data partition)
   os: nfty-unikernel
-  release: 0.4.0
+  release: 0.5.0
 EOF
     tar -czf "$ROOT_DIR/dist/lxd-vm/lxd.tar.gz" -C "$WORK_DIR/meta-vm" metadata.yaml
 fi

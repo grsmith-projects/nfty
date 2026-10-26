@@ -1191,7 +1191,20 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         }
     }
 
-    // 3. Clean up any stale mv-* interfaces no longer in cfg.vips or cfg.gateways
+    // 3. Clean up any stale mv-* interfaces (or eth0 DHCP client) no longer in cfg.vips or cfg.gateways
+    if !active_mv_ifaces.contains("eth0") {
+        let pid_file = "/run/udhcpc-eth0.pid";
+        let ip_file = "/run/nfty-dhcp-eth0.ip";
+        if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(pid_file);
+        let _ = std::fs::remove_file(ip_file);
+    }
     if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -1321,7 +1334,7 @@ pub fn validate_config(config: &Config, state: Option<&AppState>) -> ValidationR
         if let Some(vip) = &svc.vip {
             if !vip.dhcp && svc.listen_ip.is_none() && svc.vip_id.is_none() {
                 errors.push(format!(
-                    "service '{}': specifies 'vip {}' but service has no listen IP (use e.g. 'service 192.168.1.240:{}')",
+                    "service '{}': specifies 'vip {}' but service has no listen IP (use e.g. 'service 169.254.1.240:{}')",
                     svc.key,
                     vip,
                     svc.port
@@ -1472,12 +1485,170 @@ pub fn apply_vip_commands(cmds: &[String]) -> Vec<String> {
     logs
 }
 
+fn reconcile_static_iface_ips_and_routes(cfg: &Config, logs: &mut Vec<String>) {
+    if unsafe { libc::geteuid() != 0 } {
+        return;
+    }
+    if std::process::id() != 1 && !std::path::Path::new("/data/Nftyfile").exists() {
+        return;
+    }
+
+    // 1. Preserve any existing kernel default gateway on eth0 to /data/default_gw
+    let mut detected_gw: Option<std::net::Ipv4Addr> = None;
+    if let Ok(out) = Command::new("ip")
+        .args(["-4", "route", "show", "default", "dev", "eth0"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(pos) = parts.iter().position(|p| *p == "via") {
+                if let Some(gw_str) = parts.get(pos + 1) {
+                    if let Ok(gw_ip) = gw_str.parse::<std::net::Ipv4Addr>() {
+                        detected_gw = Some(gw_ip);
+                        if std::path::Path::new("/data").exists() {
+                            let _ = std::fs::write("/data/default_gw", format!("{}\n", gw_ip));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if detected_gw.is_none() {
+        if let Ok(raw) = std::fs::read_to_string("/data/default_gw") {
+            detected_gw = raw.trim().parse::<std::net::Ipv4Addr>().ok();
+        }
+    }
+
+    // 2. Check if eth0 uses DHCP in cfg
+    let eth0_uses_dhcp = cfg
+        .vips
+        .iter()
+        .any(|(k, v)| v.dhcp && dhcp_macvlan_iface_name(k) == "eth0")
+        || cfg.gateways.iter().any(|(k, g)| {
+            g.vip
+                .as_ref()
+                .map(|v| v.dhcp && dhcp_macvlan_iface_name(k) == "eth0")
+                .unwrap_or(false)
+        });
+    if eth0_uses_dhcp {
+        return;
+    }
+
+    // 3. Collect all configured static IPs on eth0
+    let mut configured_eth0: Vec<(std::net::Ipv4Addr, u8)> = Vec::new();
+    for (ip_str, vip) in &cfg.vips {
+        if !vip.dhcp && vip.effective_base_iface() == "eth0" {
+            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                if !configured_eth0.iter().any(|(i, _)| *i == ip) {
+                    configured_eth0.push((ip, vip.prefix_len));
+                }
+            }
+        }
+    }
+    for svc in cfg.services.values() {
+        if let (Some(ip), Some(vip)) = (svc.listen_ip, &svc.vip) {
+            if !vip.dhcp && vip.effective_base_iface() == "eth0" {
+                if !configured_eth0.iter().any(|(i, _)| *i == ip) {
+                    configured_eth0.push((ip, vip.prefix_len));
+                }
+            }
+        }
+    }
+    for gw in cfg.gateways.values() {
+        if let Some(vip) = &gw.vip {
+            if !vip.dhcp && !gw.listen_ip.is_unspecified() && vip.effective_base_iface() == "eth0"
+            {
+                if !configured_eth0.iter().any(|(i, _)| *i == gw.listen_ip) {
+                    configured_eth0.push((gw.listen_ip, vip.prefix_len));
+                }
+            }
+        }
+    }
+    if configured_eth0.is_empty() {
+        return;
+    }
+
+    for scope in ["all", "default", "eth0"] {
+        let _ = std::fs::write(
+            format!("/proc/sys/net/ipv4/conf/{}/promote_secondaries", scope),
+            "1\n",
+        );
+    }
+
+    // Ensure all configured static IPs are bound on eth0
+    for (ip, prefix) in &configured_eth0 {
+        let cidr = format!("{}/{}", ip, prefix);
+        let _ = Command::new("ip")
+            .args(["addr", "replace", &cidr, "dev", "eth0"])
+            .status();
+    }
+
+    // Remove any unconfigured IPv4 address from eth0
+    if let Ok(out) = Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", "eth0", "scope", "global"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(pos) = parts.iter().position(|p| *p == "inet") {
+                if let Some(cidr) = parts.get(pos + 1) {
+                    let ip_part = cidr.split('/').next().unwrap_or("");
+                    if let Ok(existing_ip) = ip_part.parse::<std::net::Ipv4Addr>() {
+                        if !configured_eth0.iter().any(|(i, _)| *i == existing_ip) {
+                            let _ = Command::new("ip")
+                                .args(["addr", "del", cidr, "dev", "eth0"])
+                                .status();
+                            logs.push(format!(
+                                "Removed unconfigured IP {} from eth0",
+                                cidr
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Ensure default route and /etc/resolv.conf exist when running purely on static VIPs
+    let has_default_route = Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
+
+    let fallback_gw = detected_gw.unwrap_or_else(|| {
+        let first_ip = configured_eth0[0].0.octets();
+        std::net::Ipv4Addr::new(first_ip[0], first_ip[1], first_ip[2], 1)
+    });
+
+    if !has_default_route {
+        let gw_str = fallback_gw.to_string();
+        let _ = Command::new("ip")
+            .args(["route", "replace", "default", "via", &gw_str, "dev", "eth0"])
+            .status();
+    }
+
+    let has_nameserver = std::fs::read_to_string("/etc/resolv.conf")
+        .map(|s| s.lines().any(|l| l.trim_start().starts_with("nameserver")))
+        .unwrap_or(false);
+    if !has_nameserver {
+        let _ = std::fs::write(
+            "/etc/resolv.conf",
+            format!("nameserver {}\nnameserver 1.1.1.1\n", fallback_gw),
+        );
+    }
+}
+
 pub fn reload_kernel_from_state(state: &mut AppState) -> Result<String> {
     reload_kernel_from_state_with_logs(state).0
 }
 
 pub fn reload_kernel_from_state_with_logs(state: &mut AppState) -> (Result<String>, Vec<String>) {
-    let dhcp_logs = reconcile_dhcp_and_vlan_vips(&mut state.running);
+    let mut dhcp_logs = reconcile_dhcp_and_vlan_vips(&mut state.running);
+    reconcile_static_iface_ips_and_routes(&state.running, &mut dhcp_logs);
     // Sync leased DHCP VIP IPs into candidate config as well so `status` and `show` stay in sync
     for (k, run_vip) in &state.running.vips {
         if let Some(leased) = run_vip.leased_ip {

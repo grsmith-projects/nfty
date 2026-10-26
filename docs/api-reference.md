@@ -20,9 +20,11 @@
 
 ## 1. Enabling `web:<port>` vs. `api:<port>`
 
+By default, **`nfty` does not bind any Control API or Web Console port** unless you explicitly declare `web:<port>` or `api:<port>` inside a `vip` or `gateway` block in `/data/Nftyfile` (or pass `--api-bind <ip:port>` on the daemon CLI).
+
 `nfty` enforces a strict separation between the interactive Web Console (`web:<port>`) and the headless JSON Control API (`api:<port>`):
 
-- **`web:<port>`** (default `:8000`): Serves the interactive 8-tab JavaScript Web Console (`GET /`, `/ui`, `/dashboard`, `/index.html`) plus the `/api/v1/*` endpoints it calls. Requires an IP/CIDR `allow` list (e.g. `allow { 192.168.0.0/16 }`) so allowed operators can use the web frontend directly in their browser.
+- **`web:<port>`** (default `:8000`): Serves the interactive 8-tab JavaScript Web Console (`GET /`, `/ui`, `/dashboard`, `/index.html`) plus the `/api/v1/*` endpoints it calls. Requires an IP/CIDR `allow` list (e.g. `allow { 169.254.0.0/16 }`) so allowed operators can use the web frontend directly in their browser.
 - **`api:<port>`** (default `:9090`): Serves **only** the headless JSON Control API (`/api/v1/*`; `GET /` returns `404 Not Found` JSON). Requires an IP/CIDR `allow` list, plus a scoped `rw` or `ro` API key if any keys are configured.
 
 Both listener types **must** have at least one IP, CIDR, or IPv4-wildcard allow entry (their own, their gateway's, or the global `allow`). Configs without one fail `validate`/`apply` and are rejected by `PUT /api/v1/config`. Hostname entries are not accepted for these listeners. Remote clients outside the allow-list, or connecting to a port with no `web:`/`api:` listener, get `403`. Loopback clients (the local CLI) are not affected.
@@ -30,20 +32,20 @@ Both listener types **must** have at least one IP, CIDR, or IPv4-wildcard allow 
 ### `Nftyfile` Configuration
 
 ```hcl
-vip 192.168.1.4/21 {
+vip 169.254.1.4/21 {
   ssh:22
 
   # Interactive Web Console on port 8000 secured by IP allow-list
   web:8000 {
     allow {
-      192.168.0.0/16
+      169.254.0.0/16
     }
   }
 
   # Headless JSON Control API on port 8080 secured by IP allow-list + scoped API keys
   api:8080 {
     allow {
-      192.168.0.0/16
+      169.254.0.0/16
     }
 
     # Full read-write automation key
@@ -53,8 +55,8 @@ vip 192.168.1.4/21 {
     key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
   }
 
-  seer:5055 {
-    hostname seer.local
+  app-backend:5055 {
+    hostname app.local
     check tcp 5s
   }
 }
@@ -147,10 +149,10 @@ If an `ro` token attempts a write or scan operation, `nfty` returns `403 Forbidd
 
 ## 3. Interactive Web Console (`web:<port>`)
 
-Navigating to `http://192.168.1.4:8000/` (or `/dashboard`, `/ui`, `/index.html`) on any port configured with `web:<port>` serves the built-in dark-mode **8-Tab Interactive Web Console**:
+Navigating to `http://169.254.1.4:8000/` (or `/dashboard`, `/ui`, `/index.html`) on any port configured with `web:<port>` serves the built-in dark-mode **8-Tab Interactive Web Console**:
 
 - **Strict Port Separation**: `GET /` is only served on `web:<port>` listeners (e.g., `web:8000`). Hitting `GET /` on an `api:<port>` listener (e.g., `api:8080`) returns `404 Not Found` (`application/json`).
-- **IP Allow-List Authentication**: `web:8000` requires an allow-list such as `allow { 192.168.0.0/16 }`; any browser client on `192.168.0.0/16` is automatically authenticated with `rw` access without needing to paste an API key. Clients outside it receive `403`.
+- **IP Allow-List Authentication**: `web:8000` requires an allow-list such as `allow { 169.254.0.0/16 }`; any browser client on `169.254.0.0/16` is automatically authenticated with `rw` access without needing to paste an API key. Clients outside it receive `403`.
 - **8 Interactive Views + Web CLI Drawer**:
   1. **Overview & Topology** (KPI cards, live VIP/Service/Gateway topology cards, health matrix, 1-click Probe Now)
   2. **VIPs & Services** (1-click Backend Drain/Enable, Add/Delete Service, API Key generator)
