@@ -1,4 +1,4 @@
-use crate::ast::{ApiKeyScope, Service};
+use crate::ast::{ApiKeyScope, Config, ControlAccess, Service};
 use crate::compiler::{
     apply_vip_commands, compile_nft_ruleset, generate_vip_commands, reload_kernel_from_state,
     validate_config,
@@ -245,22 +245,23 @@ fn decode_basic_auth_token(b64: &str) -> Option<String> {
     }
 }
 
-pub fn authenticate_api_request(
-    shared: &SharedState,
-    peer_is_loopback: bool,
-    is_internal_ipc: bool,
-    candidate_key: Option<&str>,
-) -> std::result::Result<ApiKeyScope, (u16, String)> {
-    authenticate_api_request_with_context(
-        shared,
-        peer_is_loopback,
-        is_internal_ipc,
-        candidate_key,
-        None,
-        None,
-    )
+/// Rejects a config whose `web:`/`api:` listeners lack an IP allow-list; such configs are never applied.
+fn control_allow_list_rejection(cfg: &Config) -> Option<(u16, serde_json::Value)> {
+    let errors = cfg.control_allow_list_errors();
+    if errors.is_empty() {
+        return None;
+    }
+    Some((
+        400,
+        json!({
+            "ok": false,
+            "error": "Not applied: every web:/api: listener requires an IP allow-list",
+            "errors": errors,
+        }),
+    ))
 }
 
+/// Remote clients must first pass the listener's IP allow-list; loopback clients (local CLI/IPC) skip it.
 pub fn authenticate_api_request_with_context(
     shared: &SharedState,
     peer_is_loopback: bool,
@@ -275,14 +276,14 @@ pub fn authenticate_api_request_with_context(
 
     let st = shared.read().unwrap();
     let cfg = st.active_config();
-    if let Some(ip) = peer_ip {
-        if !cfg.is_peer_ip_allowed_for_port(ip, local_port, &st) {
-            return Err((
-                403,
-                format!("Forbidden: client IP {} is not in the configured allow-list", ip),
-            ));
+    let remote_access = if peer_is_loopback {
+        None
+    } else {
+        match cfg.control_access(peer_ip, local_port) {
+            ControlAccess::Denied(message) => return Err((403, message)),
+            access => Some(access),
         }
-    }
+    };
 
     if let Some(key_str) = candidate_key {
         if let Some(scope) = cfg.verify_api_key(key_str) {
@@ -294,21 +295,14 @@ pub fn authenticate_api_request_with_context(
         return Err((401, "Invalid API key or credentials".to_string()));
     }
 
-    if let Some(ip) = peer_ip {
-        if cfg.is_unkeyed_web_or_api_allowed(ip, local_port, &st) {
-            return Ok(ApiKeyScope::ReadWrite);
-        }
-    }
-
-    let any_keys = cfg.has_any_api_keys();
-    if any_keys || !peer_is_loopback {
-        return Err((
+    match remote_access {
+        Some(ControlAccess::Granted) => Ok(ApiKeyScope::ReadWrite),
+        None if !cfg.has_any_api_keys() => Ok(ApiKeyScope::ReadWrite),
+        _ => Err((
             401,
-            "Authentication required (configure an allow-list on 'web:8000', or pass an API key / appliance login)".to_string(),
-        ));
+            "Authentication required: this listener requires an API key".to_string(),
+        )),
     }
-
-    Ok(ApiKeyScope::ReadWrite)
 }
 
 async fn read_full_http_request(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
@@ -389,19 +383,13 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
         return Ok(());
     }
 
-    if let Some(ip) = peer_ip {
-        let allowed = {
+    if !peer_is_loopback {
+        let access = {
             let st = shared.read().unwrap();
-            st.active_config()
-                .is_peer_ip_allowed_for_port(ip, local_port, &st)
+            st.active_config().control_access(peer_ip, local_port)
         };
-        if !allowed {
-            send_json(
-                &mut stream,
-                403,
-                &json!({"ok": false, "error": format!("Forbidden: client IP {} is not in the configured allow-list", ip)}),
-            )
-            .await?;
+        if let ControlAccess::Denied(message) = access {
+            send_json(&mut stream, 403, &json!({"ok": false, "error": message})).await?;
             return Ok(());
         }
     }
@@ -748,6 +736,9 @@ pub async fn route_api_request_scoped(
         }
         ("PUT", "/api/v1/config") => match parse_nftyfile(body) {
             Ok(mut cfg) => {
+                if let Some(rejection) = control_allow_list_rejection(&cfg) {
+                    return rejection;
+                }
                 let prev = {
                     let st = shared.read().unwrap();
                     st.running.clone()
@@ -849,6 +840,9 @@ pub async fn route_api_request_scoped(
                 }
 
                 if req.apply {
+                    if let Some(rejection) = control_allow_list_rejection(&st.candidate) {
+                        return rejection;
+                    }
                     st.running = st.candidate.clone();
                     let _ = reload_kernel_from_state(&mut st);
                 }
@@ -887,6 +881,9 @@ pub async fn route_api_request_scoped(
                     st.candidate.global_allow.retain(|x| !targets.contains(x));
                 }
                 if req.apply {
+                    if let Some(rejection) = control_allow_list_rejection(&st.candidate) {
+                        return rejection;
+                    }
                     st.running = st.candidate.clone();
                     let _ = reload_kernel_from_state(&mut st);
                 }

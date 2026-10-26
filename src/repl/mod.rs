@@ -659,6 +659,14 @@ pub fn handle_bootstrap(args: &[&str], shared: &SharedState) -> Result<()> {
             st.candidate.services.insert(key, svc);
         }
 
+        let allow_list_errors = st.candidate.control_allow_list_errors();
+        if !allow_list_errors.is_empty() {
+            bail!(
+                "Not applied: every web:/api: listener requires an IP allow-list\n  {}",
+                allow_list_errors.join("\n  ")
+            );
+        }
+
         let vip_cmds = generate_vip_commands(&prev_running, &st.candidate);
         vip_logs = apply_vip_commands(&vip_cmds);
 

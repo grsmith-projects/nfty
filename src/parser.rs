@@ -662,6 +662,22 @@ pub fn expand_ip_wildcard_to_cidr(entry: &str) -> Option<String> {
     }
 }
 
+/// Parses an allow-list entry that names addresses directly (IPv4, CIDR, or IPv4 wildcard) into
+/// its network and prefix length. Returns `None` for hostnames, hostname wildcards, and malformed entries.
+pub fn parse_ip_allow_entry(entry: &str) -> Option<(Ipv4Addr, u8)> {
+    let cidr = expand_ip_wildcard_to_cidr(entry.trim())?;
+    let Some((network, prefix)) = cidr.split_once('/') else {
+        return Some((cidr.parse().ok()?, 32));
+    };
+    let prefix = prefix.parse::<u8>().ok().filter(|prefix| *prefix <= 32)?;
+    Some((network.parse().ok()?, prefix))
+}
+
+pub fn ipv4_in_network(ip: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
+    let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+    u32::from(ip) & mask == u32::from(network) & mask
+}
+
 /// Wildcard glob matcher for hostnames (e.g. pattern `*.office.lan` or `web-*.corp.lan` against ` macbook.office.lan`)
 pub fn wildcard_host_matches(pattern: &str, hostname: &str) -> bool {
     let pat = pattern.to_ascii_lowercase();

@@ -174,8 +174,10 @@ vip 10.20.0.10/24 {
 ### 3.5 `web:<port>` (Web Console) and `api:<port>` (Headless JSON API) Inside a VIP
 
 `nfty` enforces strict separation between `web:<port>` and `api:<port>`:
-- **`web:<port>`** serves the interactive 8-tab HTML/JS Web Console (`GET /`) and is typically secured with an IP `allow` list (e.g., `allow { 192.168.0.0/16 }`).
-- **`api:<port>`** serves only the headless JSON Control API (`/api/v1/*`) and is secured with scoped `ro` or `rw` API keys:
+- **`web:<port>`** serves the interactive 8-tab HTML/JS Web Console (`GET /`) and requires an IP `allow` list (e.g., `allow { 192.168.0.0/16 }`).
+- **`api:<port>`** serves only the headless JSON Control API (`/api/v1/*`), requires an IP `allow` list, and is further secured with scoped `ro` or `rw` API keys.
+
+Every `web:` and `api:` listener must be covered by at least one IP, CIDR, or IPv4-wildcard allow entry (its own, its gateway's, or the global `allow`). Otherwise `validate`/`apply` fail. Hostname entries (e.g. `*.office.lan`) are rejected on these listeners and ignored when they come from the global allow-list:
 
 ```hcl
 vip 192.168.1.4/21 {
@@ -186,6 +188,9 @@ vip 192.168.1.4/21 {
         }
     }
     api:8080 {
+        allow {
+            192.168.0.0/16
+        }
         key new rw
         key new ro
     }

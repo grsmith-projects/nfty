@@ -192,7 +192,8 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             }
         }
         out.push_str("        iifname \"wg*\" accept\n");
-        out.push_str("        ip daddr { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 224.0.0.0/4, 255.255.255.255 } accept\n");
+        out.push_str("        meta pkttype { broadcast, multicast } accept\n");
+        out.push_str("        ip daddr { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } accept\n");
         for gw_id in &dns_bypass_gws {
             out.push_str(&format!(
                 "        ip daddr @dns_bypass_{} counter accept comment \"nfty:dns-bypass={}\"\n",
@@ -516,6 +517,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
     // 3. Forward chain (per-backend traffic accounting counters & accept for DNAT'd traffic)
     out.push_str("    chain forward {\n");
     out.push_str("        type filter hook forward priority filter; policy accept;\n");
+    out.push_str("        meta pkttype { broadcast, multicast } drop\n");
     out.push_str("        ct state established,related accept\n");
 
     for svc in config.services.values() {
@@ -551,13 +553,14 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
         out.push_str("        iifname \"wg*\" ct state established,related counter accept\n");
         let any_killswitch = config.gateways.values().any(|g| !g.tunnels.is_empty() && g.killswitch);
         if any_killswitch {
-            out.push_str("        oifname \"eth0\" ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 224.0.0.0/4 } meta mark != 0x0 counter drop comment \"nfty:killswitch\"\n");
+            out.push_str("        oifname \"eth0\" ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } meta mark != 0x0 counter drop comment \"nfty:killswitch\"\n");
         }
     }
     if any_direct_gw {
-        out.push_str("        oifname \"eth0\" counter accept comment \"nfty:direct-gw-forward\"\n");
+        out.push_str("        oifname \"eth0\" ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter accept comment \"nfty:direct-gw-forward\"\n");
     }
     out.push_str("        ct status dnat accept\n");
+    out.push_str("        oifname { \"eth0\", \"mv-*\" } ip daddr { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } drop\n");
     out.push_str("    }\n\n");
 
     // 4. Postrouting chain (Mode NAT vs Mode Transparent + Gateway Masquerade)
@@ -583,7 +586,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
         out.push_str("        oifname \"wg*\" counter masquerade comment \"nfty:wg-nat\"\n");
     }
     if any_direct_gw {
-        out.push_str("        oifname \"eth0\" ip saddr != 127.0.0.0/8 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 224.0.0.0/4 } counter masquerade comment \"nfty:direct-gw-nat\"\n");
+        out.push_str("        oifname \"eth0\" ip saddr != 127.0.0.0/8 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter masquerade comment \"nfty:direct-gw-nat\"\n");
     }
     for gw_id in &dns_bypass_gws {
         out.push_str(&format!(
@@ -747,6 +750,9 @@ fn emit_service_prerouting(
 }
 
 pub fn dhcp_macvlan_iface_name(vip_key: &str) -> String {
+    if vip_key.trim().eq_ignore_ascii_case("default") {
+        return "eth0".to_string();
+    }
     let clean: String = vip_key
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -829,6 +835,33 @@ fn ensure_vlan_interface(vip: &crate::ast::VipConfig, logs: &mut Vec<String>) {
         .status();
 }
 
+fn sync_primary_iface_ip_file(iface: &str, ip_file: &str) {
+    if std::path::Path::new(ip_file).exists() {
+        return;
+    }
+    if let Ok(out) = Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", iface, "scope", "global"])
+        .output()
+    {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(pos) = parts.iter().position(|p| *p == "inet") {
+                    if let Some(cidr) = parts.get(pos + 1) {
+                        let ip_part = cidr.split('/').next().unwrap_or("");
+                        if ip_part.parse::<std::net::Ipv4Addr>().is_ok() {
+                            let _ = std::fs::create_dir_all("/run");
+                            let _ = std::fs::write(ip_file, format!("{}\n", ip_part));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
     let mut logs = Vec::new();
     if unsafe { libc::geteuid() != 0 } {
@@ -876,15 +909,27 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         }
 
         let mv_sys = format!("/sys/class/net/{}", mv_iface);
-        let lower_sys = format!("/sys/class/net/{}/lower_{}", mv_iface, parent_iface);
-        if std::path::Path::new(&mv_sys).exists() && !std::path::Path::new(&lower_sys).exists() {
-            // Parent interface changed (e.g. VLAN changed); recreate macvlan
-            let _ = Command::new("ip")
-                .args(["link", "del", "dev", &mv_iface])
-                .status();
+        if mv_iface != parent_iface {
+            let lower_sys = format!("/sys/class/net/{}/lower_{}", mv_iface, parent_iface);
+            if std::path::Path::new(&mv_sys).exists() && !std::path::Path::new(&lower_sys).exists() {
+                // Parent interface changed (e.g. VLAN changed); recreate macvlan
+                let _ = Command::new("ip")
+                    .args(["link", "del", "dev", &mv_iface])
+                    .status();
+            }
         }
 
-        if !std::path::Path::new(&mv_sys).exists() {
+        // Prevent ARP flux and ICMP redirects on parent and macvlan BEFORE bringing link up
+        for scope in ["all", "default", parent_iface.as_str()] {
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", scope), "1\n");
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_announce", scope), "2\n");
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_filter", scope), "1\n");
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/send_redirects", scope), "0\n");
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/accept_redirects", scope), "0\n");
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", scope), "0\n");
+        }
+
+        if mv_iface != parent_iface && !std::path::Path::new(&mv_sys).exists() {
             let _ = Command::new("modprobe").args(["-q", "macvlan"]).status();
             let _ = Command::new("ip")
                 .args([
@@ -902,13 +947,6 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
                     "bridge",
                 ])
                 .status();
-            let _ = Command::new("ip")
-                .args(["link", "set", "dev", &mv_iface, "up"])
-                .status();
-        } else {
-            let _ = Command::new("ip")
-                .args(["link", "set", "dev", &mv_iface, "up"])
-                .status();
         }
 
         if !std::path::Path::new(&mv_sys).exists() {
@@ -919,19 +957,25 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
             continue;
         }
 
-        // Prevent ARP flux on macvlan
-        let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/arp_ignore", "1\n");
-        let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/arp_announce", "2\n");
-        let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", "0\n");
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", mv_iface), "1\n");
         let _ = std::fs::write(
             format!("/proc/sys/net/ipv4/conf/{}/arp_announce", mv_iface),
             "2\n",
         );
+        let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_filter", mv_iface), "1\n");
+        let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/send_redirects", mv_iface), "0\n");
+        let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/accept_redirects", mv_iface), "0\n");
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", mv_iface), "0\n");
+
+        let _ = Command::new("ip")
+            .args(["link", "set", "dev", &mv_iface, "up"])
+            .status();
 
         let pid_file = format!("/run/udhcpc-{}.pid", mv_iface);
         let ip_file = format!("/run/nfty-dhcp-{}.ip", mv_iface);
+        if mv_iface == parent_iface {
+            sync_primary_iface_ip_file(&mv_iface, &ip_file);
+        }
         let udhcpc_running = std::fs::read_to_string(&pid_file)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
@@ -1018,14 +1062,25 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         }
 
         let mv_sys = format!("/sys/class/net/{}", mv_iface);
-        let lower_sys = format!("/sys/class/net/{}/lower_{}", mv_iface, parent_iface);
-        if std::path::Path::new(&mv_sys).exists() && !std::path::Path::new(&lower_sys).exists() {
-            let _ = Command::new("ip")
-                .args(["link", "del", "dev", &mv_iface])
-                .status();
+        if mv_iface != parent_iface {
+            let lower_sys = format!("/sys/class/net/{}/lower_{}", mv_iface, parent_iface);
+            if std::path::Path::new(&mv_sys).exists() && !std::path::Path::new(&lower_sys).exists() {
+                let _ = Command::new("ip")
+                    .args(["link", "del", "dev", &mv_iface])
+                    .status();
+            }
         }
 
-        if !std::path::Path::new(&mv_sys).exists() {
+        for scope in ["all", "default", parent_iface.as_str()] {
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", scope), "1\n");
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_announce", scope), "2\n");
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_filter", scope), "1\n");
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/send_redirects", scope), "0\n");
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/accept_redirects", scope), "0\n");
+            let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", scope), "0\n");
+        }
+
+        if mv_iface != parent_iface && !std::path::Path::new(&mv_sys).exists() {
             let _ = Command::new("modprobe").args(["-q", "macvlan"]).status();
             let _ = Command::new("ip")
                 .args([
@@ -1044,9 +1099,6 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
                 ])
                 .status();
         }
-        let _ = Command::new("ip")
-            .args(["link", "set", "dev", &mv_iface, "up"])
-            .status();
 
         if !std::path::Path::new(&mv_sys).exists() {
             logs.push(format!(
@@ -1061,10 +1113,20 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
             format!("/proc/sys/net/ipv4/conf/{}/arp_announce", mv_iface),
             "2\n",
         );
+        let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_filter", mv_iface), "1\n");
+        let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/send_redirects", mv_iface), "0\n");
+        let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/accept_redirects", mv_iface), "0\n");
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", mv_iface), "0\n");
+
+        let _ = Command::new("ip")
+            .args(["link", "set", "dev", &mv_iface, "up"])
+            .status();
 
         let pid_file = format!("/run/udhcpc-{}.pid", mv_iface);
         let ip_file = format!("/run/nfty-dhcp-{}.ip", mv_iface);
+        if mv_iface == parent_iface {
+            sync_primary_iface_ip_file(&mv_iface, &ip_file);
+        }
         let udhcpc_running = std::fs::read_to_string(&pid_file)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
@@ -1246,6 +1308,9 @@ pub fn validate_config(config: &Config, state: Option<&AppState>) -> ValidationR
         warnings.push("No VIPs, services, or gateways are defined in configuration.".to_string());
     }
 
+    errors.extend(config.control_allow_list_errors());
+    warnings.extend(config.control_allow_list_warnings());
+
     for svc in config.services.values() {
         if svc.backends.is_empty() {
             errors.push(format!(
@@ -1256,7 +1321,7 @@ pub fn validate_config(config: &Config, state: Option<&AppState>) -> ValidationR
         if let Some(vip) = &svc.vip {
             if !vip.dhcp && svc.listen_ip.is_none() && svc.vip_id.is_none() {
                 errors.push(format!(
-                    "service '{}': specifies 'vip {}' but service has no listen IP (use e.g. 'service 169.254.1.240:{}')",
+                    "service '{}': specifies 'vip {}' but service has no listen IP (use e.g. 'service 192.168.1.240:{}')",
                     svc.key,
                     vip,
                     svc.port

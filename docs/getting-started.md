@@ -160,30 +160,30 @@ To build the latest LXD container image and roll it out to a remote LXD host whi
 
 ### Mode 3: Bootable Unikernel / QEMU-KVM / Bare-Metal x86_64
 
-`packaging/unikernel/build-unikernel.sh` also builds a standalone initramfs (`dist/nfty-unikernel-initramfs.cpio.gz`) and a 196 MiB bootable UEFI GPT disk image (`dist/lxd-vm/disk.qcow2`):
+`packaging/unikernel/build-unikernel.sh` builds a hybrid BIOS + UEFI Secure Boot ISO (`dist/nfty-unikernel-x86_64.iso`), a standalone initramfs (`dist/nfty-unikernel-initramfs.cpio.gz`), and a 264 MiB bootable UEFI Secure Boot GPT disk image (`dist/nfty-unikernel-x86_64.img.gz` / `dist/lxd-vm/disk.qcow2`):
 
-- **Partition 1 (64 MiB FAT32 ESP)**: `systemd-boot` (`BOOTX64.EFI`), Linux kernel (`vmlinuz`), and `initramfs.img` (`rdinit=/init`).
-- **Partition 2 (128 MiB `ext4`, label `nfty-data`)**: Automatically mounted at `/data` by `nfty` when booting as PID 1.
+- **Partition 1 (128 MiB FAT32 ESP)**: Microsoft UEFI CA signed `shim-signed` (`BOOTX64.EFI`), `grub-efi-amd64-signed` (`grubx64.efi`), signed Debian 6.12 LTS Linux kernel (`vmlinuz`), and `initramfs.img` (`rdinit=/init`).
+- **Partition 2 (128 MiB `ext4`, label `nfty-data`)**: Automatically mounted at `/data` by `nfty` when booting as PID 1 and pre-seeded with `gateway default { dhcp eth0; ssh:22 }`.
 
 #### Launching as an LXD Virtual Machine
 
 ```bash
 ./packaging/unikernel/build-unikernel.sh
 lxc image import dist/lxd-vm/lxd.tar.gz dist/lxd-vm/disk.qcow2 --alias nfty-unikernel
-lxc launch nfty-unikernel nfty-vm --vm -c security.secureboot=false
+lxc launch nfty-unikernel nfty-vm --vm
 lxc console nfty-vm
 ```
 
 #### Launching Directly with QEMU/KVM
 
-You can boot the initramfs directly with QEMU/KVM and attach a persistent raw or qcow2 disk image as `/dev/vda`:
+You can boot the hybrid BIOS + UEFI Secure Boot ISO or the qcow2 disk image directly with QEMU/KVM:
 
 ```bash
 qemu-system-x86_64 \
   -enable-kvm \
-  -m 256M \
+  -m 512M \
   -smp 2 \
-  -drive file=dist/lxd-vm/disk.qcow2,format=qcow2,if=virtio \
+  -cdrom dist/nfty-unikernel-x86_64.iso \
   -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::9090-:9090 \
   -device virtio-net-pci,netdev=net0 \
   -nographic
@@ -240,11 +240,29 @@ When the RK3588S board powers on:
 
 ---
 
-## 3. First-Boot Bootstrap & SSH Login
+## 3. First-Boot Default DHCP Gateway & SSH Login
 
-### Step 1: Bootstrap Your First Virtual IP
+### Default Out-of-the-Box Gateway (`gateway default`)
 
-On a fresh appliance with an empty `/data/Nftyfile`, the `bootstrap` command binds a static Virtual IP to `eth0`, creates an initial `vip` block with local SSH (`ssh:22`) enabled and rate-limited (`30/min burst 10 per-ip`), applies the `nftables` ruleset to the kernel, and persists `/data/Nftyfile`.
+Every fresh unikernel and container appliance ships with a pre-seeded `/data/Nftyfile` defining a DHCP gateway named `default` with SSH (`ssh:22`) enabled:
+
+```hcl
+gateway default {
+    dhcp eth0
+    ssh:22
+}
+```
+
+When the appliance boots, `nfty` automatically creates the `mv-default` `macvlan` interface on `eth0`, acquires a DHCP lease (advertising hostname `default`), applies the kernel `nftables` ruleset, and exposes SSH on port 22 so you can always connect right away:
+
+```bash
+ssh nfty@default
+# or connect to the leased IP shown in `show gateways` / `show interfaces`
+```
+
+### Step 1 (Optional): Bootstrap a Static Virtual IP
+
+If you prefer a static Virtual IP instead of the default DHCP gateway, the `bootstrap` command binds a static Virtual IP to `eth0`, creates an initial `vip` block with local SSH (`ssh:22`) enabled and rate-limited (`30/min burst 10 per-ip`), applies the `nftables` ruleset to the kernel, and persists `/data/Nftyfile`.
 
 From an LXD host:
 

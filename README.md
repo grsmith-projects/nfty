@@ -28,11 +28,23 @@
 
 ---
 
-## Bootstrapping a New Appliance
+## Default DHCP Gateway & Bootstrapping a New Appliance
 
-On a fresh LXD container or unikernel VM with an empty `/data/Nftyfile`, the `bootstrap` command assigns your primary virtual IP to the network interface, creates the initial `vip` block with local SSH (`ssh:22`) enabled, applies the kernel `nftables` ruleset, and writes `/data/Nftyfile`.
+Fresh LXD container and unikernel VM appliances ship with a pre-seeded `/data/Nftyfile` defining a DHCP gateway named `default` with SSH (`ssh:22`) enabled:
 
-### 1. Run `bootstrap` from the Host or Console
+```hcl
+gateway default {
+    dhcp eth0
+    ssh:22
+}
+```
+
+On first boot, `nfty` automatically creates the `mv-default` `macvlan` interface on `eth0`, acquires a DHCP lease with hostname `default`, applies the kernel `nftables` ruleset, and exposes the embedded SSH server on port 22 so you can connect immediately (`ssh nfty@default` or `ssh nfty@<leased-ip>`, inspectable via `show gateways` or `show interfaces`).
+
+If you prefer a static Virtual IP instead, run `bootstrap` to assign a static VIP to `eth0` and replace the starter config.
+
+### 1. Optional: Run `bootstrap` for a Static VIP
+
 
 From an LXD host (without entering an interactive shell):
 
@@ -347,25 +359,23 @@ ssh 169.254.1.10 "lxc stop -f nfty && lxc file push --mode=0755 /tmp/nfty-bin nf
 
 ### 2. Build and Launch as a Bootable Unikernel VM (LXD VM or QEMU)
 
-`packaging/unikernel/build-unikernel.sh` also assembles a 196 MiB GPT disk image (`dist/lxd-vm/disk.qcow2`) containing a 64 MiB UEFI ESP (`systemd-boot` + kernel + `nfty` initramfs with `rdinit=/init`) and a 128 MiB `ext4` partition labeled `nfty-data` mounted at `/data`.
+`packaging/unikernel/build-unikernel.sh` builds a hybrid BIOS + UEFI Secure Boot ISO (`dist/nfty-unikernel-x86_64.iso`) and a 264 MiB GPT disk image (`dist/nfty-unikernel-x86_64.img.gz` / `dist/lxd-vm/disk.qcow2`) containing a 128 MiB UEFI Secure Boot ESP (`shim-signed` + `grub-efi-amd64-signed` + signed Debian 6.12 LTS kernel + `nfty` initramfs with `rdinit=/init`) and a 128 MiB `ext4` partition labeled `nfty-data` mounted at `/data`.
 
 **Launch as an LXD Virtual Machine:**
 
 ```bash
 ./packaging/unikernel/build-unikernel.sh
 lxc image import dist/lxd-vm/lxd.tar.gz dist/lxd-vm/disk.qcow2 --alias nfty-unikernel
-lxc launch nfty-unikernel nfty-vm --vm -c security.secureboot=false
+lxc launch nfty-unikernel nfty-vm --vm
 lxc console nfty-vm
 ```
 
-**Launch directly with QEMU/KVM (initramfs + kernel):**
+**Launch directly with QEMU/KVM from the ISO:**
 
 ```bash
 qemu-system-x86_64 \
-  -enable-kvm -m 256M -smp 2 \
-  -kernel /boot/vmlinuz-linux \
-  -initrd dist/nfty-unikernel-initramfs.cpio.gz \
-  -append "console=ttyS0 quiet rdinit=/init -- --unikernel --file /data/Nftyfile" \
+  -enable-kvm -m 512M -smp 2 \
+  -cdrom dist/nfty-unikernel-x86_64.iso \
   -nographic
 ```
 

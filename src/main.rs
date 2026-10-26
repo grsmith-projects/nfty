@@ -136,6 +136,10 @@ async fn main() -> Result<()> {
 
     let mut app_state = AppState::new(initial_cfg, effective_file.clone());
     app_state.api_bind = cli.api_bind.clone();
+    // Boot still applies the dataplane; listeners without an allow-list stay locked at request time.
+    for error in app_state.candidate.control_allow_list_errors() {
+        eprintln!("nfty: web/API access blocked: {}", error);
+    }
 
     // Load persisted wildcard host resolutions from /data/hosts.json if present
     if Path::new("/data/hosts.json").exists() {
@@ -248,6 +252,13 @@ async fn main() -> Result<()> {
         }
         Commands::Apply => {
             refresh_allowlist_hosts(&shared).await;
+            let allow_list_errors = shared.read().unwrap().candidate.control_allow_list_errors();
+            if !allow_list_errors.is_empty() {
+                anyhow::bail!(
+                    "not applied: every web:/api: listener requires an IP allow-list\n  {}",
+                    allow_list_errors.join("\n  ")
+                );
+            }
             {
                 let mut st = shared.write().unwrap();
                 let vip_cmds = generate_vip_commands(&Config::new(), &st.candidate);
@@ -930,6 +941,9 @@ service 169.254.1.240:80 {
             r#"
 vip 169.254.1.4 {
     api:9090 {
+        allow {
+            10.0.0.0/8
+        }
         key nfty_rw_committed_token rw
     }
 }
@@ -940,6 +954,9 @@ vip 169.254.1.4 {
             r#"
 vip 169.254.1.4 {
     api:9090 {
+        allow {
+            10.0.0.0/8
+        }
         key nfty_rw_committed_token rw
         key nfty_rw_uncommitted_candidate rw
     }
@@ -951,20 +968,25 @@ vip 169.254.1.4 {
         app_state.candidate = candidate;
         let shared: SharedState = Arc::new(RwLock::new(app_state));
 
+        let client = Some("10.0.0.5".parse().unwrap());
         assert_eq!(
-            crate::api::authenticate_api_request(
+            crate::api::authenticate_api_request_with_context(
                 &shared,
                 false,
                 false,
-                Some("nfty_rw_committed_token")
+                Some("nfty_rw_committed_token"),
+                client,
+                Some(9090),
             ),
             Ok(crate::ast::ApiKeyScope::ReadWrite)
         );
-        assert!(crate::api::authenticate_api_request(
+        assert!(crate::api::authenticate_api_request_with_context(
             &shared,
             false,
             false,
-            Some("nfty_rw_uncommitted_candidate")
+            Some("nfty_rw_uncommitted_candidate"),
+            client,
+            Some(9090),
         )
         .is_err());
     }
@@ -980,6 +1002,9 @@ vip 192.168.1.4 {
         }
     }
     api:8080 {
+        allow {
+            192.168.0.0/16
+        }
         key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
     }
 }
@@ -1047,5 +1072,129 @@ vip 192.168.1.4 {
         assert!(nft.contains("set allow_192_168_1_4_8000"));
         assert!(nft.contains("elements = { 192.168.0.0/16 }"));
         assert!(nft.contains("ip daddr 192.168.1.4 tcp dport 8000 ip saddr @allow_192_168_1_4_8000 counter redirect to :8000"));
+    }
+
+    fn control_auth(
+        shared: &SharedState,
+        peer: &str,
+        port: u16,
+    ) -> std::result::Result<crate::ast::ApiKeyScope, (u16, String)> {
+        let peer: Ipv4Addr = peer.parse().unwrap();
+        crate::api::authenticate_api_request_with_context(
+            shared,
+            peer.is_loopback(),
+            false,
+            None,
+            Some(peer),
+            Some(port),
+        )
+    }
+
+    fn shared_from(raw: &str) -> SharedState {
+        let cfg = parse_nftyfile(raw).unwrap();
+        Arc::new(RwLock::new(AppState::new(cfg, PathBuf::from("Nftyfile"))))
+    }
+
+    #[test]
+    fn test_web_and_api_listeners_require_ip_allow_list() {
+        // No allow-list anywhere: not appliable, and remote clients are denied at runtime.
+        let open = r#"
+vip 192.168.1.4 {
+    web:8000
+    api:8080
+}
+"#;
+        let cfg = parse_nftyfile(open).unwrap();
+        let errors = cfg.control_allow_list_errors();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors.iter().all(|e| e.contains("requires an IP allow-list")));
+        let shared = shared_from(open);
+        assert_eq!(control_auth(&shared, "192.168.1.50", 8000).unwrap_err().0, 403);
+        assert_eq!(control_auth(&shared, "192.168.1.50", 8080).unwrap_err().0, 403);
+        // Loopback (local CLI / IPC) keeps working.
+        assert_eq!(
+            control_auth(&shared, "127.0.0.1", 8000),
+            Ok(crate::ast::ApiKeyScope::ReadWrite)
+        );
+
+        // Hostname entries are rejected for web/api listeners and never grant access.
+        let hostname = r#"
+vip 192.168.1.4 {
+    web:8000 {
+        allow {
+            *.office.lan
+        }
+    }
+}
+"#;
+        let cfg = parse_nftyfile(hostname).unwrap();
+        let errors = cfg.control_allow_list_errors();
+        assert!(errors.iter().any(|e| e.contains("'*.office.lan' is not an IP")), "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains("requires an IP allow-list")), "{errors:?}");
+        let shared = shared_from(hostname);
+        shared
+            .write()
+            .unwrap()
+            .resolved_hosts
+            .insert("laptop.office.lan".to_string(), vec!["192.168.1.50".parse().unwrap()]);
+        assert_eq!(control_auth(&shared, "192.168.1.50", 8000).unwrap_err().0, 403);
+
+        // A global IP allow-list satisfies the requirement.
+        let global = r#"
+allow 192.168.0.0/16
+vip 192.168.1.4 {
+    web:8000
+    api:8080 {
+        key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
+    }
+}
+"#;
+        let cfg = parse_nftyfile(global).unwrap();
+        assert!(cfg.control_allow_list_errors().is_empty());
+        let shared = shared_from(global);
+        assert_eq!(
+            control_auth(&shared, "192.168.1.50", 8000),
+            Ok(crate::ast::ApiKeyScope::ReadWrite)
+        );
+        assert_eq!(control_auth(&shared, "10.0.0.50", 8000).unwrap_err().0, 403);
+        // Allow-listed but keyed: a key is still required.
+        assert_eq!(control_auth(&shared, "192.168.1.50", 8080).unwrap_err().0, 401);
+        // A port with no web/api listener (e.g. the default --api-bind 0.0.0.0:9090) is closed to remote clients.
+        assert_eq!(control_auth(&shared, "192.168.1.50", 9090).unwrap_err().0, 403);
+    }
+
+    #[test]
+    fn test_validate_rejects_web_listener_without_allow_list() {
+        let cfg = parse_nftyfile("vip 192.168.1.4 {\n    web:8000\n}\n").unwrap();
+        let report = validate_config(&cfg, None);
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|e| e.contains("web:8000") && e.contains("requires an IP allow-list")));
+    }
+
+    #[test]
+    fn test_default_dhcp_gateway_and_lan_anti_loop_rules() {
+        assert_eq!(crate::compiler::dhcp_macvlan_iface_name("default"), "eth0");
+        assert_eq!(crate::compiler::dhcp_macvlan_iface_name("my-gw"), "mv-my-gw");
+
+        let raw = r#"
+gateway default {
+    dhcp eth0
+    ssh:22
+}
+gateway 192.168.1.10 {
+    killswitch on
+    tunnels {
+        wg0.conf
+    }
+}
+"#;
+        let cfg = parse_nftyfile(raw).unwrap();
+        assert!(cfg.gateways.contains_key("default"));
+        let nft = compile_nft_ruleset(&cfg, None);
+        assert!(nft.contains("meta pkttype { broadcast, multicast } accept"));
+        assert!(nft.contains("ip daddr { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } accept"));
+        assert!(nft.contains("meta pkttype { broadcast, multicast } drop"));
+        assert!(nft.contains("oifname { \"eth0\", \"mv-*\" } ip daddr { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } drop"));
+        assert!(nft.contains("oifname \"eth0\" ip saddr != 127.0.0.0/8 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter masquerade comment \"nfty:direct-gw-nat\""));
     }
 }

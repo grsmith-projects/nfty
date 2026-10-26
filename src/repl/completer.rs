@@ -244,7 +244,7 @@ impl Completer for NftyHelper {
                 }
                 "scan" => {
                     let mut list = self.known_hosts();
-                    list.push("169.254.1.0/24".to_string());
+                    list.push("192.168.1.0/24".to_string());
                     let matches = list
                         .into_iter()
                         .filter(|c| c.starts_with(prefix))
@@ -791,8 +791,8 @@ impl Completer for NftyHelper {
                 let mut list = self.known_hosts();
                 for pat in [
                     "*.office.lan",
-                    "169.254.1.*",
-                    "169.254.0.0/16",
+                    "192.168.1.*",
+                    "192.168.0.0/16",
                     "10.0.0.0/8",
                     "..",
                     "up",

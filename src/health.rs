@@ -271,6 +271,21 @@ async fn run_probes_internal(shared: &SharedState, force_all: bool) -> Vec<Probe
                 }
             }
         }
+        for (gw_key, gw) in &st.running.gateways {
+            if let Some(v) = &gw.vip {
+                if v.dhcp {
+                    let mv_iface = crate::compiler::dhcp_macvlan_iface_name(gw_key);
+                    let ip_file = format!("/run/nfty-dhcp-{}.ip", mv_iface);
+                    if let Ok(raw_ip) = fs::read_to_string(&ip_file) {
+                        if let Ok(leased_ip) = raw_ip.trim().parse::<Ipv4Addr>() {
+                            if v.leased_ip != Some(leased_ip) || gw.listen_ip != leased_ip {
+                                health_changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if health_changed && !st.running.is_empty() {
             let _ = reload_kernel_from_state(&mut st);
         }

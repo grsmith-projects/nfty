@@ -58,6 +58,8 @@ pub fn handle_udhcpc_hook(action: &str) {
                     let _ = Command::new("ip")
                         .args(["addr", "replace", &cidr, "dev", &iface])
                         .status();
+                    let _ = fs::create_dir_all("/run");
+                    let _ = fs::write(format!("/run/nfty-dhcp-{}.ip", iface), format!("{}\n", ip));
                 }
                 if let Ok(routers) = std::env::var("router") {
                     if let Some(gw) = routers.split_whitespace().next() {
@@ -77,16 +79,24 @@ pub fn handle_udhcpc_hook(action: &str) {
                 }
             } else if let Ok(ip) = std::env::var("ip") {
                 // Secondary macvlan / VLAN DHCP VIP interface:
-                // 1. Prevent ARP flux across macvlan interfaces on the same L2 bridge/VLAN
-                let _ = fs::write("/proc/sys/net/ipv4/conf/all/arp_ignore", "1\n");
-                let _ = fs::write("/proc/sys/net/ipv4/conf/all/arp_announce", "2\n");
-                let _ = fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", "0\n");
-                let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", iface), "1\n");
-                let _ = fs::write(
-                    format!("/proc/sys/net/ipv4/conf/{}/arp_announce", iface),
-                    "2\n",
-                );
-                let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", iface), "0\n");
+                // 1. Prevent ARP flux and ICMP redirects across macvlan interfaces on the same L2 bridge/VLAN
+                for scope in ["all", "default", "eth0", iface.as_str()] {
+                    let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", scope), "1\n");
+                    let _ = fs::write(
+                        format!("/proc/sys/net/ipv4/conf/{}/arp_announce", scope),
+                        "2\n",
+                    );
+                    let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_filter", scope), "1\n");
+                    let _ = fs::write(
+                        format!("/proc/sys/net/ipv4/conf/{}/send_redirects", scope),
+                        "0\n",
+                    );
+                    let _ = fs::write(
+                        format!("/proc/sys/net/ipv4/conf/{}/accept_redirects", scope),
+                        "0\n",
+                    );
+                    let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", scope), "0\n");
+                }
 
                 // 2. Bind /32 so it does not override eth0's metric-0 connected subnet route
                 let cidr32 = format!("{}/32", ip);
@@ -373,22 +383,39 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
 
         // Automatically acquire IPv4 address via DHCP on eth0
         if Path::new("/bin/udhcpc").exists() && Path::new(&format!("/sys/class/net/{}", primary_iface)).exists() {
+            let pid_file = format!("/run/udhcpc-{}.pid", primary_iface);
             let _ = Command::new("/bin/udhcpc")
-                .args(["-i", &primary_iface, "-s", "/bin/udhcpc-hook", "-b", "-q"])
+                .args(["-i", &primary_iface, "-p", &pid_file, "-s", "/bin/udhcpc-hook", "-b", "-q"])
                 .status();
         }
     }
 
-    // Enable kernel IPv4 packet forwarding if writable
+    // Enable kernel IPv4 packet forwarding and disable ICMP redirects / ARP flux on shared bridges
     let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1\n");
+    for scope in ["all", "default", "eth0"] {
+        let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", scope), "1\n");
+        let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_announce", scope), "2\n");
+        let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_filter", scope), "1\n");
+        let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/send_redirects", scope), "0\n");
+        let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/accept_redirects", scope), "0\n");
+    }
 
+    let default_seed = "gateway default {\n    dhcp eth0\n    ssh:22\n}\n";
     let data_dir = Path::new("/data");
     if data_dir.exists() && data_dir.is_dir() {
         let persistent_cfg = data_dir.join("Nftyfile");
-        if !persistent_cfg.exists() {
-            if let Ok(seed) = fs::read_to_string("/etc/nfty/Nftyfile") {
-                let _ = fs::write(&persistent_cfg, seed);
-            }
+        let is_empty = fs::read_to_string(&persistent_cfg)
+            .map(|s| {
+                let t = s.trim();
+                t.is_empty() || t == "# Empty Nftyfile"
+            })
+            .unwrap_or(true);
+        if is_empty {
+            let seed = fs::read_to_string("/etc/nfty/Nftyfile")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| default_seed.to_string());
+            let _ = fs::write(&persistent_cfg, seed);
         }
         if persistent_cfg.exists() {
             return Some(persistent_cfg);

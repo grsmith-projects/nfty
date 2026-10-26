@@ -15,8 +15,9 @@ Core properties:
 1. **Declarative `Nftyfile` and CLI Directive (`web:<port>`)**:
    - Declare `web:8000` (or `web`) inside any `vip` or `gateway` block, with `allow`, `limit`, `auth`, `hostname` (mDNS `.local`), `cloudflare-dns`, and optional `key` sub-directives.
    - Kernel `nftables` `prerouting` and `input` chains enforce any attached `allow` CIDR/hostname sets (`@allow_<id>`) and `limit` meters (`@meter_<id>`) before accepting traffic to the local `web:<port>` listener.
-2. **Allow-List Authentication and Optional Token/Login Auth**:
-   - **IP Allow-List Auth**: When `web:8000` is configured with an `allow` list (e.g., `allow 192.168.0.0/16`) and no API keys are required on that listener, clients matching the allow-list are permitted by both kernel `nftables` and userspace `authenticate_api_request_with_context` with `rw` access.
+2. **Required IP Allow-List, with Optional Token/Login Auth**:
+   - **Allow-List Required**: Every `web:<port>` and `api:<port>` listener must be covered by at least one IP, CIDR, or IPv4-wildcard `allow` entry (its own, its gateway's, or the global allow-list). `validate`, `apply`, `bootstrap`, `PUT /api/v1/config`, and allow-list updates with `"apply": true` refuse configs that break this rule. Hostname entries (e.g. `*.office.lan`) are rejected on these listeners because DHCP clients choose their own names. If a config loaded at boot breaks the rule, the dataplane still starts, but remote access to the listener is denied (`403`). Loopback clients (the local CLI) are not affected.
+   - **IP Allow-List Auth**: Clients matching the allow-list of a listener with no API keys receive `rw` access (`authenticate_api_request_with_context`). If the listener has API keys, allow-listed clients must also present a key. Remote clients connecting to a port with no `web:`/`api:` listener (including the default `--api-bind 0.0.0.0:9090` when `api:9090` is not configured) are denied.
    - **Appliance Login & Scoped API Keys**: Operators can also authenticate using the appliance username/password (`nfty` / `/data/auth.json` via `POST /api/v1/auth/login`) or switch to an `nfty_ro_...` / `nfty_rw_...` API key via the **Switch Key / Login** modal.
 3. **Self-Contained Static Assets**:
    - Compiled directly into the `nfty` binary (`WEB_CONSOLE_HTML` in `src/api.rs`) with no external runtime or CDN dependencies.
@@ -37,6 +38,9 @@ vip 192.168.1.4 {
         }
     }
     api:8080 {
+        allow {
+            192.168.0.0/16
+        }
         key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
     }
     seer:5055 {
@@ -179,7 +183,7 @@ flowchart LR
 - **AST & Port Helpers (`src/ast.rs`)**:
   - `Service::is_local_web()` and `Service::is_local_api_or_web()` identify `web:<port>` and `api:<port>` services.
   - `Config::is_web_port(local_port)` checks whether a given listener port is configured as `web:<port>` on any VIP or Gateway so `GET /` is only served on `web:<port>` ports.
-  - `Config::is_unkeyed_web_or_api_allowed(peer_ip, local_port, resolved_hosts)` and `Config::is_peer_ip_allowed_for_port(...)` evaluate IP/CIDR/wildcard/hostname allow-lists for unkeyed `web:<port>` listeners.
+  - `Config::control_listeners()` lists every `web:<port>`/`api:<port>` listener with its governing allow-list; `Config::control_allow_list_errors()` blocks applying any listener without an IP allow-list; `Config::control_access(peer_ip, local_port)` denies by default at request time, allowing only clients that match the listener's IP/CIDR/IPv4-wildcard entries (hostname entries never grant access).
 - **Kernel `nftables` Rules (`src/compiler.rs`)**:
   - `emit_service_prerouting` redirects `web:<port>` and `api:<port>` to their declared port (`redirect to :<port>`) after enforcing any service-level `@allow_<id>` and `@meter_<id>` sets.
   - `compile_nft_ruleset` emits VIP-scoped `tcp dport <port> accept` rules in `chain input` and drops unauthorized destination IPs.

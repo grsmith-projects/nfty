@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 
+use crate::parser::{ipv4_in_network, parse_ip_allow_entry};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Proto {
@@ -1177,6 +1179,42 @@ impl DnsConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlListenerKind {
+    Api,
+    Web,
+}
+
+/// A `web:<port>` or `api:<port>` listener and the allow-list/API keys that govern it.
+#[derive(Debug, Clone)]
+pub struct ControlListener<'a> {
+    pub owner: String,
+    pub kind: ControlListenerKind,
+    pub port: u16,
+    pub allow: &'a [String],
+    pub api_keys: &'a [ApiKey],
+}
+
+impl fmt::Display for ControlListener<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind {
+            ControlListenerKind::Api => "api",
+            ControlListenerKind::Web => "web",
+        };
+        write!(f, "{}:{} ({})", kind, self.port, self.owner)
+    }
+}
+
+/// Outcome of the IP allow-list check for a remote control-plane client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlAccess {
+    /// Allow-listed, and the listener has no API keys, so the allow-list grants read-write access.
+    Granted,
+    /// Allow-listed, but the listener also requires an API key.
+    KeyRequired,
+    Denied(String),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     /// Global allow-list of hosts/CIDRs/wildcards applied across services (or referenced by them)
@@ -1276,117 +1314,162 @@ impl Config {
         false
     }
 
-    /// Checks whether a source IPv4 address is allowed to access a `web:<port>` or `api:<port>`
-    /// service that has no API keys configured (relying on its `allow` or `global_allow` list).
-    pub fn is_unkeyed_web_or_api_allowed(
-        &self,
-        peer_ip: Ipv4Addr,
-        local_port: Option<u16>,
-        st: &crate::state::AppState,
-    ) -> bool {
-        for svc in self.services.values() {
-            if svc.is_local_api_or_web() {
-                if let Some(lp) = local_port {
-                    if svc.port == lp {
-                        if !svc.api_keys.is_empty() {
-                            return false;
-                        }
-                        if !svc.allow.is_empty() || !self.global_allow.is_empty() {
-                            return st.is_ip_allowed(peer_ip, &svc.allow, &self.global_allow);
-                        } else {
-                            return svc.is_local_web();
-                        }
-                    }
-                }
-            }
-        }
-        for gw in self.gateways.values() {
-            for gs in &gw.services {
-                if matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web) {
-                    if let Some(lp) = local_port {
-                        if gs.port == lp {
-                            if !gs.api_keys.is_empty() {
-                                return false;
-                            }
-                            if !gw.allow.is_empty() || !self.global_allow.is_empty() {
-                                return st.is_ip_allowed(peer_ip, &gw.allow, &self.global_allow);
-                            } else {
-                                return gs.kind == GatewayServiceKind::Web;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // If the connection arrived on the redirected port 9090 or local_port was unspecified,
-        // check if any unkeyed web:<port> or allow-listed api:<port> service permits peer_ip.
-        for svc in self.services.values() {
-            if svc.is_local_api_or_web() && svc.api_keys.is_empty() {
-                if !svc.allow.is_empty() || !self.global_allow.is_empty() {
-                    if st.is_ip_allowed(peer_ip, &svc.allow, &self.global_allow) {
-                        return true;
-                    }
-                } else if svc.is_local_web() {
-                    return true;
-                }
-            }
-        }
-        for gw in self.gateways.values() {
-            for gs in &gw.services {
-                if matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web)
-                    && gs.api_keys.is_empty()
-                {
-                    if !gw.allow.is_empty() || !self.global_allow.is_empty() {
-                        if st.is_ip_allowed(peer_ip, &gw.allow, &self.global_allow) {
-                            return true;
-                        }
-                    } else if gs.kind == GatewayServiceKind::Web {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+    /// Lists every `web:<port>` and `api:<port>` control listener declared on a VIP or gateway.
+    /// Gateway listeners are governed by the gateway's `allow` list.
+    pub fn control_listeners(&self) -> Vec<ControlListener<'_>> {
+        let services = self.services.values().filter_map(|svc| {
+            let kind = if svc.is_local_web() {
+                ControlListenerKind::Web
+            } else if svc.is_local_api() {
+                ControlListenerKind::Api
+            } else {
+                return None;
+            };
+            Some(ControlListener {
+                owner: format!("service {}", svc.key),
+                kind,
+                port: svc.port,
+                allow: &svc.allow,
+                api_keys: &svc.api_keys,
+            })
+        });
+        let gateways = self.gateways.values().flat_map(|gw| {
+            gw.services.iter().filter_map(move |gs| {
+                let kind = match gs.kind {
+                    GatewayServiceKind::Web => ControlListenerKind::Web,
+                    GatewayServiceKind::Api => ControlListenerKind::Api,
+                    _ => return None,
+                };
+                Some(ControlListener {
+                    owner: format!("gateway {}", gw.key),
+                    kind,
+                    port: gs.port,
+                    allow: &gw.allow,
+                    api_keys: &gs.api_keys,
+                })
+            })
+        });
+        services.chain(gateways).collect()
     }
 
-    /// Checks whether a source IPv4 address is permitted by the allow-list of the `web:<port>` / `api:<port>`
-    /// service on `local_port` (if an allow-list is configured).
-    pub fn is_peer_ip_allowed_for_port(
-        &self,
-        peer_ip: Ipv4Addr,
-        local_port: Option<u16>,
-        st: &crate::state::AppState,
-    ) -> bool {
-        if peer_ip.is_loopback() {
-            return true;
-        }
-        if let Some(lp) = local_port {
-            for svc in self.services.values() {
-                if svc.is_local_api_or_web() && svc.port == lp {
-                    if !svc.allow.is_empty() || !self.global_allow.is_empty() {
-                        return st.is_ip_allowed(peer_ip, &svc.allow, &self.global_allow);
-                    }
-                    return true;
+    /// Address entries (IP, CIDR, IPv4 wildcard) that govern a control listener: its own plus the
+    /// global allow-list. Hostname entries are skipped because DHCP clients choose their own names.
+    fn control_allow_networks<'a>(
+        &'a self,
+        own: &'a [String],
+    ) -> impl Iterator<Item = (Ipv4Addr, u8)> + 'a {
+        own.iter()
+            .chain(&self.global_allow)
+            .filter_map(|entry| parse_ip_allow_entry(entry))
+    }
+
+    /// Reasons this config must not be applied: every `web:`/`api:` listener needs an IP allow-list
+    /// (its own or global), and its own allow entries must be addresses rather than hostnames.
+    pub fn control_allow_list_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for listener in self.control_listeners() {
+            for entry in listener.allow {
+                if parse_ip_allow_entry(entry).is_none() {
+                    errors.push(format!(
+                        "{}: allow entry '{}' is not an IP, CIDR, or IPv4 wildcard (hostnames are not accepted for web:/api: access)",
+                        listener, entry
+                    ));
                 }
             }
-            for gw in self.gateways.values() {
-                for gs in &gw.services {
-                    if matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web)
-                        && gs.port == lp
-                    {
-                        if !gw.allow.is_empty() || !self.global_allow.is_empty() {
-                            return st.is_ip_allowed(peer_ip, &gw.allow, &self.global_allow);
-                        }
-                        return true;
-                    }
-                }
+            if self.control_allow_networks(listener.allow).next().is_none() {
+                errors.push(format!(
+                    "{}: requires an IP allow-list (add 'allow <ip-or-cidr>' to it, or to the global allow-list)",
+                    listener
+                ));
             }
         }
-        if !self.global_allow.is_empty() {
-            return st.is_ip_allowed(peer_ip, &[], &self.global_allow);
+        errors
+    }
+
+    pub fn control_allow_list_warnings(&self) -> Vec<String> {
+        let listeners = self.control_listeners();
+        if listeners.is_empty() {
+            return Vec::new();
         }
-        true
+        let mut warnings: Vec<String> = self
+            .global_allow
+            .iter()
+            .filter(|entry| parse_ip_allow_entry(entry).is_none())
+            .map(|entry| {
+                format!(
+                    "global allow entry '{}' is not an IP or CIDR and is ignored for web:/api: access",
+                    entry
+                )
+            })
+            .collect();
+        for listener in &listeners {
+            if self
+                .control_allow_networks(listener.allow)
+                .any(|(_, prefix)| prefix == 0)
+            {
+                warnings.push(format!(
+                    "{}: allow-list includes 0.0.0.0/0, which admits every client",
+                    listener
+                ));
+            }
+        }
+        let mut owners_by_port: BTreeMap<u16, Vec<String>> = BTreeMap::new();
+        for listener in &listeners {
+            owners_by_port
+                .entry(listener.port)
+                .or_default()
+                .push(listener.to_string());
+        }
+        for (port, owners) in owners_by_port {
+            if owners.len() > 1 {
+                warnings.push(format!(
+                    "port {} is shared by {}; clients must satisfy every one of their allow-lists",
+                    port,
+                    owners.join(", ")
+                ));
+            }
+        }
+        warnings
+    }
+
+    /// Decides whether a remote (non-loopback) client may reach the control listener on `local_port`.
+    /// Fails closed: unknown ports, non-IPv4 clients, and listeners without an IP allow-list are denied.
+    pub fn control_access(&self, peer_ip: Option<Ipv4Addr>, local_port: Option<u16>) -> ControlAccess {
+        let Some(peer_ip) = peer_ip else {
+            return ControlAccess::Denied(
+                "Forbidden: web/API access requires an IPv4 client address".to_string(),
+            );
+        };
+        let Some(port) = local_port else {
+            return ControlAccess::Denied("Forbidden: unknown listener port".to_string());
+        };
+        let listeners: Vec<ControlListener<'_>> = self
+            .control_listeners()
+            .into_iter()
+            .filter(|listener| listener.port == port)
+            .collect();
+        if listeners.is_empty() {
+            return ControlAccess::Denied(format!(
+                "Forbidden: port {} is not a configured web:/api: listener",
+                port
+            ));
+        }
+        for listener in &listeners {
+            let permitted = self
+                .control_allow_networks(listener.allow)
+                .any(|(network, prefix)| ipv4_in_network(peer_ip, network, prefix));
+            if !permitted {
+                return ControlAccess::Denied(format!(
+                    "Forbidden: client IP {} is not in the allow-list for {}",
+                    peer_ip, listener
+                ));
+            }
+        }
+        if listeners.iter().any(|listener| !listener.api_keys.is_empty()) {
+            ControlAccess::KeyRequired
+        } else {
+            ControlAccess::Granted
+        }
     }
 
     /// Verifies a candidate API key against all configured `api:<port>` blocks across VIPs and Gateways.

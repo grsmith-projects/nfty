@@ -172,7 +172,12 @@ if [[ -d /usr/share/terminfo ]]; then
     done
 fi
 
-echo -n "" > "$STAGE_DIR/etc/nfty/Nftyfile"
+cat > "$STAGE_DIR/etc/nfty/Nftyfile" <<'EOF'
+gateway default {
+    dhcp eth0
+    ssh:22
+}
+EOF
 echo "root:x:0:0:root:/root:/bin/nfty" > "$STAGE_DIR/etc/passwd"
 echo "root:x:0:" > "$STAGE_DIR/etc/group"
 
@@ -304,7 +309,12 @@ INITRD_IMG="$ROOT_DIR/dist/nfty-unikernel-initramfs.cpio.gz"
 
 echo "==> [4/6] Building Secure Boot UEFI ESP & Persistent ext4 Data Partitions..."
 mkdir -p "$WORK_DIR/data-seed"
-echo -n "" > "$WORK_DIR/data-seed/Nftyfile"
+cat > "$WORK_DIR/data-seed/Nftyfile" <<'EOF'
+gateway default {
+    dhcp eth0
+    ssh:22
+}
+EOF
 echo "{}" > "$WORK_DIR/data-seed/hosts.json"
 
 DATA_PART="$WORK_DIR/part2-data.ext4"
@@ -328,17 +338,19 @@ menuentry "nfty x86_64 Unikernel Appliance (QEMU / KVM / UEFI Secure Boot)" {
 }
 EOF
 
-# 1. 8 MiB El Torito UEFI Boot Image for the ISO (loads /vmlinuz and /initramfs.img from ISO9660 root)
+# 1. 16 MiB El Torito UEFI Boot Image for the ISO (FAT16; loads /vmlinuz and /initramfs.img from ISO9660 root)
+# Note: Do NOT place fbx64.efi in /EFI/BOOT/ — when shimx64.efi runs as BOOTX64.EFI and sees
+# /EFI/BOOT/fbx64.efi, should_use_fallback() runs fbx64.efi instead of grubx64.efi, which fails
+# with EFI_NOT_FOUND when no BOOTX64.CSV exists.
 ISO_EFIBOOT="$WORK_DIR/efiboot-iso.img"
-truncate -s 8M "$ISO_EFIBOOT"
-run_tool "$WORK_DIR/tools/usr/bin/mformat" -i "$ISO_EFIBOOT" -F -v "NFTY_EFI" ::
+truncate -s 16M "$ISO_EFIBOOT"
+run_tool "$WORK_DIR/tools/usr/bin/mformat" -i "$ISO_EFIBOOT" -v "NFTY_EFI" ::
 for dir in ::/EFI ::/EFI/BOOT ::/EFI/debian ::/boot ::/boot/grub; do
     run_tool "$WORK_DIR/tools/usr/bin/mmd" -i "$ISO_EFIBOOT" "$dir"
 done
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ISO_EFIBOOT" "$WORK_DIR/efi/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ISO_EFIBOOT" "$WORK_DIR/efi/grubx64.efi" ::/EFI/BOOT/grubx64.efi
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ISO_EFIBOOT" "$WORK_DIR/efi/mmx64.efi" ::/EFI/BOOT/mmx64.efi
-run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ISO_EFIBOOT" "$WORK_DIR/efi/fbx64.efi" ::/EFI/BOOT/fbx64.efi
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ISO_EFIBOOT" "$WORK_DIR/efi/grubx64.efi" ::/EFI/debian/grubx64.efi
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ISO_EFIBOOT" "$WORK_DIR/grub.cfg" ::/EFI/debian/grub.cfg
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ISO_EFIBOOT" "$WORK_DIR/grub.cfg" ::/EFI/BOOT/grub.cfg
@@ -354,7 +366,6 @@ done
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ESP_PART" "$WORK_DIR/efi/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ESP_PART" "$WORK_DIR/efi/grubx64.efi" ::/EFI/BOOT/grubx64.efi
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ESP_PART" "$WORK_DIR/efi/mmx64.efi" ::/EFI/BOOT/mmx64.efi
-run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ESP_PART" "$WORK_DIR/efi/fbx64.efi" ::/EFI/BOOT/fbx64.efi
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ESP_PART" "$WORK_DIR/efi/grubx64.efi" ::/EFI/debian/grubx64.efi
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ESP_PART" "$WORK_DIR/grub.cfg" ::/EFI/debian/grub.cfg
 run_tool "$WORK_DIR/tools/usr/bin/mcopy" -i "$ESP_PART" "$WORK_DIR/grub.cfg" ::/EFI/BOOT/grub.cfg
@@ -371,7 +382,6 @@ cp "$INITRD_IMG" "$ISO_ROOT/initramfs.img"
 cp "$WORK_DIR/efi/BOOTX64.EFI" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
 cp "$WORK_DIR/efi/grubx64.efi" "$ISO_ROOT/EFI/BOOT/grubx64.efi"
 cp "$WORK_DIR/efi/mmx64.efi" "$ISO_ROOT/EFI/BOOT/mmx64.efi"
-cp "$WORK_DIR/efi/fbx64.efi" "$ISO_ROOT/EFI/BOOT/fbx64.efi"
 cp "$WORK_DIR/efi/grubx64.efi" "$ISO_ROOT/EFI/debian/grubx64.efi"
 cp "$WORK_DIR/grub.cfg" "$ISO_ROOT/EFI/debian/grub.cfg"
 cp "$WORK_DIR/grub.cfg" "$ISO_ROOT/EFI/BOOT/grub.cfg"
