@@ -383,10 +383,10 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                             gw.key, gs.port, gw.listen_ip, gs.port, gw_allow_guard, gw.key
                         ));
                     }
-                    GatewayServiceKind::Api => {
+                    GatewayServiceKind::Api | GatewayServiceKind::Web => {
                         out.push_str(&format!(
-                            "\n        # --- gateway {} service api:{} ---\n        ip daddr {} tcp dport {}{} counter redirect to :{} comment \"nfty:gw-api={}\"\n",
-                            gw.key, gs.port, gw.listen_ip, gs.port, gw_allow_guard, gs.port, gw.key
+                            "\n        # --- gateway {} service {}:{} ---\n        ip daddr {} tcp dport {}{} counter redirect to :{} comment \"nfty:gw-api={}\"\n",
+                            gw.key, gs.kind, gs.port, gw.listen_ip, gs.port, gw_allow_guard, gs.port, gw.key
                         ));
                     }
                     GatewayServiceKind::Privoxy
@@ -457,7 +457,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                 if svc.port == 22 && svc.backends.iter().any(|b| b.ip.is_loopback() && b.port == 22) {
                     ssh_allowed_vips.insert(ip);
                 }
-                if svc.is_local_api() && svc.port == 9090 {
+                if svc.is_local_api_or_web() && svc.port == 9090 {
                     api_allowed_vips.insert(ip);
                 }
             }
@@ -473,11 +473,10 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             {
                 ssh_allowed_vips.insert(gw.listen_ip);
             }
-            if gw
-                .services
-                .iter()
-                .any(|gs| gs.kind == GatewayServiceKind::Api && gs.port == 9090)
-            {
+            if gw.services.iter().any(|gs| {
+                matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web)
+                    && gs.port == 9090
+            }) {
                 api_allowed_vips.insert(gw.listen_ip);
             }
         }
@@ -690,9 +689,14 @@ fn emit_service_prerouting(
     if slots.len() == 1 {
         let b = slots[0];
         if b.ip.is_loopback() {
+            let redirect_port = if svc.is_local_api_or_web() {
+                svc.port
+            } else {
+                b.port
+            };
             out.push_str(&format!(
                 "        {}{}{} counter redirect to :{} comment \"nfty:svc={}\"\n",
-                match_prefix, allow_guard, rate_guard, b.port, svc.key
+                match_prefix, allow_guard, rate_guard, redirect_port, svc.key
             ));
         } else {
             out.push_str(&format!(

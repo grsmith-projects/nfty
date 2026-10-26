@@ -371,6 +371,9 @@ impl Service {
     }
 
     pub fn display_name(&self) -> String {
+        if self.is_local_web() {
+            return format!("web:{}", self.port);
+        }
         if self.is_local_api() {
             return format!("api:{}", self.port);
         }
@@ -437,12 +440,25 @@ impl Service {
             .as_deref()
             .map(|n| n.eq_ignore_ascii_case("api") || n.to_ascii_lowercase().starts_with("api:"))
             .unwrap_or(false)
-            || (!self.api_keys.is_empty()
+            || (!self.is_local_web()
+                && !self.api_keys.is_empty()
                 && self.backends.len() == 1
                 && self.backends[0].ip.is_loopback())
     }
 
+    pub fn is_local_web(&self) -> bool {
+        self.name
+            .as_deref()
+            .map(|n| n.eq_ignore_ascii_case("web") || n.to_ascii_lowercase().starts_with("web:"))
+            .unwrap_or(false)
+    }
+
+    pub fn is_local_api_or_web(&self) -> bool {
+        self.is_local_api() || self.is_local_web()
+    }
+
     pub fn format_in_vip(&self) -> String {
+        let is_web = self.is_local_web();
         let is_api = self.is_local_api();
         let is_ssh = self.is_local_ssh();
         let is_dns = self.is_local_dns();
@@ -454,7 +470,9 @@ impl Service {
             format!("{}/{}", self.port, self.proto)
         };
 
-        let (hdr, port_encoded_in_hdr, backend_encoded_in_hdr) = if is_api {
+        let (hdr, port_encoded_in_hdr, backend_encoded_in_hdr) = if is_web {
+            (format!("web:{}", self.port), true, true)
+        } else if is_api {
             (format!("api:{}", self.port), true, true)
         } else if is_ssh {
             (format!("ssh:{}", self.port), true, true)
@@ -485,6 +503,7 @@ impl Service {
         if !is_dns
             && !is_ssh
             && !is_api
+            && !is_web
             && self.proto != Proto::Tcp
             && !hdr.contains('/')
         {
@@ -590,7 +609,7 @@ impl Service {
             }
             out.push_str("    }\n");
         }
-        if !self.backends.is_empty() && !self.is_local_api() {
+        if !self.backends.is_empty() && !self.is_local_api_or_web() {
             out.push_str("    to {\n");
             for b in &self.backends {
                 out.push_str(&format!("        {}\n", b));
@@ -672,6 +691,7 @@ pub enum GatewayServiceKind {
     Ssh,
     Dns,
     Api,
+    Web,
 }
 
 impl fmt::Display for GatewayServiceKind {
@@ -682,6 +702,7 @@ impl fmt::Display for GatewayServiceKind {
             GatewayServiceKind::Ssh => write!(f, "ssh"),
             GatewayServiceKind::Dns => write!(f, "dns"),
             GatewayServiceKind::Api => write!(f, "api"),
+            GatewayServiceKind::Web => write!(f, "web"),
         }
     }
 }
@@ -848,7 +869,9 @@ impl Gateway {
             out.push_str("    }\n");
         }
         for s in &self.services {
-            if s.kind == GatewayServiceKind::Api && !s.api_keys.is_empty() {
+            if matches!(s.kind, GatewayServiceKind::Api | GatewayServiceKind::Web)
+                && !s.api_keys.is_empty()
+            {
                 out.push_str(&format!("    {}:{} {{\n", s.kind, s.port));
                 for k in &s.api_keys {
                     out.push_str(&format!("        key {} {}\n", k.key, k.scope));
@@ -1199,11 +1222,12 @@ impl Config {
     }
 
     pub fn has_any_api_service(&self) -> bool {
-        self.services.values().any(|s| s.is_local_api())
-            || self
-                .gateways
-                .values()
-                .any(|g| g.services.iter().any(|gs| gs.kind == GatewayServiceKind::Api))
+        self.services.values().any(|s| s.is_local_api_or_web())
+            || self.gateways.values().any(|g| {
+                g.services.iter().any(|gs| {
+                    matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web)
+                })
+            })
     }
 
     pub fn has_any_api_keys(&self) -> bool {
@@ -1214,22 +1238,135 @@ impl Config {
                 .any(|g| g.services.iter().any(|gs| !gs.api_keys.is_empty()))
     }
 
-    /// Returns all configured API ports across VIP services and gateways.
+    /// Returns all configured API and Web UI ports across VIP services and gateways.
     pub fn api_ports(&self) -> Vec<u16> {
         let mut ports = std::collections::BTreeSet::new();
         for svc in self.services.values() {
-            if svc.is_local_api() {
+            if svc.is_local_api_or_web() {
                 ports.insert(svc.port);
             }
         }
         for gw in self.gateways.values() {
             for gs in &gw.services {
-                if gs.kind == GatewayServiceKind::Api {
+                if matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web) {
                     ports.insert(gs.port);
                 }
             }
         }
         ports.into_iter().collect()
+    }
+
+    /// Checks whether a source IPv4 address is allowed to access a `web:<port>` or `api:<port>`
+    /// service that has no API keys configured (relying on its `allow` or `global_allow` list).
+    pub fn is_unkeyed_web_or_api_allowed(
+        &self,
+        peer_ip: Ipv4Addr,
+        local_port: Option<u16>,
+        st: &crate::state::AppState,
+    ) -> bool {
+        for svc in self.services.values() {
+            if svc.is_local_api_or_web() {
+                if let Some(lp) = local_port {
+                    if svc.port == lp {
+                        if !svc.api_keys.is_empty() {
+                            return false;
+                        }
+                        if !svc.allow.is_empty() || !self.global_allow.is_empty() {
+                            return st.is_ip_allowed(peer_ip, &svc.allow, &self.global_allow);
+                        } else {
+                            return svc.is_local_web();
+                        }
+                    }
+                }
+            }
+        }
+        for gw in self.gateways.values() {
+            for gs in &gw.services {
+                if matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web) {
+                    if let Some(lp) = local_port {
+                        if gs.port == lp {
+                            if !gs.api_keys.is_empty() {
+                                return false;
+                            }
+                            if !gw.allow.is_empty() || !self.global_allow.is_empty() {
+                                return st.is_ip_allowed(peer_ip, &gw.allow, &self.global_allow);
+                            } else {
+                                return gs.kind == GatewayServiceKind::Web;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If the connection arrived on the redirected port 9090 or local_port was unspecified,
+        // check if any unkeyed web:<port> or allow-listed api:<port> service permits peer_ip.
+        for svc in self.services.values() {
+            if svc.is_local_api_or_web() && svc.api_keys.is_empty() {
+                if !svc.allow.is_empty() || !self.global_allow.is_empty() {
+                    if st.is_ip_allowed(peer_ip, &svc.allow, &self.global_allow) {
+                        return true;
+                    }
+                } else if svc.is_local_web() {
+                    return true;
+                }
+            }
+        }
+        for gw in self.gateways.values() {
+            for gs in &gw.services {
+                if matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web)
+                    && gs.api_keys.is_empty()
+                {
+                    if !gw.allow.is_empty() || !self.global_allow.is_empty() {
+                        if st.is_ip_allowed(peer_ip, &gw.allow, &self.global_allow) {
+                            return true;
+                        }
+                    } else if gs.kind == GatewayServiceKind::Web {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Checks whether a source IPv4 address is permitted by the allow-list of the `web:<port>` / `api:<port>`
+    /// service on `local_port` (if an allow-list is configured).
+    pub fn is_peer_ip_allowed_for_port(
+        &self,
+        peer_ip: Ipv4Addr,
+        local_port: Option<u16>,
+        st: &crate::state::AppState,
+    ) -> bool {
+        if peer_ip.is_loopback() {
+            return true;
+        }
+        if let Some(lp) = local_port {
+            for svc in self.services.values() {
+                if svc.is_local_api_or_web() && svc.port == lp {
+                    if !svc.allow.is_empty() || !self.global_allow.is_empty() {
+                        return st.is_ip_allowed(peer_ip, &svc.allow, &self.global_allow);
+                    }
+                    return true;
+                }
+            }
+            for gw in self.gateways.values() {
+                for gs in &gw.services {
+                    if matches!(gs.kind, GatewayServiceKind::Api | GatewayServiceKind::Web)
+                        && gs.port == lp
+                    {
+                        if !gw.allow.is_empty() || !self.global_allow.is_empty() {
+                            return st.is_ip_allowed(peer_ip, &gw.allow, &self.global_allow);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        if !self.global_allow.is_empty() {
+            return st.is_ip_allowed(peer_ip, &[], &self.global_allow);
+        }
+        true
     }
 
     /// Verifies a candidate API key against all configured `api:<port>` blocks across VIPs and Gateways.

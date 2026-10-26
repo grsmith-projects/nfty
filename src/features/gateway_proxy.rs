@@ -295,7 +295,10 @@ async fn run_single_gateway_proxy(
                 GatewayServiceKind::Socks5 => {
                     let _ = handle_socks5_client(client, shared_c, gw_k).await;
                 }
-                GatewayServiceKind::Ssh | GatewayServiceKind::Dns | GatewayServiceKind::Api => {}
+                GatewayServiceKind::Ssh
+                | GatewayServiceKind::Dns
+                | GatewayServiceKind::Api
+                | GatewayServiceKind::Web => {}
             }
         });
     }
