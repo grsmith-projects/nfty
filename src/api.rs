@@ -406,9 +406,27 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
         }
     }
 
+    let is_web_listener = {
+        let st = shared.read().unwrap();
+        st.active_config().is_web_port(local_port)
+    };
+
     if method == "GET" && matches!(path, "/" | "/ui" | "/dashboard" | "/index.html") {
-        send_html(&mut stream, 200, WEB_CONSOLE_HTML).await?;
-        return Ok(());
+        if is_web_listener {
+            send_html(&mut stream, 200, WEB_CONSOLE_HTML).await?;
+            return Ok(());
+        } else {
+            send_json(
+                &mut stream,
+                404,
+                &json!({
+                    "ok": false,
+                    "error": "Web UI is not enabled on this API port (configure 'web:<port>' on a VIP or gateway for the web interface, or query '/api/v1/status')"
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
     if method == "POST" && path == "/api/v1/auth/login" {

@@ -1256,6 +1256,26 @@ impl Config {
         ports.into_iter().collect()
     }
 
+    /// Returns true if `local_port` is configured as a `web:<port>` service on a VIP or Gateway.
+    pub fn is_web_port(&self, local_port: Option<u16>) -> bool {
+        let Some(lp) = local_port else {
+            return false;
+        };
+        for svc in self.services.values() {
+            if svc.is_local_web() && svc.port == lp {
+                return true;
+            }
+        }
+        for gw in self.gateways.values() {
+            for gs in &gw.services {
+                if gs.kind == GatewayServiceKind::Web && gs.port == lp {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Checks whether a source IPv4 address is allowed to access a `web:<port>` or `api:<port>`
     /// service that has no API keys configured (relying on its `allow` or `global_allow` list).
     pub fn is_unkeyed_web_or_api_allowed(
