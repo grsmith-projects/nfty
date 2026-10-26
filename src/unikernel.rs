@@ -380,7 +380,7 @@ pub fn persist_to_storage(shared: &SharedState) {
             ) {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                 let req = format!(
-                    "PUT /api/v1/config HTTP/1.1\r\nHost: 127.0.0.1:9090\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "PUT /api/v1/config HTTP/1.1\r\nHost: 127.0.0.1:9090\r\nX-Nfty-Internal-IPC: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -396,7 +396,7 @@ pub fn persist_to_storage(shared: &SharedState) {
 /// Spawns the native Rust L4 Load-Balancer Dataplane for Unikernel / Standalone Userspace mode.
 pub fn spawn_unikernel_dataplane(shared: SharedState) {
     tokio::spawn(async move {
-        let mut active_listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut active_listeners: HashMap<(String, Option<Ipv4Addr>, u16, Proto), tokio::task::JoinHandle<()>> = HashMap::new();
 
         loop {
             let services_snapshot = {
@@ -404,13 +404,24 @@ pub fn spawn_unikernel_dataplane(shared: SharedState) {
                 st.active_config().services.clone()
             };
 
-            active_listeners.retain(|k, handle| {
-                if !services_snapshot.contains_key(k) {
+            active_listeners.retain(|(k, lip, port, proto), handle| {
+                let keep = services_snapshot.get(k).map(|svc| {
+                    let is_local_loopback =
+                        svc.backends.is_empty() || svc.backends.iter().all(|b| b.ip.is_loopback());
+                    let is_unleased_dhcp =
+                        svc.listen_ip.is_none() && svc.vip.as_ref().map(|v| v.dhcp).unwrap_or(false);
+                    matches!(svc.proto, Proto::Tcp | Proto::Both)
+                        && !is_local_loopback
+                        && !is_unleased_dhcp
+                        && svc.port != 22
+                        && svc.listen_ip == *lip
+                        && svc.port == *port
+                        && svc.proto == *proto
+                }).unwrap_or(false);
+                if !keep {
                     handle.abort();
-                    false
-                } else {
-                    true
                 }
+                keep
             });
 
             for (key, svc) in services_snapshot {
@@ -418,11 +429,12 @@ pub fn spawn_unikernel_dataplane(shared: SharedState) {
                     svc.backends.is_empty() || svc.backends.iter().all(|b| b.ip.is_loopback());
                 let is_unleased_dhcp =
                     svc.listen_ip.is_none() && svc.vip.as_ref().map(|v| v.dhcp).unwrap_or(false);
+                let listener_key = (key.clone(), svc.listen_ip, svc.port, svc.proto);
                 if matches!(svc.proto, Proto::Tcp | Proto::Both)
                     && !is_local_loopback
                     && !is_unleased_dhcp
                     && svc.port != 22
-                    && !active_listeners.contains_key(&key)
+                    && !active_listeners.contains_key(&listener_key)
                 {
                     let st_clone = shared.clone();
                     let svc_key = key.clone();
@@ -478,9 +490,17 @@ pub fn spawn_unikernel_dataplane(shared: SharedState) {
                                     crate::ast::RateUnit::Second => Duration::from_secs(1),
                                     crate::ast::RateUnit::Minute => Duration::from_secs(60),
                                 };
+                                if buckets.len() > 4096 {
+                                    buckets.retain(|_, (ts, _)| ts.elapsed() < window);
+                                }
                                 let max_allowed = lim.rate + lim.burst.unwrap_or(0);
+                                let bucket_key = if lim.per_ip {
+                                    client_ip
+                                } else {
+                                    Ipv4Addr::UNSPECIFIED
+                                };
                                 let entry = buckets
-                                    .entry(client_ip)
+                                    .entry(bucket_key)
                                     .or_insert_with(|| (Instant::now(), 0));
                                 if entry.0.elapsed() >= window {
                                     *entry = (Instant::now(), 1);
@@ -546,7 +566,7 @@ pub fn spawn_unikernel_dataplane(shared: SharedState) {
                             });
                         }
                     });
-                    active_listeners.insert(key, handle);
+                    active_listeners.insert(listener_key, handle);
                 }
             }
 

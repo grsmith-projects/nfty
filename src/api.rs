@@ -1,4 +1,4 @@
-use crate::ast::Service;
+use crate::ast::{ApiKeyScope, Service};
 use crate::compiler::{
     apply_vip_commands, compile_nft_ruleset, generate_vip_commands, reload_kernel_from_state,
     validate_config,
@@ -10,17 +10,18 @@ use crate::state::SharedState;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug, Deserialize)]
 pub struct AllowListRequest {
-    /// Optional service key (e.g. "9000" or "192.168.1.240:443"). If omitted, applies to global allow-list.
+    /// Optional service key (e.g. "9000" or "169.254.1.240:443"). If omitted, applies to global allow-list.
     pub service: Option<String>,
-    /// List of hostnames, wildcard hostnames ("*.office.lan"), IP wildcards ("192.168.1.*"), or CIDRs
+    /// List of hostnames, wildcard hostnames ("*.office.lan"), IP wildcards ("169.254.1.*"), or CIDRs
     pub hosts: Vec<String>,
     /// Whether to immediately apply changes to running config & kernel nftables (defaults to true)
     #[serde(default = "default_true")]
@@ -70,6 +71,7 @@ pub struct AllowStatusResponse {
 }
 
 pub fn spawn_api_server(shared: SharedState, bind_addr: String) {
+    let shared_main = shared.clone();
     tokio::spawn(async move {
         let listener = match TcpListener::bind(&bind_addr).await {
             Ok(l) => l,
@@ -77,22 +79,230 @@ pub fn spawn_api_server(shared: SharedState, bind_addr: String) {
         };
         loop {
             if let Ok((stream, _)) = listener.accept().await {
-                let st = shared.clone();
+                let st = shared_main.clone();
                 tokio::spawn(async move {
                     let _ = handle_http_connection(stream, st).await;
                 });
             }
         }
     });
+
+    // Dynamically bind any custom `api:<port>` ports configured on VIPs or Gateways
+    tokio::spawn(async move {
+        let mut bound_ports: HashSet<u16> = HashSet::new();
+        bound_ports.insert(9090);
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let desired_ports = {
+                let Ok(st) = shared.read() else { continue };
+                st.active_config().api_ports()
+            };
+            for port in desired_ports {
+                if bound_ports.contains(&port) {
+                    continue;
+                }
+                let addr = format!("0.0.0.0:{}", port);
+                if let Ok(listener) = TcpListener::bind(&addr).await {
+                    bound_ports.insert(port);
+                    let st_clone = shared.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            if let Ok((stream, _)) = listener.accept().await {
+                                let s = st_clone.clone();
+                                tokio::spawn(async move {
+                                    let _ = handle_http_connection(stream, s).await;
+                                });
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+}
+
+fn extract_api_key_from_request(header_part: &str, query: &str) -> (Option<String>, bool) {
+    let mut is_internal_ipc = false;
+    let mut candidate_key: Option<String> = None;
+
+    for line in header_part.lines().skip(1) {
+        let Some((name, val)) = line.split_once(':') else {
+            continue;
+        };
+        let name_lower = name.trim().to_ascii_lowercase();
+        let val_trimmed = val.trim();
+        match name_lower.as_str() {
+            "x-nfty-internal-ipc" if val_trimmed == "1" => {
+                is_internal_ipc = true;
+            }
+            "x-api-key" | "x-nfty-key" => {
+                if !val_trimmed.is_empty() {
+                    candidate_key = Some(val_trimmed.to_string());
+                }
+            }
+            "authorization" => {
+                if let Some(rest) = val_trimmed
+                    .strip_prefix("Bearer ")
+                    .or_else(|| val_trimmed.strip_prefix("bearer "))
+                    .or_else(|| val_trimmed.strip_prefix("Token "))
+                    .or_else(|| val_trimmed.strip_prefix("token "))
+                {
+                    let tok = rest.trim();
+                    if !tok.is_empty() {
+                        candidate_key = Some(tok.to_string());
+                    }
+                } else if let Some(b64) = val_trimmed
+                    .strip_prefix("Basic ")
+                    .or_else(|| val_trimmed.strip_prefix("basic "))
+                {
+                    if let Some(decoded) = decode_basic_auth_token(b64.trim()) {
+                        candidate_key = Some(decoded);
+                    }
+                } else if !val_trimmed.is_empty() {
+                    candidate_key = Some(val_trimmed.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if candidate_key.is_none() && !query.is_empty() {
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if matches!(k, "key" | "api_key" | "token") && !v.trim().is_empty() {
+                    candidate_key = Some(v.trim().to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    (candidate_key, is_internal_ipc)
+}
+
+fn decode_basic_auth_token(b64: &str) -> Option<String> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut vals = Vec::with_capacity(b64.len());
+    for b in b64.bytes() {
+        if b == b'=' {
+            break;
+        }
+        let pos = TABLE.iter().position(|&c| c == b)?;
+        vals.push(pos as u8);
+    }
+    let mut out = Vec::new();
+    for chunk in vals.chunks(4) {
+        if chunk.len() >= 2 {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+        }
+        if chunk.len() >= 3 {
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        if chunk.len() >= 4 {
+            out.push((chunk[2] << 6) | chunk[3]);
+        }
+    }
+    let s = String::from_utf8(out).ok()?;
+    if let Some((_user, pass)) = s.split_once(':') {
+        if !pass.is_empty() {
+            return Some(pass.to_string());
+        }
+    }
+    if !s.is_empty() {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+pub fn authenticate_api_request(
+    shared: &SharedState,
+    peer_is_loopback: bool,
+    is_internal_ipc: bool,
+    candidate_key: Option<&str>,
+) -> std::result::Result<ApiKeyScope, (u16, String)> {
+    if peer_is_loopback && is_internal_ipc {
+        return Ok(ApiKeyScope::ReadWrite);
+    }
+
+    let st = shared.read().unwrap();
+    let cfg = st.active_config();
+    if let Some(key_str) = candidate_key {
+        match cfg.verify_api_key(key_str) {
+            Some(scope) => return Ok(scope),
+            None => return Err((401, "Invalid API key".to_string())),
+        }
+    }
+
+    let any_keys = cfg.has_any_api_keys();
+    if any_keys || !peer_is_loopback {
+        return Err((
+            401,
+            "API key required (configure 'api:9090 { key new rw }' and pass 'Authorization: Bearer <key>', 'X-API-Key: <key>', or '?key=<key>')".to_string(),
+        ));
+    }
+
+    Ok(ApiKeyScope::ReadWrite)
+}
+
+async fn read_full_http_request(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
+    let mut buf = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    let mut header_end: Option<usize> = None;
+    let mut content_length: usize = 0;
+
+    loop {
+        let read_res = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk)).await;
+        let n = match read_res {
+            Ok(Ok(n)) => n,
+            _ => break,
+        };
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > 4 * 1024 * 1024 {
+            anyhow::bail!("HTTP request payload exceeds 4MB limit");
+        }
+
+        if header_end.is_none() {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let end = pos + 4;
+                header_end = Some(end);
+                let hdr_str = String::from_utf8_lossy(&buf[..pos]);
+                for line in hdr_str.lines().skip(1) {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_length = v.trim().parse::<usize>().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(end) = header_end {
+            if buf.len() >= end + content_length {
+                break;
+            }
+        }
+    }
+
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(buf))
 }
 
 async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> Result<()> {
-    let mut buf = vec![0u8; 65536];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
+    let peer_is_loopback = stream
+        .peer_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false);
+
+    let Some(buf) = read_full_http_request(&mut stream).await? else {
         return Ok(());
-    }
-    let raw = String::from_utf8_lossy(&buf[..n]);
+    };
+    let raw = String::from_utf8_lossy(&buf);
     let (header_part, body_part) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
     let request_line = header_part.lines().next().unwrap_or("");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
@@ -102,14 +312,29 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
     }
     let method = parts[0].to_ascii_uppercase();
     let full_path = parts[1];
-    let (path, _query) = full_path.split_once('?').unwrap_or((full_path, ""));
+    let (path, query) = full_path.split_once('?').unwrap_or((full_path, ""));
 
     if method == "GET" && matches!(path, "/" | "/ui" | "/dashboard" | "/index.html") {
         send_html(&mut stream, 200, READONLY_DASHBOARD_HTML).await?;
         return Ok(());
     }
 
-    let (status, resp_val) = route_api_request(&method, path, body_part.trim(), &shared).await;
+    let (candidate_key, is_internal_ipc) = extract_api_key_from_request(header_part, query);
+    let scope = match authenticate_api_request(
+        &shared,
+        peer_is_loopback,
+        is_internal_ipc,
+        candidate_key.as_deref(),
+    ) {
+        Ok(s) => s,
+        Err((code, msg)) => {
+            send_json(&mut stream, code, &json!({"ok": false, "error": msg})).await?;
+            return Ok(());
+        }
+    };
+
+    let (status, resp_val) =
+        route_api_request_scoped(&method, path, body_part.trim(), &shared, scope).await;
     if matches!(method.as_str(), "POST" | "PUT" | "DELETE") && status == 200 {
         crate::unikernel::persist_to_storage(&shared);
     }
@@ -123,16 +348,59 @@ pub async fn route_api_request(
     body: &str,
     shared: &SharedState,
 ) -> (u16, serde_json::Value) {
+    route_api_request_scoped(method, path, body, shared, ApiKeyScope::ReadWrite).await
+}
+
+pub async fn route_api_request_scoped(
+    method: &str,
+    path: &str,
+    body: &str,
+    shared: &SharedState,
+    scope: ApiKeyScope,
+) -> (u16, serde_json::Value) {
+    if scope == ApiKeyScope::ReadOnly && (method != "GET" || path == "/api/v1/scan") {
+        return (
+            403,
+            json!({
+                "ok": false,
+                "error": "Forbidden: API key has read-only ('ro') scope; write and scan operations require a read-write ('rw') key"
+            }),
+        );
+    }
+
     if let Ok(mut st) = shared.write() {
         st.sync_from_disk_if_changed();
     }
     match (method, path) {
         ("GET", "/api/v1/status") | ("GET", "/status") => {
             let flows = crate::features::read_active_flows(shared);
-            let wg_configs = crate::features::list_saved_wg_configs();
+            let mut wg_configs = crate::features::list_saved_wg_configs();
+            if scope == ApiKeyScope::ReadOnly {
+                for res in wg_configs.values_mut() {
+                    if let Ok(w) = res {
+                        w.private_key = "<redacted>".to_string();
+                        w.preshared_key = w.preshared_key.as_ref().map(|_| "<redacted>".to_string());
+                    }
+                }
+            }
             let st = shared.read().unwrap();
-            let cfg = st.active_config();
-            let nft = compile_nft_ruleset(cfg, Some(&st));
+            let cfg_raw = st.active_config();
+            let cfg = if scope == ApiKeyScope::ReadOnly {
+                cfg_raw.redacted_for_readonly()
+            } else {
+                cfg_raw.clone()
+            };
+            let running_cfg = if scope == ApiKeyScope::ReadOnly {
+                st.running.redacted_for_readonly()
+            } else {
+                st.running.clone()
+            };
+            let candidate_cfg = if scope == ApiKeyScope::ReadOnly {
+                st.candidate.redacted_for_readonly()
+            } else {
+                st.candidate.clone()
+            };
+            let nft = compile_nft_ruleset(&cfg, Some(&st));
             let mut active_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for (k, svc) in &cfg.services {
                 active_map.insert(
@@ -146,8 +414,8 @@ pub async fn route_api_request(
             (
                 200,
                 json!({
-                    "running": st.running,
-                    "candidate": st.candidate,
+                    "running": running_cfg,
+                    "candidate": candidate_cfg,
                     "active_config": cfg,
                     "nftyfile": cfg.format_nftyfile(),
                     "runtime": st.runtime,
@@ -170,7 +438,15 @@ pub async fn route_api_request(
             (200, json!({"ok": true, "discovered": discovered}))
         }
         ("GET", "/api/v1/wg") => {
-            let wg_configs = crate::features::list_saved_wg_configs();
+            let mut wg_configs = crate::features::list_saved_wg_configs();
+            if scope == ApiKeyScope::ReadOnly {
+                for res in wg_configs.values_mut() {
+                    if let Ok(w) = res {
+                        w.private_key = "<redacted>".to_string();
+                        w.preshared_key = w.preshared_key.as_ref().map(|_| "<redacted>".to_string());
+                    }
+                }
+            }
             (200, json!({"ok": true, "wg_configs": wg_configs}))
         }
         ("GET", "/api/v1/cloudflare") | ("GET", "/api/v1/cf") => {
@@ -238,24 +514,37 @@ pub async fn route_api_request(
         }
         ("GET", "/api/v1/config") => {
             let st = shared.read().unwrap();
+            let running_cfg = if scope == ApiKeyScope::ReadOnly {
+                st.running.redacted_for_readonly()
+            } else {
+                st.running.clone()
+            };
+            let candidate_cfg = if scope == ApiKeyScope::ReadOnly {
+                st.candidate.redacted_for_readonly()
+            } else {
+                st.candidate.clone()
+            };
             (
                 200,
                 json!({
-                    "running": st.running,
-                    "candidate": st.candidate,
-                    "nftyfile_running": st.running.format_nftyfile(),
-                    "nftyfile_candidate": st.candidate.format_nftyfile(),
+                    "running": running_cfg,
+                    "candidate": candidate_cfg,
+                    "nftyfile_running": running_cfg.format_nftyfile(),
+                    "nftyfile_candidate": candidate_cfg.format_nftyfile(),
                 }),
             )
         }
         ("PUT", "/api/v1/config") => match parse_nftyfile(body) {
             Ok(mut cfg) => {
+                let prev = {
+                    let st = shared.read().unwrap();
+                    st.running.clone()
+                };
+                let _ = crate::compiler::reconcile_dhcp_and_vlan_vips(&mut cfg);
+                let vip_cmds = generate_vip_commands(&prev, &cfg);
+                let _ = apply_vip_commands(&vip_cmds);
                 {
                     let mut st = shared.write().unwrap();
-                    let prev = st.running.clone();
-                    let _ = crate::compiler::reconcile_dhcp_and_vlan_vips(&mut cfg);
-                    let vip_cmds = generate_vip_commands(&prev, &cfg);
-                    let _ = apply_vip_commands(&vip_cmds);
                     st.history.push(prev);
                     st.candidate = cfg.clone();
                     st.running = cfg;
@@ -304,7 +593,7 @@ pub async fn route_api_request(
             };
             (200, serde_json::to_value(resp).unwrap())
         }
-        // Add or replace allow-list entries (supports wildcards like "*.office.lan", "192.168.1.*", hostnames, CIDRs)
+        // Add or replace allow-list entries (supports wildcards like "*.office.lan", "169.254.1.*", hostnames, CIDRs)
         ("POST", "/api/v1/allow") | ("PUT", "/api/v1/allow") => {
             let req: AllowListRequest = match serde_json::from_str(body) {
                 Ok(r) => r,
@@ -471,12 +760,14 @@ pub async fn route_api_request(
             if !report.valid {
                 return (400, serde_json::to_value(report).unwrap());
             }
+            let (prev, next) = {
+                let st = shared.read().unwrap();
+                (st.running.clone(), st.candidate.clone())
+            };
+            let vip_cmds = generate_vip_commands(&prev, &next);
+            let _ = apply_vip_commands(&vip_cmds);
             {
                 let mut st = shared.write().unwrap();
-                let prev = st.running.clone();
-                let next = st.candidate.clone();
-                let vip_cmds = generate_vip_commands(&prev, &next);
-                let _ = apply_vip_commands(&vip_cmds);
                 st.history.push(prev);
                 st.running = next;
                 st.sync_runtime_entries();
@@ -512,14 +803,24 @@ pub async fn route_api_request(
         }
         ("GET", "/api/v1/services") => {
             let st = shared.read().unwrap();
-            (200, json!({"services": st.candidate.services}))
+            let cfg = if scope == ApiKeyScope::ReadOnly {
+                st.candidate.redacted_for_readonly()
+            } else {
+                st.candidate.clone()
+            };
+            (200, json!({"services": cfg.services}))
         }
         _ if path.starts_with("/api/v1/services/") => {
             let key = path.trim_start_matches("/api/v1/services/");
             match method {
                 "GET" => {
                     let st = shared.read().unwrap();
-                    match st.candidate.services.get(key) {
+                    let cfg = if scope == ApiKeyScope::ReadOnly {
+                        st.candidate.redacted_for_readonly()
+                    } else {
+                        st.candidate.clone()
+                    };
+                    match cfg.services.get(key) {
                         Some(svc) => (200, serde_json::to_value(svc).unwrap()),
                         None => (404, json!({"error": "Service not found"})),
                     }
@@ -557,6 +858,8 @@ async fn send_json(
     let status_text = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "Internal Server Error",
@@ -789,7 +1092,7 @@ const READONLY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <script>
 async function refreshDashboard() {
   try {
-    const res = await fetch('/api/v1/status');
+    const res = await fetch('/api/v1/status' + (window.location.search || ''));
     const data = await res.json();
     const cfg = data.active_config || { services: {}, gateways: {}, global_allow: [] };
     const services = Object.values(cfg.services || {});
