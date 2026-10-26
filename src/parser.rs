@@ -301,11 +301,12 @@ pub fn parse_vip_header(tokens: &[&str]) -> Result<(String, Option<Ipv4Addr>, Vi
                 if idx + 1 < tokens.len()
                     && !matches!(
                         tokens[idx + 1].to_ascii_lowercase().as_str(),
-                        "vlan" | "service" | "services" | "ssh" | "dns" | "api"
+                        "vlan" | "service" | "services" | "ssh" | "dns" | "api" | "web"
                     )
                     && !tokens[idx + 1].starts_with("ssh:")
                     && !tokens[idx + 1].starts_with("dns:")
                     && !tokens[idx + 1].starts_with("api:")
+                    && !tokens[idx + 1].starts_with("web:")
                 {
                     idx += 1;
                     let (base, vid) = split_iface_and_vlan(tokens[idx]);
@@ -945,15 +946,16 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                                 s.vip = Some(updated.clone());
                             }
                             ParseContext::Vip(vip_key)
-                        } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api")
+                        } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api" | "web")
                             || tokens[0].to_ascii_lowercase().starts_with("ssh:")
                             || tokens[0].to_ascii_lowercase().starts_with("dns:")
                             || tokens[0].to_ascii_lowercase().starts_with("api:")
+                            || tokens[0].to_ascii_lowercase().starts_with("web:")
                             || (tokens[0].eq_ignore_ascii_case("local") && tokens.len() >= 2)
                         {
                             let spec_owned: String = if tokens[0].eq_ignore_ascii_case("local") {
                                 tokens[1].to_string()
-                            } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api")
+                            } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api" | "web")
                                 && tokens.len() >= 2
                                 && tokens[1].parse::<u16>().is_ok()
                             {
@@ -1545,6 +1547,36 @@ pub fn create_or_find_vip_service_by_key(
         let mut svc = Service::new(key.clone(), vip_ip_opt, port, Proto::Tcp);
         svc.vip_id = Some(vip_key.to_string());
         svc.name = Some(format!("api:{}", port));
+        svc.vip = vip_cfg;
+        svc.backends.push(Backend {
+            host: None,
+            ip: Ipv4Addr::new(127, 0, 0, 1),
+            port: 9090,
+            weight: 1,
+            backup: false,
+        });
+        config.services.insert(key.clone(), svc);
+        return Ok(key);
+    }
+    if lower == "web" || lower.starts_with("web:") {
+        let port = if let Some((_, p_str)) = lower.split_once(':') {
+            p_str
+                .parse::<u16>()
+                .with_context(|| format!("Invalid Web UI port '{}'", p_str))?
+        } else {
+            8000
+        };
+        if port == 0 {
+            bail!("Web UI port cannot be 0");
+        }
+        let key = format!("{}:{}", vip_key, port);
+        if let Some(existing) = config.services.get_mut(&key) {
+            existing.name = Some(format!("web:{}", port));
+            return Ok(key);
+        }
+        let mut svc = Service::new(key.clone(), vip_ip_opt, port, Proto::Tcp);
+        svc.vip_id = Some(vip_key.to_string());
+        svc.name = Some(format!("web:{}", port));
         svc.vip = vip_cfg;
         svc.backends.push(Backend {
             host: None,
@@ -2282,8 +2314,12 @@ pub fn parse_gateway_service(raw: &str) -> Result<GatewayService> {
             GatewayServiceKind::Api,
             port_opt.unwrap_or(9090),
         )),
+        "web" | "webui" | "ui" => Ok(GatewayService::new(
+            GatewayServiceKind::Web,
+            port_opt.unwrap_or(8000),
+        )),
         other => bail!(
-            "Unknown gateway service '{}' (valid gateway services: 'privoxy[:8118]', 'socks5[:1080]', 'ssh[:22]', 'dns[:53]', 'api[:9090]')",
+            "Unknown gateway service '{}' (valid gateway services: 'privoxy[:8118]', 'socks5[:1080]', 'ssh[:22]', 'dns[:53]', 'api[:9090]', 'web[:8000]')",
             other
         ),
     }

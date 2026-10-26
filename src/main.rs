@@ -968,4 +968,80 @@ vip 169.254.1.4 {
         )
         .is_err());
     }
+
+    #[test]
+    fn test_web_service_with_allowlist_and_roundtrip() {
+        let raw = r#"
+vip 192.168.1.4 {
+    ssh:22
+    web:8000 {
+        allow {
+            192.168.0.0/16
+        }
+    }
+    api:8080 {
+        key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
+    }
+}
+"#;
+        let cfg = parse_nftyfile(raw).unwrap();
+        let formatted = cfg.format_nftyfile();
+        assert!(formatted.contains("web:8000 {"));
+        assert!(formatted.contains("192.168.0.0/16"));
+        let reparsed = parse_nftyfile(&formatted).unwrap();
+        assert_eq!(cfg, reparsed);
+
+        let app_state = AppState::new(cfg.clone(), PathBuf::from("Nftyfile"));
+        let shared: SharedState = Arc::new(RwLock::new(app_state));
+
+        // 1. Client inside 192.168.0.0/16 accessing web:8000 without API key -> ReadWrite allowed
+        assert_eq!(
+            crate::api::authenticate_api_request_with_context(
+                &shared,
+                false,
+                false,
+                None,
+                Some("192.168.1.50".parse().unwrap()),
+                Some(8000),
+            ),
+            Ok(crate::ast::ApiKeyScope::ReadWrite)
+        );
+
+        // 2. Client outside 192.168.0.0/16 accessing web:8000 -> 403 Forbidden
+        assert_eq!(
+            crate::api::authenticate_api_request_with_context(
+                &shared,
+                false,
+                false,
+                None,
+                Some("10.0.0.50".parse().unwrap()),
+                Some(8000),
+            )
+            .unwrap_err()
+            .0,
+            403
+        );
+
+        // 3. Client accessing keyed api:8080 without key -> 401 Unauthorized
+        assert_eq!(
+            crate::api::authenticate_api_request_with_context(
+                &shared,
+                false,
+                false,
+                None,
+                Some("192.168.1.50".parse().unwrap()),
+                Some(8080),
+            )
+            .unwrap_err()
+            .0,
+            401
+        );
+
+        // 4. Compiled nftables ruleset enforces @allow_192_168_1_4_8000 on tcp dport 8000
+        let st = shared.read().unwrap();
+        let nft = compile_nft_ruleset(&cfg, Some(&st));
+        assert!(nft.contains("set allow_192_168_1_4_8000"));
+        assert!(nft.contains("elements = { 192.168.0.0/16 }"));
+        assert!(nft.contains("ip daddr 192.168.1.4 tcp dport 8000 ip saddr @allow_192_168_1_4_8000 counter redirect to :8000"));
+    }
 }
