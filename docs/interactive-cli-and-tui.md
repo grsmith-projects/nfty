@@ -256,7 +256,7 @@ flowchart LR
 
 > [!TIP]
 > **Preventing Remote Lockout with `apply confirm`**
-> Whenever you modify `allow` rules, VLAN tags, or WireGuard `killswitch` settings over a remote SSH session, always use `apply confirm 30`. If the change accidentally drops your SSH packets, `nfty` will automatically restore your previous working configuration after 30 seconds!
+> When modifying `allow` rules, VLAN tags, or WireGuard `killswitch` settings over a remote SSH session, use `apply confirm 30`. If the change drops your SSH connection, `nfty` automatically restores the previous configuration after 30 seconds.
 
 ---
 

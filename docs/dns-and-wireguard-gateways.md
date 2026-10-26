@@ -138,7 +138,7 @@ dns {
   # Standard split-horizon forwarding to an internal Active Directory / CoreDNS server
   forward k8s.internal to 10.96.0.10:53
 
-  # Route DNS queries for a remote private zone through a WireGuard Gateway!
+  # Route DNS queries for a remote private zone through a WireGuard gateway
   forward internal.partner.org to 10.64.0.1 via 169.254.1.10
 }
 ```
@@ -211,7 +211,7 @@ dns {
 
 ## 7. WireGuard Virtual Gateways (`gateway` Block)
 
-A `gateway` block turns `nfty` into a high-performance policy-routed WireGuard router and load balancer. Any machine on your LAN can set its default gateway (or route specific subnets/domains) to the `gateway` IP (e.g., `169.254.1.10`) to have its traffic transparently encrypted and load-balanced across one or more WireGuard tunnels.
+A `gateway` block configures `nfty` as a policy-routed WireGuard router and load balancer. Any machine on the LAN can set its default gateway (or route specific subnets/domains) to the `gateway` IP (e.g., `169.254.1.10`) to have its traffic encrypted and load-balanced across one or more WireGuard tunnels.
 
 ### Managing WireGuard Profiles (`/data/wg/`)
 
