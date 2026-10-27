@@ -54,6 +54,18 @@ pub struct WgUploadRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SshKeyUploadRequest {
+    pub name: String,
+    #[serde(alias = "public_key", alias = "config")]
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SshKeyDeleteRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CloudflareConfigRequest {
     pub api_token: Option<String>,
     pub account_id: Option<String>,
@@ -99,27 +111,32 @@ pub struct AllowStatusResponse {
     pub expanded_service_sets: BTreeMap<String, Vec<String>>,
 }
 
-pub fn spawn_api_server(shared: SharedState, bind_addr: String) {
-    let primary_port = bind_addr.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok());
-    let shared_main = shared.clone();
-    tokio::spawn(async move {
-        let listener = match TcpListener::bind(&bind_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[nfty api] Failed to bind {}: {}", bind_addr, e);
-                return;
-            }
-        };
-        run_api_listener(listener, shared_main).await;
-    });
+pub fn spawn_api_server(shared: SharedState, bind_addr: Option<String>) {
+    let mut primary_port: Option<u16> = None;
+    if let Some(addr) = bind_addr.filter(|s| !s.trim().is_empty()) {
+        primary_port = addr.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok());
+        let shared_main = shared.clone();
+        tokio::spawn(async move {
+            let listener = match TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[nfty api] Failed to bind {}: {}", addr, e);
+                    return;
+                }
+            };
+            run_api_listener(listener, shared_main).await;
+        });
+    }
 
-    // Dynamically bind any custom `api:<port>` ports configured on VIPs or Gateways
+    // Dynamically bind any custom `api:<port>` or `web:<port>` ports configured on VIPs or Gateways
     tokio::spawn(async move {
         let mut listeners: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
             let desired_ports = {
-                let Ok(st) = shared.read() else { continue };
+                let Ok(st) = shared.read() else {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                };
                 st.active_config().api_ports()
             };
             listeners.retain(|port, handle| {
@@ -141,6 +158,7 @@ pub fn spawn_api_server(shared: SharedState, bind_addr: String) {
                     Err(e) => eprintln!("[nfty api] Failed to bind {}: {}", addr, e),
                 }
             }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 }
@@ -806,6 +824,7 @@ pub async fn route_api_request_scoped(
                         .collect(),
                 );
             }
+            let ssh_keys = crate::ssh::list_saved_ssh_keys();
             (
                 200,
                 json!({
@@ -818,6 +837,7 @@ pub async fn route_api_request_scoped(
                     "resolved_hosts": st.resolved_hosts,
                     "flows": flows,
                     "wg_configs": wg_configs,
+                    "ssh_keys": ssh_keys,
                     "kernel_applied": st.kernel_applied,
                     "nft_ruleset": nft,
                 }),
@@ -845,6 +865,37 @@ pub async fn route_api_request_scoped(
                 }
             }
             (200, json!({"ok": true, "wg_configs": wg_configs}))
+        }
+        ("GET", "/api/v1/ssh") => {
+            let ssh_keys = crate::ssh::list_saved_ssh_keys();
+            (200, json!({"ok": true, "ssh_keys": ssh_keys}))
+        }
+        ("POST", "/api/v1/ssh") => {
+            let req: SshKeyUploadRequest = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
+            };
+            match crate::ssh::save_ssh_pubkey_file(&req.name, &req.key) {
+                Ok((filename, parsed)) => (
+                    200,
+                    json!({
+                        "ok": true,
+                        "filename": filename,
+                        "parsed": parsed,
+                    }),
+                ),
+                Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+            }
+        }
+        ("DELETE", "/api/v1/ssh") => {
+            let req: SshKeyDeleteRequest = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
+            };
+            match crate::ssh::delete_ssh_pubkey_file(&req.name) {
+                Ok(filename) => (200, json!({"ok": true, "deleted": filename})),
+                Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+            }
         }
         ("GET", "/api/v1/cloudflare") | ("GET", "/api/v1/cf") => {
             let cf = match crate::features::load_cloudflare_config() {
@@ -1889,7 +1940,7 @@ const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
               <input type="text" id="gw-quick-ip" placeholder="192.168.1.10">
             </div>
             <div class="form-row">
-              <label>Directive (e.g. <code>killswitch on</code>, <code>privoxy:8118</code>, <code>forward 51413 to 192.168.1.50:51413</code>, <code>tunnel ca-van.conf</code>)</label>
+              <label>Directive (e.g. <code>killswitch on</code>, <code>privoxy:8118</code>, <code>forward 51413 to 192.168.1.50:51413</code>, <code>tunnel wg0.conf</code>)</label>
               <input type="text" id="gw-quick-cmd" placeholder="forward 51413 to 192.168.1.50:51413">
             </div>
             <button class="btn btn-success rw-only" onclick="runGatewayQuickCmd()">Apply to Gateway</button>
@@ -2123,12 +2174,12 @@ const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
     <h3>Add or Update VIP Service</h3>
     <p>Configure a forwarded backend service, local <code>web:8000</code> console, <code>api:9090</code>, <code>ssh:22</code>, or <code>dns:53</code> on a Virtual IP.</p>
     <div class="form-row">
-      <label>VIP Address or DHCP Name (e.g. <code>192.168.1.4</code> or <code>sonarr</code>)</label>
+      <label>VIP Address or DHCP Name (e.g. <code>192.168.1.4</code> or <code>web-app</code>)</label>
       <input type="text" id="svc-modal-vip" placeholder="192.168.1.4">
     </div>
     <div class="form-row">
-      <label>Service Spec (e.g. <code>80 to 192.168.3.18:5055</code>, <code>web:8000</code>, <code>api:8080</code>, <code>ssh:22</code>)</label>
-      <input type="text" id="svc-modal-spec" placeholder="80 to 192.168.3.18:5055">
+      <label>Service Spec (e.g. <code>80 to 192.168.20.10:5055</code>, <code>web:8000</code>, <code>api:8080</code>, <code>ssh:22</code>)</label>
+      <input type="text" id="svc-modal-spec" placeholder="80 to 192.168.20.10:5055">
     </div>
     <div class="form-row">
       <label>Optional Allow-List CIDR / Hostname (e.g. <code>192.168.0.0/16</code>)</label>

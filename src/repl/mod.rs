@@ -1,4 +1,5 @@
 pub mod completer;
+pub mod debug;
 pub mod help;
 pub mod status;
 
@@ -32,6 +33,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellLevel {
     Operational,
+    Debug,
     ConfigRoot,
     GlobalAllow,
     Dns,
@@ -50,6 +52,7 @@ impl ShellLevel {
     pub fn prompt(&self) -> String {
         match self {
             ShellLevel::Operational => "nfty> ".to_string(),
+            ShellLevel::Debug => "nfty(debug)# ".to_string(),
             ShellLevel::ConfigRoot => "nfty(config)# ".to_string(),
             ShellLevel::GlobalAllow => "nfty(config-allow)# ".to_string(),
             ShellLevel::Dns => "nfty(config-dns)# ".to_string(),
@@ -73,23 +76,39 @@ pub async fn run_repl(shared: SharedState) -> Result<()> {
     let mut rl = Editor::new()?;
     rl.set_helper(Some(helper));
 
-    let api_bind = shared.read().unwrap().api_bind.clone();
+    let (api_bind, api_ports) = {
+        let st = shared.read().unwrap();
+        (st.api_bind.clone(), st.active_config().api_ports())
+    };
     println!(
         "{}",
         "Welcome to nfty — L4 Service Load Balancer & Port Router for nftables"
             .bold()
             .cyan()
     );
+    if let Some(bind) = api_bind {
+        println!(
+            "1:1 Control API listening on {} (endpoints: /api/v1/allow, /api/v1/cli, /api/v1/status)",
+            format!("http://{}", bind).green().bold()
+        );
+    } else if !api_ports.is_empty() {
+        let ports_str = api_ports
+            .iter()
+            .map(|p| format!(":{}", p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "Control API / Web UI enabled on VIP listener port(s) {}",
+            ports_str.green().bold()
+        );
+    }
     println!(
-        "1:1 Control API listening on {} (endpoints: /api/v1/allow, /api/v1/cli, /api/v1/status)",
-        format!("http://{}", api_bind).green().bold()
-    );
-    println!(
-        "Type {} to enter config mode, {} for live status, {} for live TUI, or {} for help.\n",
+        "Type {} to enter config mode, {} for troubleshooting tools, {} for live status, {} for live TUI, or {} for help.\n",
         "configure".yellow(),
+        "debug".magenta(),
         "status".green(),
         "watch".cyan(),
-        "?".magenta()
+        "?".cyan()
     );
     if std::path::Path::new("/run/nfty-ephemeral-storage").exists() {
         println!(
@@ -134,7 +153,7 @@ pub async fn run_repl(shared: SharedState) -> Result<()> {
                         *lvl = ShellLevel::ConfigRoot;
                         println!("^C (returned to config root)");
                     }
-                    ShellLevel::ConfigRoot => {
+                    ShellLevel::ConfigRoot | ShellLevel::Debug => {
                         *lvl = ShellLevel::Operational;
                         println!("^C (returned to operational mode)");
                     }
@@ -227,14 +246,16 @@ pub async fn handle_line_checked(
                 | ShellLevel::Dns => {
                     ShellLevel::ConfigRoot
                 }
-                ShellLevel::ConfigRoot => ShellLevel::Operational,
+                ShellLevel::ConfigRoot | ShellLevel::Debug => ShellLevel::Operational,
                 ShellLevel::Operational => ShellLevel::Operational,
             };
             return Ok(false);
         }
         "top" => {
             let mut lvl = level.lock().unwrap();
-            if *lvl != ShellLevel::Operational {
+            if *lvl == ShellLevel::Debug {
+                *lvl = ShellLevel::Operational;
+            } else if *lvl != ShellLevel::Operational {
                 *lvl = ShellLevel::ConfigRoot;
             }
             return Ok(false);
@@ -266,7 +287,7 @@ pub async fn handle_line_checked(
                 | ShellLevel::Dns => {
                     *lvl = ShellLevel::ConfigRoot;
                 }
-                ShellLevel::ConfigRoot => {
+                ShellLevel::ConfigRoot | ShellLevel::Debug => {
                     *lvl = ShellLevel::Operational;
                 }
                 ShellLevel::Operational => return Ok(true),
@@ -295,7 +316,13 @@ pub async fn handle_line_checked(
             crate::features::print_flows_table(shared);
             return Ok(false);
         }
-        "wg" | "wireguard" => {
+        "wg" | "wireguard"
+            if cur_level != ShellLevel::Debug
+                || matches!(
+                    tokens.get(1).copied(),
+                    Some("add" | "paste" | "edit" | "rm" | "list")
+                ) =>
+        {
             match crate::features::handle_wg_cli_command(&tokens[1..]) {
                 Ok(Some(saved_filename)) => {
                     if let ShellLevel::Gateway(gw_key) | ShellLevel::GatewayTunnels(gw_key) =
@@ -320,6 +347,22 @@ pub async fn handle_line_checked(
                 Ok(None) => {}
                 Err(e) => return Err(e),
             }
+            return Ok(false);
+        }
+        "ssh-key" | "ssh-keys" | "authorized-keys" => {
+            crate::ssh::handle_ssh_cli_command(&tokens[1..])?;
+            return Ok(false);
+        }
+        "ssh"
+            if matches!(
+                cur_level,
+                ShellLevel::Operational
+                    | ShellLevel::ConfigRoot
+                    | ShellLevel::GlobalAllow
+                    | ShellLevel::Dns
+            ) || (tokens.len() >= 2 && tokens[1].parse::<u16>().is_err()) =>
+        {
+            crate::ssh::handle_ssh_cli_command(&tokens[1..])?;
             return Ok(false);
         }
         "cf" | "cloudflare"
@@ -444,6 +487,27 @@ pub async fn handle_line_checked(
             handle_load(&tokens[1..], shared)?;
             return Ok(false);
         }
+        "ping" => {
+            debug::run_ping_command(&tokens[1..])?;
+            return Ok(false);
+        }
+        "traceroute" | "tracepath" => {
+            debug::run_traceroute_command(&tokens[1..])?;
+            return Ok(false);
+        }
+        "arping" => {
+            debug::run_arping_command(&tokens[1..])?;
+            return Ok(false);
+        }
+        "debug" | "troubleshoot" | "diag" => {
+            if tokens.len() == 1 {
+                *level.lock().unwrap() = ShellLevel::Debug;
+            } else {
+                let sub = tokens[1..].join(" ");
+                debug::handle_debug_command(&sub, level, shared).await?;
+            }
+            return Ok(false);
+        }
         _ => {}
     }
 
@@ -458,13 +522,17 @@ pub async fn handle_line_checked(
             }
             _ => {
                 bail!(
-                    "Unknown command '{}'. Type {} to enter configuration mode or {} for help.",
+                    "Unknown command '{}'. Type {} to enter configuration mode, {} for troubleshooting, or {} for help.",
                     cmd,
                     "configure".yellow(),
-                    "?".magenta()
+                    "debug".magenta(),
+                    "?".cyan()
                 );
             }
         },
+        ShellLevel::Debug => {
+            debug::handle_debug_command(trimmed, level, shared).await?;
+        }
         ShellLevel::ConfigRoot => {
             handle_config_root_command(trimmed, level, shared)?;
         }

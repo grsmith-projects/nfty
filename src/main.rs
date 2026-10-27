@@ -42,9 +42,9 @@ struct Cli {
     #[arg(short, long, default_value = "Nftyfile")]
     file: PathBuf,
 
-    /// Bind address for the 1:1 HTTP/JSON Control API
-    #[arg(long, default_value = "0.0.0.0:9090")]
-    api_bind: String,
+    /// Optional explicit bind address for the HTTP/JSON Control API (otherwise only `api:<port>` / `web:<port>` in Nftyfile are bound)
+    #[arg(long)]
+    api_bind: Option<String>,
 
     /// Bind address for the embedded SSH2 appliance server
     #[arg(long, default_value = "0.0.0.0:22")]
@@ -153,9 +153,11 @@ async fn main() -> Result<()> {
     if app_state.controller_is_authoritative {
         app_state.running = Config::new();
     }
-    // Boot still applies the dataplane; listeners without an allow-list stay locked at request time.
-    for error in app_state.candidate.control_allow_list_errors() {
-        eprintln!("nfty: web/API access blocked: {}", error);
+    if !cli.ssh_session && cli.command.is_none() {
+        // Boot still applies the dataplane; listeners without an allow-list stay locked at request time.
+        for error in app_state.candidate.control_allow_list_errors() {
+            eprintln!("nfty: web/API access blocked: {}", error);
+        }
     }
 
     // Load persisted wildcard host resolutions from /data/hosts.json if present
@@ -226,11 +228,15 @@ async fn main() -> Result<()> {
                 apply_config(&mut st, next)?;
             }
             persist_to_storage(&shared)?;
-            println!(
-                "nfty daemon running (API: http://{}, Config: {})",
-                cli.api_bind,
-                effective_file.display()
-            );
+            if let Some(ref bind) = cli.api_bind {
+                println!(
+                    "nfty daemon running (API: http://{}, Config: {})",
+                    bind,
+                    effective_file.display()
+                );
+            } else {
+                println!("nfty daemon running (Config: {})", effective_file.display());
+            }
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
@@ -1317,7 +1323,7 @@ vip 192.168.1.4 {
         assert_eq!(control_auth(&shared, "10.0.0.50", 8000).unwrap_err().0, 403);
         // Allow-listed but keyed: a key is still required.
         assert_eq!(control_auth(&shared, "192.168.1.50", 8080).unwrap_err().0, 401);
-        // A port with no web/api listener (e.g. the default --api-bind 0.0.0.0:9090) is closed to remote clients.
+        // A port with no web/api listener is closed to remote clients.
         assert_eq!(control_auth(&shared, "192.168.1.50", 9090).unwrap_err().0, 403);
     }
 
@@ -1536,5 +1542,39 @@ gateway 192.168.1.10 {
         assert!(nft.contains("meta pkttype { broadcast, multicast } drop"));
         assert!(nft.contains("oifname { \"eth0\", \"mv-*\" } ip daddr { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } drop"));
         assert!(nft.contains("oifname \"eth0\" ip saddr != 127.0.0.0/8 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter masquerade comment \"nfty:direct-gw-nat\""));
+    }
+
+    #[tokio::test]
+    async fn test_debug_mode_and_non24_prefix_persistence() {
+        let state = AppState::new(Config::new(), PathBuf::from("Nftyfile"));
+        assert_eq!(state.api_bind, None);
+
+        let shared: SharedState = Arc::new(RwLock::new(state));
+        let level = Arc::new(Mutex::new(ShellLevel::Operational));
+
+        handle_line("debug", &level, &shared).await;
+        assert_eq!(*level.lock().unwrap(), ShellLevel::Debug);
+        assert_eq!(level.lock().unwrap().prompt(), "nfty(debug)# ");
+
+        handle_line("..", &level, &shared).await;
+        assert_eq!(*level.lock().unwrap(), ShellLevel::Operational);
+
+        handle_line("debug", &level, &shared).await;
+        assert_eq!(*level.lock().unwrap(), ShellLevel::Debug);
+
+        handle_line("configure", &level, &shared).await;
+        assert_eq!(*level.lock().unwrap(), ShellLevel::ConfigRoot);
+
+        handle_line("vip 192.168.1.4/21", &level, &shared).await;
+        handle_line("ssh:22", &level, &shared).await;
+        handle_line("..", &level, &shared).await;
+        handle_line("gateway 192.168.1.10/21", &level, &shared).await;
+        handle_line("ssh:22", &level, &shared).await;
+
+        let formatted = shared.read().unwrap().candidate.format_nftyfile();
+        assert!(
+            formatted.contains("interface eth0/21"),
+            "Formatted Nftyfile must always preserve non-/24 prefix: {formatted}"
+        );
     }
 }

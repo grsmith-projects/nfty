@@ -20,6 +20,8 @@
 
 ## 1. Enabling `web:<port>` vs. `api:<port>`
 
+By default, **`nfty` does not bind any Control API or Web Console port** unless you explicitly declare `web:<port>` or `api:<port>` inside a `vip` or `gateway` block in `/data/Nftyfile` (or pass `--api-bind <ip:port>` on the daemon CLI).
+
 `nfty` enforces a strict separation between the interactive Web Console (`web:<port>`) and the headless JSON Control API (`api:<port>`):
 
 - **`web:<port>`** (default `:8000`): Serves the interactive 8-tab JavaScript Web Console (`GET /`, `/ui`, `/dashboard`, `/index.html`) plus the `/api/v1/*` endpoints it calls. Requires an IP/CIDR `allow` list (e.g. `allow { 192.168.0.0/16 }`) so allowed operators can use the web frontend directly in their browser.
@@ -53,8 +55,8 @@ vip 192.168.1.4/21 {
     key nfty_ro_5a2d949e15250c395c4b9683833c5bc3 ro
   }
 
-  seer:5055 {
-    hostname seer.local
+  app-backend:5055 {
+    hostname app.local
     check tcp 5s
   }
 }
@@ -554,6 +556,25 @@ curl -s -X POST \
     "config": "[Interface]\nPrivateKey = YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=\nAddress = 10.64.0.2/32\n\n[Peer]\nPublicKey = YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI=\nEndpoint = 198.51.100.10:51820\nAllowedIPs = 0.0.0.0/0\n"
   }' \
   http://192.168.1.4:9090/api/v1/wg
+```
+
+---
+
+### `GET /api/v1/ssh`, `POST /api/v1/ssh` & `DELETE /api/v1/ssh`
+
+- **`GET /api/v1/ssh`** (`ro` or `rw`): Lists all saved global OpenSSH authorized public keys in `/data/ssh/*.pub` along with their algorithm, `SHA256:...` fingerprint, and comment.
+- **`POST /api/v1/ssh`** (`rw` only): Validates and saves an OpenSSH public key (`ssh-ed25519`, `ecdsa-sha2-*`, or `ssh-rsa`) to `/data/ssh/<name>.pub`.
+- **`DELETE /api/v1/ssh`** (`rw` only): Removes `/data/ssh/<name>.pub`.
+
+**Example (`POST /api/v1/ssh`):**
+```bash
+curl -s -X POST \
+  -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
+  -d '{
+    "name": "workstation",
+    "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ admin@workstation.example.com"
+  }' \
+  http://192.168.1.4:9090/api/v1/ssh
 ```
 
 ---

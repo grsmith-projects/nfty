@@ -474,20 +474,18 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
             .args(["addr", "replace", "127.0.0.1/8", "dev", "lo"])
             .status();
 
-        let primary_iface = ensure_primary_eth0_up();
-
-        // Automatically acquire IPv4 address via DHCP on eth0
-        if Path::new("/bin/udhcpc").exists() && Path::new(&format!("/sys/class/net/{}", primary_iface)).exists() {
-            let pid_file = format!("/run/udhcpc-{}.pid", primary_iface);
-            let _ = Command::new("/bin/udhcpc")
-                .args(["-i", &primary_iface, "-p", &pid_file, "-s", "/bin/udhcpc-hook", "-b", "-q"])
-                .status();
-        }
+        // Bring physical link(s) up without acquiring an unconfigured base OS IP;
+        // all IPv4 addresses (static or DHCP) are bound strictly from Nftyfile.
+        let _ = ensure_primary_eth0_up();
     }
 
-    // Enable kernel IPv4 packet forwarding and disable ICMP redirects / ARP flux on shared bridges
+    // Enable kernel IPv4 packet forwarding, secondary IP promotion, and disable ICMP redirects / ARP flux
     let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1\n");
     for scope in ["all", "default", "eth0"] {
+        let _ = fs::write(
+            format!("/proc/sys/net/ipv4/conf/{}/promote_secondaries", scope),
+            "1\n",
+        );
         let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", scope), "1\n");
         let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_announce", scope), "2\n");
         let _ = fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_filter", scope), "1\n");
@@ -498,6 +496,8 @@ pub fn init_unikernel_appliance() -> Option<PathBuf> {
     let default_seed = "gateway default {\n    dhcp eth0\n    ssh:22\n}\n";
     let data_dir = Path::new("/data");
     if data_dir.exists() && data_dir.is_dir() {
+        let _ = fs::create_dir_all(data_dir.join("wg"));
+        let _ = fs::create_dir_all(data_dir.join("ssh"));
         let persistent_cfg = data_dir.join("Nftyfile");
         let is_empty = fs::read_to_string(&persistent_cfg)
             .map(|s| s.trim().is_empty())
@@ -716,16 +716,22 @@ fn send_controller_request(bind: &str, method: &str, path: &str, body: &str) -> 
 }
 
 fn notify_controller(shared: &SharedState) -> Result<()> {
-    let (bind, body, authoritative) = {
+    let (ipc_addr, body, authoritative) = {
         let st = shared.read().unwrap();
-        (st.api_bind.clone(), st.running.format_nftyfile(), st.controller_is_authoritative)
+        (st.controller_ipc_addr(), st.running.format_nftyfile(), st.controller_is_authoritative)
     };
     if !authoritative {
-        if let Err(e) = send_controller_request(&bind, "PUT", "/api/v1/config", &body) {
-            if !pid1_is_nfty() && is_connection_refused(&e) {
-                return Ok(());
+        if let Some(bind) = ipc_addr {
+            if let Err(e) = send_controller_request(&bind, "PUT", "/api/v1/config", &body) {
+                if !pid1_is_nfty() && is_connection_refused(&e) {
+                    return Ok(());
+                }
+                return Err(e);
             }
-            return Err(e);
+        } else if pid1_is_nfty() && std::process::id() != 1 {
+            unsafe {
+                libc::kill(1, libc::SIGHUP);
+            }
         }
     }
     Ok(())
@@ -736,17 +742,19 @@ pub(crate) fn notify_controller_host_mapping(
     host: &str,
     ips: &[Ipv4Addr],
 ) -> Result<()> {
-    let (bind, authoritative) = {
+    let (ipc_addr, authoritative) = {
         let st = shared.read().unwrap();
-        (st.api_bind.clone(), st.controller_is_authoritative)
+        (st.controller_ipc_addr(), st.controller_is_authoritative)
     };
     if !authoritative {
-        let body = serde_json::json!({"host": host, "ips": ips}).to_string();
-        if let Err(e) = send_controller_request(&bind, "PUT", "/api/v1/allow/hosts", &body) {
-            if !pid1_is_nfty() && is_connection_refused(&e) {
-                return Ok(());
+        if let Some(bind) = ipc_addr {
+            let body = serde_json::json!({"host": host, "ips": ips}).to_string();
+            if let Err(e) = send_controller_request(&bind, "PUT", "/api/v1/allow/hosts", &body) {
+                if !pid1_is_nfty() && is_connection_refused(&e) {
+                    return Ok(());
+                }
+                return Err(e);
             }
-            return Err(e);
         }
     }
     Ok(())
@@ -759,10 +767,13 @@ pub(crate) fn dispatch_backend_drain_state(
 ) -> Result<()> {
     let bind = {
         let mut st = shared.write().unwrap();
-        if st.controller_is_authoritative {
+        if st.controller_is_authoritative
+            || (st.controller_ipc_addr().is_none() && !pid1_is_nfty())
+        {
             return crate::compiler::set_backend_drain_state(&mut st, endpoints, drained);
         }
-        st.api_bind.clone()
+        st.controller_ipc_addr()
+            .ok_or_else(|| anyhow::anyhow!("No controller API listener is active to dispatch backend state update"))?
     };
 
     let path = if drained {
@@ -835,7 +846,7 @@ mod controller_dispatch_tests {
         });
 
         let mut state = AppState::new(crate::ast::Config::new(), PathBuf::from("Nftyfile"));
-        state.api_bind = addr.to_string();
+        state.api_bind = Some(addr.to_string());
         state
             .runtime
             .insert("192.0.2.21:80".to_string(), Default::default());

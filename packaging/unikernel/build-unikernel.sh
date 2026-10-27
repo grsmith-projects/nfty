@@ -127,9 +127,10 @@ rm -f "$STAGE_DIR"/.PKGINFO "$STAGE_DIR"/.SIGN.* "$STAGE_DIR"/.post-*
 if [[ -f "$STAGE_DIR/bin/busybox.static" ]]; then
     mv "$STAGE_DIR/bin/busybox.static" "$STAGE_DIR/bin/busybox"
     chmod +x "$STAGE_DIR/bin/busybox"
-    for applet in ping mount umount udhcpc ifconfig route arping vi ls cat rm mkdir sleep dmesg uname; do
+    for applet in ping traceroute nslookup netstat arp arping nc mount umount udhcpc ifconfig route vi ls cat rm mkdir sleep dmesg uname ps free uptime head tail; do
         ln -sf /bin/busybox "$STAGE_DIR/bin/$applet"
         ln -sf /bin/busybox "$STAGE_DIR/sbin/$applet"
+        ln -sf /bin/busybox "$STAGE_DIR/usr/bin/$applet"
     done
 fi
 
@@ -328,7 +329,7 @@ truncate -s 128M "$DATA_PART"
 mkfs.ext4 -q -F -L "nfty-data" -d "$WORK_DIR/data-seed" "$DATA_PART"
 
 KERNEL_IMG="$WORK_DIR/kern/vmlinuz"
-BOOTARGS="console=tty0 console=ttyS0,115200n8 quiet rdinit=/init -- --unikernel --file /data/Nftyfile --api-bind 0.0.0.0:9090"
+BOOTARGS="console=tty0 console=ttyS0,115200n8 quiet rdinit=/init -- --unikernel --file /data/Nftyfile"
 
 cat > "$WORK_DIR/grub.cfg" <<EOF
 serial --unit=0 --speed=115200

@@ -113,7 +113,7 @@ pub struct AppState {
     pub last_applied_nft: String,
     pub last_disk_nftyfile: String,
     pub kernel_applied: bool,
-    pub api_bind: String,
+    pub api_bind: Option<String>,
     pub controller_is_authoritative: bool,
 }
 
@@ -134,11 +134,25 @@ impl AppState {
             last_applied_nft: String::new(),
             last_disk_nftyfile: initial_txt,
             kernel_applied: false,
-            api_bind: "127.0.0.1:9090".to_string(),
+            api_bind: None,
             controller_is_authoritative: false,
         };
         s.sync_runtime_entries();
         s
+    }
+
+    pub fn controller_ipc_addr(&self) -> Option<String> {
+        if let Some(ref bind) = self.api_bind {
+            if !bind.trim().is_empty() {
+                return Some(bind.clone());
+            }
+        }
+        self.running
+            .api_ports()
+            .into_iter()
+            .chain(self.candidate.api_ports())
+            .next()
+            .map(|p| format!("127.0.0.1:{}", p))
     }
 
     /// Returns the committed configuration, including when it is empty.

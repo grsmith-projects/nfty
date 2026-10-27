@@ -239,7 +239,7 @@ case "$BOARD" in
     coolpi-4b)     DEFAULT_DTB="rk3588s-coolpi-4b.dtb" ;;
 esac
 
-BOOTARGS="console=ttyS2,1500000n8 console=ttyFIQ0,1500000n8 console=tty0 earlycon=uart8250,mmio32,0xfeb50000 rdinit=/init -- --unikernel --file /data/Nftyfile --api-bind 0.0.0.0:9090"
+BOOTARGS="console=ttyS2,1500000n8 console=ttyFIQ0,1500000n8 console=tty0 earlycon=uart8250,mmio32,0xfeb50000 rdinit=/init -- --unikernel --file /data/Nftyfile"
 
 cat > "$WORK_DIR/extlinux.conf" <<EOF
 timeout 10

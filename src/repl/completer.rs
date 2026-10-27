@@ -88,6 +88,21 @@ impl NftyHelper {
         list.sort();
         list
     }
+
+    fn ssh_pub_files(&self) -> Vec<String> {
+        let mut list = Vec::new();
+        let dir = crate::ssh::ssh_keys_dir();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.ends_with(".pub") {
+                    list.push(name);
+                }
+            }
+        }
+        list.sort();
+        list
+    }
 }
 
 impl Completer for NftyHelper {
@@ -198,6 +213,18 @@ impl Completer for NftyHelper {
                         .collect();
                     return Ok((start_pos, matches));
                 }
+                "ssh" | "ssh-key" | "ssh-keys" => {
+                    let list = vec!["list", "add", "edit", "paste", "vi", "show", "rm", "key"];
+                    let matches = list
+                        .into_iter()
+                        .filter(|c| c.starts_with(prefix))
+                        .map(|c| Pair {
+                            display: c.to_string(),
+                            replacement: c.to_string(),
+                        })
+                        .collect();
+                    return Ok((start_pos, matches));
+                }
                 "cf" | "cloudflare" => {
                     let list = vec![
                         "status",
@@ -255,6 +282,58 @@ impl Completer for NftyHelper {
                         .collect();
                     return Ok((start_pos, matches));
                 }
+                "ping" | "traceroute" | "tracepath" | "arping" => {
+                    let mut list = self.known_hosts();
+                    list.push("1.1.1.1".to_string());
+                    list.push("8.8.8.8".to_string());
+                    let matches = list
+                        .into_iter()
+                        .filter(|c| c.starts_with(prefix))
+                        .map(|c| Pair {
+                            display: c.clone(),
+                            replacement: c,
+                        })
+                        .collect();
+                    return Ok((start_pos, matches));
+                }
+                "tcp" => {
+                    let list = self.known_host_ports();
+                    let matches = list
+                        .into_iter()
+                        .filter(|c| c.starts_with(prefix))
+                        .map(|c| Pair {
+                            display: c.clone(),
+                            replacement: c,
+                        })
+                        .collect();
+                    return Ok((start_pos, matches));
+                }
+                "debug" | "troubleshoot" | "diag" => {
+                    let list = vec![
+                        "ping",
+                        "traceroute",
+                        "tcp",
+                        "dns",
+                        "arping",
+                        "interfaces",
+                        "routes",
+                        "arp",
+                        "sockets",
+                        "wg",
+                        "nft",
+                        "flows",
+                        "dmesg",
+                    ];
+                    let matches = list
+                        .into_iter()
+                        .filter(|c| c.starts_with(prefix))
+                        .map(|c| Pair {
+                            display: c.to_string(),
+                            replacement: c.to_string(),
+                        })
+                        .collect();
+                    return Ok((start_pos, matches));
+                }
                 "adopt" => {
                     let st = self.state.read().unwrap();
                     let mut list = Vec::new();
@@ -298,6 +377,31 @@ impl Completer for NftyHelper {
                 })
                 .collect();
             return Ok((start_pos, matches));
+        } else if (word_idx == 2 || word_idx == 3)
+            && matches!(cmd0.as_str(), "ssh" | "ssh-key" | "ssh-keys")
+        {
+            if word_idx == 2 && matches!(cmd1.as_str(), "key" | "keys") {
+                let list = vec!["list", "add", "edit", "paste", "vi", "show", "rm"];
+                let matches = list
+                    .into_iter()
+                    .filter(|c| c.starts_with(prefix))
+                    .map(|c| Pair {
+                        display: c.to_string(),
+                        replacement: c.to_string(),
+                    })
+                    .collect();
+                return Ok((start_pos, matches));
+            }
+            let files = self.ssh_pub_files();
+            let matches = files
+                .into_iter()
+                .filter(|c| c.starts_with(prefix))
+                .map(|c| Pair {
+                    display: c.clone(),
+                    replacement: c,
+                })
+                .collect();
+            return Ok((start_pos, matches));
         } else if word_idx >= 2 && cmd0 == "adopt" {
             if words.get(word_idx.saturating_sub(1)).copied() == Some("vip") {
                 let st = self.state.read().unwrap();
@@ -332,10 +436,15 @@ impl Completer for NftyHelper {
                 "adopt",
                 "bootstrap",
                 "configure",
+                "debug",
+                "ping",
+                "traceroute",
+                "arping",
                 "status",
                 "flows",
                 "dns",
                 "wg",
+                "ssh",
                 "cf",
                 "watch",
                 "probe",
@@ -345,6 +454,34 @@ impl Completer for NftyHelper {
                 "password",
                 "help",
                 "exit",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            (ShellLevel::Debug, 0) => vec![
+                "ping",
+                "traceroute",
+                "tcp",
+                "dns",
+                "arping",
+                "interfaces",
+                "routes",
+                "arp",
+                "sockets",
+                "wg",
+                "nft",
+                "flows",
+                "conntrack",
+                "dmesg",
+                "probe",
+                "status",
+                "watch",
+                "show",
+                "configure",
+                "..",
+                "up",
+                "exit",
+                "help",
             ]
             .into_iter()
             .map(String::from)
@@ -363,6 +500,7 @@ impl Completer for NftyHelper {
                 "show",
                 "flows",
                 "wg",
+                "ssh",
                 "cf",
                 "diff",
                 "test",

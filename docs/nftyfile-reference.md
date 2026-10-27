@@ -113,7 +113,7 @@ A `vip` block provisions a Virtual IP address on the appliance and groups all lo
 
 ### 3.1 Static IPv4 VIPs
 
-When the `vip` identifier is an IPv4 address (with an optional `/prefix`), `nfty` binds that static IP directly to the target network interface using `ip addr replace <ip>/<prefix> dev <iface>`. If the `/prefix` is omitted, `nfty` automatically detects the primary subnet mask of `eth0` (defaulting to `/24`).
+When the `vip` identifier is an IPv4 address (with an optional `/prefix`), `nfty` binds that static IP directly to the target network interface using `ip addr replace <ip>/<prefix> dev <iface>`. All IP addresses on the appliance are strictly driven by `/data/Nftyfile` (the base OS does not hold an unconfigured DHCP lease on `eth0`), and non-`/24` prefixes (such as `/21`) are explicitly preserved via `interface eth0/<prefix>` when `Nftyfile` is formatted.
 
 ```hcl
 vip 192.168.10.10/24 {
@@ -188,7 +188,7 @@ vip 10.20.0.10/24 {
 
 ### 3.5 `web:<port>` (Web Console) and `api:<port>` (Headless JSON API) Inside a VIP
 
-`nfty` enforces strict separation between `web:<port>` and `api:<port>`:
+No Control API or Web Console port is bound by default unless declared via `web:<port>` or `api:<port>` in `Nftyfile` (or `--api-bind`). `nfty` enforces strict separation between `web:<port>` and `api:<port>`:
 - **`web:<port>`** serves the interactive 8-tab HTML/JS Web Console (`GET /`) and requires an IP `allow` list (e.g., `allow { 192.168.0.0/16 }`).
 - **`api:<port>`** serves only the headless JSON Control API (`/api/v1/*`), requires an IP `allow` list, and is further secured with scoped `ro` or `rw` API keys.
 
@@ -196,6 +196,7 @@ Every `web:` and `api:` listener must be covered by at least one IP, CIDR, or IP
 
 ```hcl
 vip 192.168.1.4/21 {
+    interface eth0/21
     ssh:22
     web:8000 {
         allow {
