@@ -11,7 +11,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -255,13 +255,17 @@ struct PtySession {
 struct NftySshServer {
     sessions: Arc<Mutex<HashMap<ChannelId, PtySession>>>,
     pending_dims: Arc<Mutex<HashMap<ChannelId, (u32, u32)>>>,
+    config_path: PathBuf,
+    api_bind: String,
 }
 
 impl NftySshServer {
-    fn new() -> Self {
+    fn new(config_path: PathBuf, api_bind: String) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_dims: Arc::new(Mutex::new(HashMap::new())),
+            config_path,
+            api_bind,
         }
     }
 }
@@ -269,7 +273,7 @@ impl NftySshServer {
 impl russh::server::Server for NftySshServer {
     type Handler = Self;
     fn new_client(&mut self, _peer_addr: Option<std::net::SocketAddr>) -> Self {
-        Self::new()
+        Self::new(self.config_path.clone(), self.api_bind.clone())
     }
 }
 
@@ -357,6 +361,10 @@ impl Handler for NftySshServer {
         // Spawn `/bin/nfty --ssh-session` attached to the slave PTY
         let mut cmd = Command::new(exe);
         cmd.arg("--ssh-session")
+            .arg("--file")
+            .arg(&self.config_path)
+            .arg("--api-bind")
+            .arg(&self.api_bind)
             .env("TERM", "xterm-256color");
 
         unsafe {
@@ -500,7 +508,7 @@ pub fn load_or_create_ssh_host_key() -> KeyPair {
     kp
 }
 
-pub fn spawn_ssh_server(bind_addr: String) {
+pub fn spawn_ssh_server(bind_addr: String, config_path: PathBuf, api_bind: String) {
     // Ensure default auth config and persistent SSH host key exist on boot
     let _ = load_auth_config();
     let _ = load_or_create_ssh_host_key();
@@ -512,7 +520,7 @@ pub fn spawn_ssh_server(bind_addr: String) {
             config.inactivity_timeout = Some(std::time::Duration::from_secs(3600));
             let config = Arc::new(config);
 
-            let mut server = NftySshServer::new();
+            let mut server = NftySshServer::new(config_path.clone(), api_bind.clone());
             if let Err(e) = server.run_on_address(config, bind_addr.as_str()).await {
                 eprintln!("[nfty-ssh] SSH listener error on {}: {} (retrying in 1s)", bind_addr, e);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;

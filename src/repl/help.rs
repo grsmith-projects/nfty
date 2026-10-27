@@ -81,15 +81,15 @@ pub fn print_context_help(level: &ShellLevel) {
                 "scan [host|subnet]".yellow()
             );
             println!(
-                "  {:<32} Adopt discovered service (e.g. 'adopt 1' or 'adopt sonarr vip 169.254.1.4')",
+                "  {:<32} Adopt discovered service (e.g. 'adopt 1' or 'adopt sonarr vip 192.168.1.4')",
                 "adopt <# | name> [vip <vip>]".yellow()
             );
             println!(
-                "  {:<32} Create/enter a static or DHCP VIP container (e.g. 'vip 169.254.1.4' or 'vip sonarr')",
+                "  {:<32} Create/enter a static or DHCP VIP container (e.g. 'vip 192.168.1.4' or 'vip sonarr')",
                 "vip <ipv4[/cidr]|name>".yellow()
             );
             println!(
-                "  {:<32} Create/enter a Virtual Gateway (static IP or DHCP, e.g. 'gateway 169.254.1.10' or 'gateway mullvad')",
+                "  {:<32} Create/enter a Virtual Gateway (static IP or DHCP, e.g. 'gateway 192.168.1.10' or 'gateway mullvad')",
                 "gateway <ipv4[/cidr]|name>".yellow()
             );
             println!(
@@ -101,7 +101,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 "bootstrap <ip[/24]>...".yellow()
             );
             println!(
-                "  {:<32} Enter global allow-list block (supports wildcards e.g. '*.office.lan', '169.254.1.*')",
+                "  {:<32} Enter global allow-list block (supports wildcards e.g. '*.office.lan', '192.168.1.*')",
                 "allow [pattern...]".yellow()
             );
             println!(
@@ -265,7 +265,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 "<*.domain.tld>".yellow()
             );
             println!(
-                "  {:<32} Allow IP wildcard (e.g. '169.254.1.*')",
+                "  {:<32} Allow IP wildcard (e.g. '192.168.1.*')",
                 "<a.b.c.*>".yellow()
             );
             println!(
@@ -441,7 +441,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 .cyan()
             );
             println!(
-                "  {:<32} Add backend (e.g. 'plex:32400' or '169.254.1.60:9000')",
+                "  {:<32} Add backend (e.g. 'plex:32400' or '192.168.1.60:9000')",
                 "<ip|host[:port]>".yellow()
             );
             println!(
@@ -471,7 +471,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 .cyan()
             );
             println!(
-                "  {:<32} Allow wildcard domain, IP wildcard, host, or CIDR (e.g. '*.office.lan', '169.254.1.*')",
+                "  {:<32} Allow wildcard domain, IP wildcard, host, or CIDR (e.g. '*.office.lan', '192.168.1.*')",
                 "<pattern>".yellow()
             );
             println!("  {:<32} Remove source pattern", "no <pattern>".yellow());

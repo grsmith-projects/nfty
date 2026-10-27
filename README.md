@@ -9,20 +9,20 @@
   - Compiles L4 TCP/UDP port forwarding and weighted `numgen inc mod` (`round-robin`) or `ip saddr` (`sticky`) load balancing into atomic `nft -f` transactions.
   - Provides a userspace L7 reverse proxy for HTTP `Host` and TLS `SNI` routing (`hostname <name>.local`) paired with a multicast mDNS responder (`224.0.0.251:5353`).
 - **Static, VLAN, and DHCP Virtual IPs**:
-  - Binds static VIPs (`vip 169.254.10.10/24`) to host interfaces or 802.1Q VLAN sub-interfaces (`vlan 20`).
+  - Binds static VIPs (`vip 192.168.10.10/24`) to host interfaces or 802.1Q VLAN sub-interfaces (`vlan 20`).
   - Provisions dedicated `macvlan` interfaces with deterministic MAC addresses and `udhcpc` leases for hostname-based DHCP VIPs (`vip web-frontend { dhcp eth0 }`), registering the hostname directly with upstream router DNS.
 - **Internet NAT and WireGuard Egress Gateways**:
-  - Binds static or DHCP virtual gateway IPs (`gateway 169.254.10.20` or `gateway lan-exit dhcp eth0`) that LAN machines or containers can use as their default IPv4 gateway (`ip route replace default via ...`).
+  - Binds static or DHCP virtual gateway IPs (`gateway 192.168.10.20` or `gateway lan-exit dhcp eth0`) that LAN machines or containers can use as their default IPv4 gateway (`ip route replace default via ...`).
   - **Direct Internet Gateway Mode**: When configured without WireGuard tunnels, `nfty` masquerades forwarded LAN traffic directly out the primary WAN/LAN interface (`eth0`), enforces optional source `allow` ACLs, and exposes built-in `privoxy:<port>` (HTTP/HTTPS `CONNECT`) and `socks5:<port>` proxies.
   - **WireGuard Multi-Tunnel Mode**: Aggregates one or more WireGuard `.conf` tunnels under the gateway IP using kernel `fwmark` policy routing (`ip rule` + per-tunnel routing tables), `ct mark` connection pinning, `killswitch on`, and inbound tunnel port forwarding (`forward <port> to <host:port>`).
 - **Programmable DNS Endpoint (`dnsmasq` + `nftset`)**:
-  - Supervises a native `dnsmasq` endpoint (`dns:53` on VIPs/gateways or global `dns { ... }`) that automatically synthesizes forward (`A`) and reverse (`PTR`) records from configured VIPs, gateways, `/etc/hosts`, and discovered LAN services, and dynamically removes unhealthy backends from DNS responses (`health-aware on`).
+  - Supervises a native `dnsmasq` endpoint (`dns:53` on VIPs/gateways or global `dns { ... }`) that synthesizes records from configured VIPs, gateways, and registered or resolved hosts, and dynamically removes unhealthy backends from DNS responses (`health-aware on`). Scans do not register hosts.
   - Supports authoritative `a`, `aaaa`, wildcard `address`, `cname`, `txt`, `srv`, `mx`, and `ptr` records, split-horizon conditional zone forwarding (`forward <domain> <server> [via <gateway>]`), and domain sinkholing (`block` / `blocklist`).
   - Integrates `dnsmasq`'s native `nftset=` engine with `table ip nfty` dynamic timeout sets (`@dns_route_<gw>` and `@dns_bypass_<gw>`) for zero-latency domain-based policy routing (`route <domain...> via <gateway>` and `bypass <domain...> from <gateway>`).
 - **Cloudflare Tunnel and Authentication**:
   - `cloudflare-dns <fqdn>` provisions a remotely-managed Cloudflare Tunnel, ingress rule, and proxied CNAME record via the Cloudflare API and supervises `cloudflared`.
   - `cloudflare-auth <email...>` configures Cloudflare Zero Trust Access self-hosted applications and email/domain allow policies (`user@example.com`, `*@example.com`).
-  - `auth <user:pass | nfty>` enforces HTTP Basic Authentication directly in `nfty` across both Cloudflare Tunnel traffic and local VIP requests.
+  - Local service `auth <user:pass | nfty>` is rejected on apply because enforcement is not available on every dataplane path.
 - **PID-1 Appliance Runtime**:
   - Runs as `/sbin/init` (PID 1): mounts `/proc`, `/sys`, `/dev`, and `/data`, brings up networking, starts an embedded SSH2 server (`russh`) on port 22, and persists configuration atomically to `/data`.
 
@@ -49,21 +49,21 @@ If you prefer a static Virtual IP instead, run `bootstrap` to assign a static VI
 From an LXD host (without entering an interactive shell):
 
 ```bash
-lxc exec nfty -- /sbin/init -c "bootstrap 169.254.10.10/24 on eth0"
+lxc exec nfty -- /sbin/init -c "bootstrap 192.168.10.10/24 on eth0"
 ```
 
 Or from the appliance console (`lxc console nfty` / `lxc exec nfty -- /bin/nfty`):
 
 ```text
-nfty# bootstrap 169.254.10.10/24 on eth0
-  ✔ Bootstrapped VIP 169.254.10.10/24 on eth0 (created base config 'service 169.254.10.10:22' with SSH enabled)
-  → VIP applied: ip addr replace 169.254.10.10/24 dev eth0
+nfty# bootstrap 192.168.10.10/24 on eth0
+  ✔ Bootstrapped VIP 192.168.10.10/24 on eth0 (created base config 'service 192.168.10.10:22' with SSH enabled)
+  → VIP applied: ip addr replace 192.168.10.10/24 dev eth0
 ```
 
 This generates and commits the base configuration:
 
 ```hcl
-vip 169.254.10.10/24 {
+vip 192.168.10.10/24 {
     ssh:22
 }
 ```
@@ -73,7 +73,7 @@ vip 169.254.10.10/24 {
 Once bootstrapped, connect directly to the VIP over SSH:
 
 ```bash
-ssh nfty@169.254.10.10
+ssh nfty@192.168.10.10
 ```
 
 - **Default initial credentials**: username `nfty`, password `nfty`.
@@ -88,7 +88,7 @@ ssh nfty@169.254.10.10
 Multiple backend services can share a single static VIP. Each service can expose its native port on the VIP and optionally register a `.local` hostname for mDNS and L7 HTTP `Host` / TLS `SNI` routing on ports `80` and `443`:
 
 ```hcl
-vip 169.254.10.10/24 {
+vip 192.168.10.10/24 {
     ssh:22
     app-server:3000 {
         hostname grafana.local
@@ -105,12 +105,12 @@ Equivalent interactive CLI commands:
 
 ```text
 nfty# conf
-nfty(config)# vip 169.254.10.10/24
-nfty(config-vip:169.254.10.10)# ssh:22
-nfty(config-vip:169.254.10.10)# service app-server:3000
-nfty(config-service:169.254.10.10:3000)# hostname grafana.local
-nfty(config-service:169.254.10.10:3000)# check tcp 5s
-nfty(config-service:169.254.10.10:3000)# commit
+nfty(config)# vip 192.168.10.10/24
+nfty(config-vip:192.168.10.10)# ssh:22
+nfty(config-vip:192.168.10.10)# service app-server:3000
+nfty(config-service:192.168.10.10:3000)# hostname grafana.local
+nfty(config-service:192.168.10.10:3000)# check tcp 5s
+nfty(config-service:192.168.10.10:3000)# commit
 ```
 
 ### 2. Dedicated DHCP `macvlan` VIPs and 802.1Q VLANs
@@ -140,19 +140,19 @@ nfty(config-vip:web-app)# commit
 Services with multiple backends in a `to { ... }` block are load-balanced in kernel `nftables` (`round-robin` or `sticky` by source IP). Backends marked `backup` are only programmed into the active `nftables` set when all primary backends fail their health checks:
 
 ```hcl
-vip 169.254.10.15/24 {
+vip 192.168.10.15/24 {
     443 {
         balance round-robin
         check tcp 3s
         limit 200/sec burst 100 per-ip
         allow {
-            169.254.0.0/16
+            192.168.0.0/16
             *.corp.local
         }
         to {
-            169.254.20.11:8443 weight 3
-            169.254.20.12:8443 weight 1
-            169.254.20.13:8443 backup
+            192.168.20.11:8443 weight 3
+            192.168.20.12:8443 weight 1
+            192.168.20.13:8443 backup
         }
     }
 }
@@ -160,19 +160,19 @@ vip 169.254.10.15/24 {
 
 ### 4. Internet NAT and WireGuard Egress Gateways
 
-A `gateway` block binds a virtual gateway IP (`169.254.10.20` or a DHCP `macvlan` hostname) that other machines, VMs, or containers on the LAN can set as their default IPv4 gateway or reach via the built-in `privoxy` (HTTP/CONNECT) and `socks5` proxies.
+A `gateway` block binds a virtual gateway IP (`192.168.10.20` or a DHCP `macvlan` hostname) that other machines, VMs, or containers on the LAN can set as their default IPv4 gateway or reach via the built-in `privoxy` (HTTP/CONNECT) and `socks5` proxies.
 
 **Direct Internet / LAN NAT Gateway (no VPN tunnels):**
 
 When no `tunnels` block is configured, `nfty` enables IPv4 forwarding and kernel `nftables` masquerading (`oifname "eth0" masquerade`) so isolated containers, VLANs, or lab hosts can route outbound Internet traffic or proxy connections through `nfty`:
 
 ```hcl
-gateway 169.254.10.19 {
+gateway 192.168.10.19 {
     check ping 5s
     privoxy:8118
     socks5:1080
     allow {
-        169.254.0.0/16
+        192.168.0.0/16
     }
 }
 ```
@@ -182,13 +182,13 @@ gateway 169.254.10.19 {
 When one or more WireGuard configurations stored in `/data/wg/` are attached, `nfty` policy-routes traffic from the gateway across the tunnels (`round-robin` or `sticky`), optionally drops non-tunnel leaks with `killswitch on`, and forwards inbound ports from the WireGuard interfaces to LAN hosts with `forward <port> to <host:port>` (using per-tunnel `ct mark` return-path pinning):
 
 ```hcl
-gateway 169.254.10.20 {
+gateway 192.168.10.20 {
     balance round-robin
     killswitch on
     check ping 5s
     privoxy:8118
     socks5:1080
-    forward 51413 to 169.254.20.15:51413
+    forward 51413 to 192.168.20.15:51413
     tunnels {
         wg-exit-01.conf weight 2
         wg-exit-02.conf weight 1
@@ -201,27 +201,26 @@ Configuring a gateway from the CLI:
 ```text
 nfty# wg paste wg-exit-01
 nfty# conf
-nfty(config)# gateway 169.254.10.20
-nfty(config-gw:169.254.10.20)# killswitch on
-nfty(config-gw:169.254.10.20)# privoxy:8118
-nfty(config-gw:169.254.10.20)# socks5:1080
-nfty(config-gw:169.254.10.20)# forward 51413 to 169.254.20.15:51413
-nfty(config-gw:169.254.10.20)# tunnels
-nfty(config-gw-tunnels:169.254.10.20)# wg-exit-01.conf
-nfty(config-gw-tunnels:169.254.10.20)# commit
+nfty(config)# gateway 192.168.10.20
+nfty(config-gw:192.168.10.20)# killswitch on
+nfty(config-gw:192.168.10.20)# privoxy:8118
+nfty(config-gw:192.168.10.20)# socks5:1080
+nfty(config-gw:192.168.10.20)# forward 51413 to 192.168.20.15:51413
+nfty(config-gw:192.168.10.20)# tunnels
+nfty(config-gw-tunnels:192.168.10.20)# wg-exit-01.conf
+nfty(config-gw-tunnels:192.168.10.20)# commit
 ```
 
-### 5. Cloudflare Tunnel, Zero Trust Email Auth, and HTTP Basic Auth
+### 5. Cloudflare Tunnel and Zero Trust Email Auth
 
-Once a Cloudflare API token is registered (`cf token <API_TOKEN> [ACCOUNT_ID]`), any service with `cloudflare-dns <fqdn>` is automatically published through a remotely-managed Cloudflare Tunnel and DNS CNAME record. You can layer Cloudflare Zero Trust email OTP/IdP policies (`cloudflare-auth`) and/or `nfty`'s built-in HTTP Basic Auth (`auth`):
+Once a Cloudflare API token is registered (`cf token <API_TOKEN> [ACCOUNT_ID]`), services with `cloudflare-dns <fqdn>` can be published through a remotely-managed Cloudflare Tunnel with Zero Trust email policies (`cloudflare-auth`). Local service `auth` is currently rejected on apply because it cannot be guaranteed on every dataplane path.
 
 ```hcl
-vip 169.254.10.10/24 {
+vip 192.168.10.10/24 {
     internal-app:8080 {
         hostname app.local
         cloudflare-dns app.example.com
         cloudflare-auth ops@example.com *@example.com
-        auth admin:s3cr3t nfty
         check tcp 5s
     }
 }
@@ -238,14 +237,14 @@ nfty# cf status
 `nfty` can act as a full authoritative and caching DNS server on any VIP or gateway (`dns:53`) or via a global `dns { ... }` block. Under the hood, `nfty` compiles your `Nftyfile` and live health-check state into `/run/nfty-dnsmasq.conf` and `/run/nfty-dnsmasq.hosts`, signals `dnsmasq` via `SIGHUP` on host/health changes for zero-downtime cache preservation, and wires `dnsmasq`'s `nftset=` directive into kernel `table ip nfty` sets:
 
 ```hcl
-vip 169.254.10.10/24 {
+vip 192.168.10.10/24 {
     dns:53
-    80 to 169.254.20.10:8989 {
+    80 to 192.168.20.10:8989 {
         hostname sonarr.local
     }
 }
 
-gateway 169.254.10.20/24 {
+gateway 192.168.10.20/24 {
     dns:53
     killswitch on
     tunnels {
@@ -262,19 +261,19 @@ dns {
 
     upstream 1.1.1.1
     upstream 9.9.9.9
-    forward corp.internal 169.254.99.1 via 169.254.10.20
+    forward corp.internal 192.168.99.1 via 192.168.10.20
 
-    a nas.lan 169.254.1.50
+    a nas.lan 192.168.1.50
     aaaa nas.lan fd00::50
-    address *.k8s.lan 169.254.1.100
+    address *.k8s.lan 192.168.1.100
     cname media.lan sonarr.lan
     txt _acme-challenge.example.com "token-xyz"
     srv _minecraft._tcp.lan mc.lan:25565 priority 0 weight 5
     mx lan mail.lan priority 10
 
     # Populate kernel nftables sets on DNS resolution to route or bypass gateways by domain:
-    route linuxisos.org tracker.example.org via 169.254.10.20
-    bypass plex.tv netflix.com from 169.254.10.20
+    route linuxisos.org tracker.example.org via 192.168.10.20
+    bypass plex.tv netflix.com from 192.168.10.20
 
     block doubleclick.net *.ads.example.com
 }
@@ -286,10 +285,10 @@ Interactive CLI configuration and operational diagnostics:
 nfty# conf
 nfty(config)# dns
 nfty(config-dns)# domain lan
-nfty(config-dns)# a nas.lan 169.254.1.50
-nfty(config-dns)# address *.k8s.lan 169.254.1.100
-nfty(config-dns)# route linuxisos.org via 169.254.10.20
-nfty(config-dns)# bypass plex.tv from 169.254.10.20
+nfty(config-dns)# a nas.lan 192.168.1.50
+nfty(config-dns)# address *.k8s.lan 192.168.1.100
+nfty(config-dns)# route linuxisos.org via 192.168.10.20
+nfty(config-dns)# bypass plex.tv from 192.168.10.20
 nfty(config-dns)# commit
 nfty# dns status
 nfty# dns test sonarr.lan
@@ -297,16 +296,22 @@ nfty# dns test sonarr.lan
 
 ### 7. Service Discovery (`scan` / `adopt`) and Safe Rollbacks
 
-Scan the local subnet/ARP table for running containers and adopt a discovered service directly into a VIP:
+From the long-running controller's local console (not a secondary SSH or
+one-shot session), scan for services and adopt one into a VIP:
 
 ```text
 nfty# scan
-nfty# adopt 1 vip 169.254.10.10
-nfty(config-vip:169.254.10.10)# apply confirm 60
+nfty# adopt 1 vip 192.168.10.10
+nfty(config-vip:192.168.10.10)# apply confirm 60
   ✔ Applied ruleset to kernel nftables
   Safety rollback timer active for 60s! Type 'confirm' to keep changes.
-nfty(config-vip:169.254.10.10)# confirm
+nfty(config-vip:192.168.10.10)# confirm
 ```
+
+Confirmed apply is available only in the long-running controller. Its timer is
+process-local; a controller crash can leave trial kernel state active until
+restart. Other apply operations span multiple subsystems and restoration is
+best-effort, not an atomic transaction.
 
 ---
 
@@ -314,7 +319,9 @@ nfty(config-vip:169.254.10.10)# confirm
 
 ### Prerequisites
 
-- Linux host (`x86_64`) with Rust 1.75+ and the `x86_64-unknown-linux-musl` target installed:
+- Linux host (`x86_64`) with a recent stable Rust toolchain supporting the
+  checked-in version-4 Cargo lockfile and the `x86_64-unknown-linux-musl` target
+  installed. The minimum supported Rust version has not been established:
   ```bash
   rustup target add x86_64-unknown-linux-musl
   ```
@@ -346,15 +353,15 @@ To build and roll out an update to a remote LXD host while preserving `/data` (`
 ```bash
 ./packaging/deploy-lxd.sh <lxd-host-ip> [instance-name]
 # Example:
-./packaging/deploy-lxd.sh 169.254.1.10 nfty
+./packaging/deploy-lxd.sh 192.168.1.10 nfty
 ```
 
 For fast binary-only updates during development without rebuilding the full LXD image:
 
 ```bash
 cargo build --release --target x86_64-unknown-linux-musl
-scp target/x86_64-unknown-linux-musl/release/nfty 169.254.1.10:/tmp/nfty-bin
-ssh 169.254.1.10 "lxc stop -f nfty && lxc file push --mode=0755 /tmp/nfty-bin nfty/bin/nfty && lxc start nfty"
+scp target/x86_64-unknown-linux-musl/release/nfty 192.168.1.10:/tmp/nfty-bin
+ssh 192.168.1.10 "lxc stop -f nfty && lxc file push --mode=0755 /tmp/nfty-bin nfty/bin/nfty && lxc start nfty"
 ```
 
 ### 2. Build and Launch as a Bootable Unikernel VM (LXD VM or QEMU)
@@ -419,7 +426,7 @@ src/
 ├── state.rs                 # Shared runtime state, candidate/running configs, allow-lists
 ├── parser.rs                # Nftyfile and interactive directive parser
 ├── compiler.rs              # nftables ruleset generator, DHCP macvlan & VLAN setup
-├── unikernel.rs             # PID-1 mount/network init, atomic /data persistence, L4 fallback
+├── unikernel.rs             # PID-1 mount/network init and /data persistence
 ├── health.rs                # TCP/HTTP/ICMP/WireGuard health prober and DNS refresher
 ├── api.rs                   # HTTP/JSON control API and embedded status UI
 ├── ssh.rs                   # Built-in SSH2 server (russh) and credential store

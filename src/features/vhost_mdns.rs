@@ -225,7 +225,7 @@ pub(crate) fn run_mdns_responder_loop(shared: SharedState) {
     }
 }
 
-/// Extracts either the HTTP `Host:` header or TLS ClientHello `SNI` hostname from the first packet.
+/// Extracts either the HTTP `Host:` header or TLS ClientHello `SNI` hostname.
 pub fn extract_host_or_sni(buf: &[u8]) -> Option<String> {
     if buf.is_empty() {
         return None;
@@ -237,7 +237,8 @@ pub fn extract_host_or_sni(buf: &[u8]) -> Option<String> {
         }
     }
     // 2. Check HTTP Host header
-    let text = std::str::from_utf8(buf).ok()?;
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let text = std::str::from_utf8(&buf[..header_end]).ok()?;
     for line in text.lines().take(32) {
         if let Some((k, v)) = line.split_once(':') {
             if k.trim().eq_ignore_ascii_case("host") {
@@ -304,6 +305,31 @@ fn parse_tls_sni(buf: &[u8]) -> Option<String> {
 
 static L7_VHOST_RR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+async fn read_l7_prefix(client: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut first = [0u8; 1];
+        if client.peek(&mut first).await? == 0 {
+            anyhow::bail!("connection closed before request");
+        }
+        if first[0] != 0x16 {
+            return super::read_http_headers(client, Duration::from_secs(3)).await;
+        }
+
+        let mut header = [0u8; 5];
+        client.read_exact(&mut header).await?;
+        let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if len == 0 || len > 18_432 {
+            anyhow::bail!("invalid TLS record length");
+        }
+        let mut record = header.to_vec();
+        record.resize(5 + len, 0);
+        client.read_exact(&mut record[5..]).await?;
+        Ok(record)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out reading virtual-host request"))?
+}
+
 pub(crate) async fn run_l7_virtual_host_listener(shared: SharedState, listen_port: u16) {
     let bind_addr = format!("0.0.0.0:{}", listen_port);
     let listener = loop {
@@ -325,16 +351,10 @@ pub(crate) async fn run_l7_virtual_host_listener(shared: SharedState, listen_por
         });
         let shared_conn = shared.clone();
         tokio::spawn(async move {
-            let mut peek_buf = [0u8; 2048];
-            let Ok(Ok(n)) =
-                tokio::time::timeout(Duration::from_secs(3), client.read(&mut peek_buf)).await
-            else {
+            let Ok(peek_buf) = read_l7_prefix(&mut client).await else {
                 return;
             };
-            if n == 0 {
-                return;
-            }
-            let Some(host) = extract_host_or_sni(&peek_buf[..n]) else {
+            let Some(host) = extract_host_or_sni(&peek_buf) else {
                 return;
             };
 
@@ -346,6 +366,11 @@ pub(crate) async fn run_l7_virtual_host_listener(shared: SharedState, listen_por
                     .services
                     .values()
                     .filter(|svc| {
+                        if svc.port != listen_port
+                            || !matches!(svc.proto, crate::ast::Proto::Tcp | crate::ast::Proto::Both)
+                        {
+                            return false;
+                        }
                         if let Some(svc_host) = &svc.hostname {
                             let sh = svc_host.trim_end_matches('.').to_ascii_lowercase();
                             let sh_short = sh.strip_suffix(".local").unwrap_or(&sh);
@@ -362,14 +387,13 @@ pub(crate) async fn run_l7_virtual_host_listener(shared: SharedState, listen_por
                         (Some(dst), Some(lip)) if dst == lip => 0,
                         _ => 1,
                     };
-                    let port_match = if svc.port == listen_port { 0 } else { 1 };
-                    (ip_match, port_match)
+                    ip_match
                 });
 
                 let mut found = None;
                 let peer_ip = match peer.ip() {
                     std::net::IpAddr::V4(v4) => v4,
-                    std::net::IpAddr::V6(_) => Ipv4Addr::LOCALHOST,
+                    std::net::IpAddr::V6(_) => return,
                 };
                 if let Some(svc) = candidates.first() {
                     if !st.is_ip_allowed(peer_ip, &svc.allow, &cfg.global_allow) {
@@ -405,21 +429,9 @@ pub(crate) async fn run_l7_virtual_host_listener(shared: SharedState, listen_por
             };
 
             if let Some((addr, ep_key, auth_rules)) = target_info {
-                let first_line_http = std::str::from_utf8(&peek_buf[..n])
-                    .map(|s| {
-                        let u = s.trim_start();
-                        u.starts_with("GET ")
-                            || u.starts_with("POST ")
-                            || u.starts_with("HEAD ")
-                            || u.starts_with("PUT ")
-                            || u.starts_with("DELETE ")
-                            || u.starts_with("OPTIONS ")
-                            || u.starts_with("PATCH ")
-                    })
-                    .unwrap_or(false);
+                let first_line_http = peek_buf.first() != Some(&0x16);
                 if !auth_rules.is_empty()
-                    && first_line_http
-                    && !check_http_basic_auth(&peek_buf[..n], &auth_rules)
+                    && (!first_line_http || !check_http_basic_auth(&peek_buf, &auth_rules))
                 {
                     let resp = format!(
                         "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"nfty ({})\"\r\nContent-Type: text/plain\r\nContent-Length: 26\r\nConnection: close\r\n\r\n401 Authentication Needed\n",
@@ -428,10 +440,10 @@ pub(crate) async fn run_l7_virtual_host_listener(shared: SharedState, listen_por
                     let _ = client.write_all(resp.as_bytes()).await;
                     return;
                 }
-                let forward_buf = if !auth_rules.is_empty() && first_line_http {
-                    sanitize_authenticated_http_request(&peek_buf[..n])
+                let forward_buf = if !auth_rules.is_empty() {
+                    sanitize_authenticated_http_request(&peek_buf)
                 } else {
-                    peek_buf[..n].to_vec()
+                    peek_buf
                 };
                 if let Ok(Ok(mut upstream)) =
                     tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await

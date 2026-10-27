@@ -20,7 +20,7 @@ pub use dns::{
 pub use flows::{print_flows_table, read_active_flows, ConntrackFlow};
 pub use gateway_proxy::run_gateway_proxy_supervisor;
 pub use scanner::{
-    print_scan_table, scan_network_services, COMMON_CONTAINER_HOSTNAMES, SCAN_PORTS,
+    print_scan_table, scan_network_services_async, COMMON_CONTAINER_HOSTNAMES, SCAN_PORTS,
 };
 pub use vhost_mdns::extract_host_or_sni;
 pub use wireguard::{
@@ -30,8 +30,37 @@ pub use wireguard::{
 };
 
 use crate::state::SharedState;
+use anyhow::{Context, Result};
 use std::net::Ipv4Addr;
 use std::process::Command;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+
+pub(crate) async fn read_http_headers(stream: &mut TcpStream, deadline: Duration) -> Result<Vec<u8>> {
+    tokio::time::timeout(deadline, async {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                anyhow::bail!("Incomplete HTTP headers");
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                if pos + 4 > 64 * 1024 {
+                    anyhow::bail!("HTTP headers exceed 64KB limit");
+                }
+                return Ok(buf);
+            }
+            if buf.len() > 64 * 1024 {
+                anyhow::bail!("HTTP headers exceed 64KB limit");
+            }
+        }
+    })
+    .await
+    .context("HTTP header deadline exceeded")?
+}
 
 /// Spawns background network daemons for mDNS responder, L7 HTTP/SNI virtual host proxy,
 /// Cloudflare local Basic-Auth gate, and WireGuard gateway Privoxy/SOCKS5 listeners.
@@ -54,6 +83,11 @@ pub fn spawn_advanced_feature_daemons(shared: SharedState) {
     let shared_cf_auth = shared.clone();
     tokio::spawn(async move {
         cloudflare::run_cf_auth_proxy_listener(shared_cf_auth).await;
+    });
+
+    let shared_cloudflare = shared.clone();
+    tokio::spawn(async move {
+        cloudflare::run_cloudflare_supervisor(shared_cloudflare).await;
     });
 
     let shared_gw_proxies = shared.clone();

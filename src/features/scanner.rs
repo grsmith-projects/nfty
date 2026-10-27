@@ -1,13 +1,14 @@
 use super::list_vlan_iface_ips;
 use crate::state::SharedState;
+use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::process::Command;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::process::Command;
 
 pub const SCAN_PORTS: &[(u16, &str)] = &[
     (22, "ssh"),
@@ -75,7 +76,7 @@ pub const COMMON_CONTAINER_HOSTNAMES: &[&str] = &[
     "gitea",
 ];
 
-fn reverse_lookup_ip(ip: Ipv4Addr) -> Option<String> {
+async fn reverse_lookup_ip(ip: Ipv4Addr) -> Option<String> {
     if let Ok(raw) = fs::read_to_string("/etc/hosts") {
         for line in raw.lines() {
             let clean = line.split('#').next().unwrap_or("").trim();
@@ -90,7 +91,9 @@ fn reverse_lookup_ip(ip: Ipv4Addr) -> Option<String> {
             }
         }
     }
-    if let Ok(out) = Command::new("getent").args(["hosts", &ip.to_string()]).output() {
+    let mut command = Command::new("getent");
+    command.args(["hosts", &ip.to_string()]).kill_on_drop(true);
+    if let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(2), command.output()).await {
         if out.status.success() {
             let line = String::from_utf8_lossy(&out.stdout);
             let mut parts = line.split_whitespace();
@@ -109,6 +112,38 @@ fn reverse_lookup_ip(ip: Ipv4Addr) -> Option<String> {
         }
     }
     None
+}
+
+async fn add_reverse_names(discovered: &mut [crate::state::DiscoveredService]) -> Result<()> {
+    let ips: BTreeSet<Ipv4Addr> = discovered
+        .iter()
+        .filter(|item| item.host.is_none())
+        .map(|item| item.ip)
+        .collect();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut names = BTreeMap::new();
+    for ip in ips {
+        if tasks.len() >= 16 {
+            let completed = tasks.join_next().await.context("Reverse-DNS task set closed unexpectedly")?;
+            let (resolved_ip, name) = completed.context("Reverse-DNS task failed")?;
+            if let Some(name) = name {
+                names.insert(resolved_ip, name);
+            }
+        }
+        tasks.spawn(async move { (ip, reverse_lookup_ip(ip).await) });
+    }
+    while let Some(completed) = tasks.join_next().await {
+        let (resolved_ip, name) = completed.context("Reverse-DNS task failed")?;
+        if let Some(name) = name {
+            names.insert(resolved_ip, name);
+        }
+    }
+    for item in discovered {
+        if item.host.is_none() {
+            item.host = names.get(&item.ip).cloned();
+        }
+    }
+    Ok(())
 }
 
 fn identify_http_banner(
@@ -254,33 +289,39 @@ async fn probe_single_port(
     })
 }
 
-pub fn scan_network_services(
+fn cidr_scan_targets(base: &str, prefix: &str) -> Result<Vec<Ipv4Addr>> {
+    let base_ip = base.parse::<Ipv4Addr>().context("Invalid scan network address")?;
+    let prefix = prefix.parse::<u8>().context("Invalid scan network prefix")?;
+    if !(24..=32).contains(&prefix) {
+        bail!("Scan networks must use a prefix between /24 and /32");
+    }
+    let host_bits = 32 - prefix;
+    let count = 1u32 << host_bits;
+    let net_u32 = u32::from(base_ip) & (!0u32 << host_bits);
+    let (start, end) = if prefix >= 31 { (0, count) } else { (1, count - 1) };
+    Ok((start..end).map(|offset| Ipv4Addr::from(net_u32 + offset)).collect())
+}
+
+fn scan_network_services(
     target_filter: Option<&str>,
     shared: &SharedState,
-) -> Vec<crate::state::DiscoveredService> {
+) -> Result<Vec<crate::state::DiscoveredService>> {
     let local_ips: BTreeSet<Ipv4Addr> = list_vlan_iface_ips().into_iter().collect();
     let mut host_map: BTreeMap<Ipv4Addr, Option<String>> = BTreeMap::new();
 
     if let Some(filter) = target_filter.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         if let Some((base_str, prefix_str)) = filter.split_once('/') {
-            if let (Ok(base_ip), Ok(prefix)) =
-                (base_str.parse::<Ipv4Addr>(), prefix_str.parse::<u8>())
-            {
-                let base_u32 = u32::from(base_ip);
-                let host_bits = 32u8.saturating_sub(prefix.clamp(22, 32));
-                let count = (1u32 << host_bits).min(256);
-                let net_u32 = base_u32 & (!0u32 << host_bits);
-                for offset in 1..count.saturating_sub(1).max(2) {
-                    let ip = Ipv4Addr::from(net_u32 + offset);
-                    if !local_ips.contains(&ip) {
-                        host_map.insert(ip, None);
-                    }
+            for ip in cidr_scan_targets(base_str, prefix_str)? {
+                if !local_ips.contains(&ip) {
+                    host_map.insert(ip, None);
                 }
             }
         } else if let Ok(ip) = filter.parse::<Ipv4Addr>() {
-            host_map.insert(ip, reverse_lookup_ip(ip));
+            host_map.insert(ip, None);
         } else if let Some(ip) = crate::parser::resolve_hostname_sync(filter) {
             host_map.insert(ip, Some(filter.to_string()));
+        } else {
+            bail!("Cannot resolve scan target '{}'", filter);
         }
     } else {
         // 1. Collect from existing state (resolved_hosts + configured backends)
@@ -348,63 +389,80 @@ pub fn scan_network_services(
         }
     }
 
-    for (ip, host_opt) in host_map.iter_mut() {
-        if host_opt.is_none() {
-            *host_opt = reverse_lookup_ip(*ip);
-        }
-    }
-
     let targets: Vec<(Ipv4Addr, Option<String>)> = host_map.into_iter().collect();
     let run_scan = async move {
-        let mut handles = Vec::new();
+        const MAX_CONCURRENT_PROBES: usize = 128;
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut results = Vec::new();
         for (ip, host_opt) in targets {
             for &(port, default_name) in SCAN_PORTS {
+                if tasks.len() >= MAX_CONCURRENT_PROBES {
+                    let completed = tasks.join_next().await.context("Scan task set closed unexpectedly")?;
+                    if let Some(item) = completed.context("Scan task failed")? {
+                        results.push(item);
+                    }
+                }
                 let h_cl = host_opt.clone();
-                handles.push(tokio::spawn(async move {
+                tasks.spawn(async move {
                     probe_single_port(ip, h_cl, port, default_name).await
-                }));
+                });
             }
         }
-        let mut results = Vec::new();
-        for h in handles {
-            if let Ok(Some(item)) = h.await {
+        while let Some(completed) = tasks.join_next().await {
+            if let Some(item) = completed.context("Scan task failed")? {
                 results.push(item);
             }
         }
-        results
+        add_reverse_names(&mut results).await?;
+        Ok::<_, anyhow::Error>(results)
     };
 
-    let mut discovered = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        std::thread::scope(|s| {
-            s.spawn(move || handle.block_on(run_scan))
-                .join()
-                .unwrap_or_default()
-        })
-    } else if let Ok(rt) = tokio::runtime::Runtime::new() {
-        rt.block_on(run_scan)
-    } else {
-        Vec::new()
-    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to start scan runtime")?;
+    let mut discovered = runtime.block_on(run_scan)?;
 
     discovered.sort_by(|a, b| a.ip.cmp(&b.ip).then_with(|| a.port.cmp(&b.port)));
     for (idx, item) in discovered.iter_mut().enumerate() {
         item.index = idx + 1;
     }
 
-    if let Ok(mut st) = shared.write() {
-        for item in &discovered {
-            if let Some(h) = &item.host {
-                let entry = st.resolved_hosts.entry(h.clone()).or_default();
-                if !entry.contains(&item.ip) {
-                    entry.push(item.ip);
-                }
-            }
-        }
+    {
+        let mut st = shared.write().map_err(|_| anyhow::anyhow!("Scan state is unavailable"))?;
         st.discovered_services = discovered.clone();
     }
-    crate::unikernel::persist_to_storage(shared);
+    Ok(discovered)
+}
 
-    discovered
+pub async fn scan_network_services_async(
+    target_filter: Option<&str>,
+    shared: &SharedState,
+) -> Result<Vec<crate::state::DiscoveredService>> {
+    let target_filter = target_filter.map(str::to_string);
+    let shared = shared.clone();
+    tokio::task::spawn_blocking(move || scan_network_services(target_filter.as_deref(), &shared))
+        .await
+        .context("Scan worker failed")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cidr_targets_respect_single_and_point_to_point_networks() {
+        assert_eq!(
+            cidr_scan_targets("192.0.2.7", "32").unwrap(),
+            vec![Ipv4Addr::new(192, 0, 2, 7)]
+        );
+        assert_eq!(
+            cidr_scan_targets("192.0.2.7", "31").unwrap(),
+            vec![Ipv4Addr::new(192, 0, 2, 6), Ipv4Addr::new(192, 0, 2, 7)]
+        );
+        assert!(cidr_scan_targets("192.0.2.7", "23").is_err());
+        assert!(cidr_scan_targets("192.0.2.7", "33").is_err());
+    }
 }
 
 pub fn print_scan_table(discovered: &[crate::state::DiscoveredService], shared: &SharedState) {

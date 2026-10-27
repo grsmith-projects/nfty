@@ -137,7 +137,12 @@ if [[ -d /usr/share/terminfo ]]; then
     done
 fi
 
-echo -n "" > "$STAGE_DIR/etc/nfty/Nftyfile"
+cat > "$STAGE_DIR/etc/nfty/Nftyfile" <<'EOF'
+gateway default {
+    dhcp eth0
+    ssh:22
+}
+EOF
 echo "root:x:0:0:root:/root:/bin/nfty" > "$STAGE_DIR/etc/passwd"
 echo "root:x:0:" > "$STAGE_DIR/etc/group"
 
@@ -185,7 +190,7 @@ INITRD_IMG="$OUT_DIR/nfty-rk3588s-initramfs.cpio.gz"
 
 echo "==> [4/6] Building persistent ext4 storage partition (128 MiB, label: nfty-data)..."
 mkdir -p "$WORK_DIR/data-seed"
-echo -n "" > "$WORK_DIR/data-seed/Nftyfile"
+cp "$STAGE_DIR/etc/nfty/Nftyfile" "$WORK_DIR/data-seed/Nftyfile"
 echo "{}" > "$WORK_DIR/data-seed/hosts.json"
 
 DATA_PART="$WORK_DIR/part2-data.ext4"

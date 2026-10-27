@@ -17,7 +17,7 @@ Every directive in `Nftyfile` has a 1:1 equivalent in the interactive router CLI
 ```hcl
 # 1. Global Source Allow-List (optional)
 allow {
-    169.254.1.*
+    192.168.1.*
     10.0.0.0/8
     *.office.lan
 }
@@ -32,14 +32,14 @@ dns {
 }
 
 # 3. Virtual IP (VIP) Containers (Static IPv4 or DHCP macvlan hostname)
-vip 169.254.10.10/24 {
+vip 192.168.10.10/24 {
     ssh:22
     dns:53
     api:9090 {
         key nfty_rw_0123456789abcdef0123456789abcdef rw
         key nfty_ro_fedcba9876543210fedcba9876543210 ro
     }
-    80 to 169.254.20.10:8080 {
+    80 to 192.168.20.10:8080 {
         hostname web.local
         check tcp 5s
     }
@@ -50,20 +50,20 @@ service 9000 {
     balance round-robin
     check tcp 5s
     to {
-        169.254.20.11:9000 weight 2
-        169.254.20.12:9000 weight 1
-        169.254.20.13:9000 backup
+        192.168.20.11:9000 weight 2
+        192.168.20.12:9000 weight 1
+        192.168.20.13:9000 backup
     }
 }
 
 # 5. Virtual Egress Gateways (Direct NAT or Multi-Tunnel WireGuard)
-gateway 169.254.10.20 {
+gateway 192.168.10.20 {
     balance round-robin
     killswitch on
     check ping 5s
     privoxy:8118
     socks5:1080
-    forward 51413 to 169.254.20.15:51413
+    forward 51413 to 192.168.20.15:51413
     tunnels {
         wg-exit-01.conf weight 2
         wg-exit-02.conf weight 1
@@ -81,17 +81,17 @@ The top-level `allow` block defines a global source IPv4 access-control list (AC
 
 | Format | Example | Compilation Behavior |
 | :--- | :--- | :--- |
-| **Exact IPv4** | `169.254.1.50` | Inserted directly into the kernel `nftables` set (`type ipv4_addr; flags interval`). |
+| **Exact IPv4** | `192.168.1.50` | Inserted directly into the kernel `nftables` set (`type ipv4_addr; flags interval`). |
 | **IPv4 CIDR** | `10.10.0.0/16`, `172.16.0.0/12` | Inserted as a CIDR interval into the `nftables` set. |
-| **IPv4 Octet Wildcard** | `169.254.1.*`, `10.0.*.*`, `*` | Automatically expanded to CIDR (`169.254.1.0/24`, `10.0.0.0/16`, `0.0.0.0/0`). |
+| **IPv4 Octet Wildcard** | `192.168.1.*`, `10.0.*.*`, `*` | Automatically expanded to CIDR (`192.168.1.0/24`, `10.0.0.0/16`, `0.0.0.0/0`). |
 | **Exact Hostname** | `admin.office.lan`, `workstation.local` | Resolved via `/data/hosts.json`, `/etc/hosts`, and DNS; refreshed automatically in the background. |
-| **Wildcard Hostname** | `*.office.lan`, `dev-*.corp.lan` | Matched dynamically against all known hostnames in `/data/hosts.json` (populated via `host`, `scan`, or `POST /api/v1/allow/hosts`) and `/etc/hosts`. |
+| **Wildcard Hostname** | `*.office.lan`, `dev-*.corp.lan` | Matched dynamically against known hostnames in `/data/hosts.json` and `/etc/hosts`. Register mappings explicitly with `host` or `POST /api/v1/allow/hosts`; scans do not modify the allow-list host cache. |
 
 ### Syntax Example
 
 ```hcl
 allow {
-    169.254.1.*
+    192.168.1.*
     10.20.0.0/16
     172.16.5.10
     admin-laptop.office.lan
@@ -102,7 +102,7 @@ allow {
 Single-line shorthand is also accepted:
 
 ```hcl
-allow 169.254.1.* 10.20.0.0/16 *.trusted.lan
+allow 192.168.1.* 10.20.0.0/16 *.trusted.lan
 ```
 
 ---
@@ -116,10 +116,10 @@ A `vip` block provisions a Virtual IP address on the appliance and groups all lo
 When the `vip` identifier is an IPv4 address (with an optional `/prefix`), `nfty` binds that static IP directly to the target network interface using `ip addr replace <ip>/<prefix> dev <iface>`. If the `/prefix` is omitted, `nfty` automatically detects the primary subnet mask of `eth0` (defaulting to `/24`).
 
 ```hcl
-vip 169.254.10.10/24 {
+vip 192.168.10.10/24 {
     interface eth0/24
     ssh:22
-    80 to 169.254.20.10:8080
+    80 to 192.168.20.10:8080
 }
 ```
 
@@ -127,10 +127,25 @@ vip 169.254.10.10/24 {
 
 When the `vip` identifier is a **hostname** (e.g., `vip sonarr` or `vip media-front`) or includes `dhcp <iface>`, `nfty` creates a dedicated kernel `macvlan` interface (named `mv-<name>`) with a deterministic locally-administered MAC address derived from the VIP name, tunes `arp_ignore=1` and `arp_announce=2` to prevent ARP flux, and spawns `udhcpc -x hostname:<name>` to request a dedicated DHCP lease from your router (e.g., UniFi UDM, OPNsense, pfSense).
 
+`nfty` removes only macvlans with its runtime ownership marker and refuses
+conflicting interfaces or generated names. After an upgrade, an existing
+unmarked interface is adopted only when its MAC, lease file, and managed DHCP
+process can be verified; otherwise an operator must inspect it before removing
+or recreating it. These markers are not a complete isolation mechanism.
+The configured parent interface must already exist; apply does not rename a
+different interface to satisfy it. The special DHCP name `default` uses
+`eth0` and currently cannot be assigned a different parent or VLAN.
+
+> [!WARNING]
+> DHCP deconfiguration and renewal do not reliably remove stale lease files or
+> old addresses. Inspect and recover affected interfaces manually after lease
+> loss or an address change. Existing VLAN interfaces are not fully verified
+> for ownership before reuse.
+
 ```hcl
 vip sonarr {
     dhcp eth0
-    80 to 169.254.20.10:8989 {
+    80 to 192.168.20.10:8989 {
         check tcp 5s
     }
 }
@@ -140,7 +155,7 @@ Header shorthand is also supported:
 
 ```hcl
 vip sonarr dhcp eth0 vlan 20 {
-    80 to 169.254.20.10:8989
+    80 to 192.168.20.10:8989
 }
 ```
 
@@ -169,7 +184,7 @@ vip 10.20.0.10/24 {
 | `web` / `web:<port>` | Optional port (default `8000`) | Exposes the interactive JavaScript Web Console (`GET /`) and backing REST API on this VIP. Supports `allow { ... }` CIDR/hostname ACLs so allowed LAN clients get immediate access in the browser. |
 | `api` / `api:<port>` | Optional port (default `9090`) | Exposes the headless HTTP/JSON Control API on this VIP (`GET /` is disabled). Can be opened as a block (`api:8080 { ... }`) to configure scoped `ro` / `rw` API keys. |
 | `<port[/proto]> to <host:port>` | Listen port & target backend | Maps external `<port>` (e.g., `80`, `443`, `53/udp`) on this VIP to `<host_or_ip>:<port>`. Can be followed by `{ ... }` for service options. |
-| `<host_or_ip>:<port>` | Target backend endpoint | Forwards the matching port on this VIP directly to `<host_or_ip>:<port>` (e.g., `plex:32400` or `169.254.20.15:32400`). |
+| `<host_or_ip>:<port>` | Target backend endpoint | Forwards the matching port on this VIP directly to `<host_or_ip>:<port>` (e.g., `plex:32400` or `192.168.20.15:32400`). |
 
 ### 3.5 `web:<port>` (Web Console) and `api:<port>` (Headless JSON API) Inside a VIP
 
@@ -209,9 +224,9 @@ Services can be defined either nested inside a `vip { ... }` block or at the top
 
 - **Port only (all interfaces, TCP)**: `service 9000 { ... }` or `9000 { ... }`
 - **Port + Protocol (`tcp`, `udp`, `both`)**: `service 53/udp { ... }`, `service 51413/both { ... }`
-- **Explicit VIP IP + Port [+ Protocol]**: `service 169.254.1.240:443 { ... }`, `service 10.0.1.10:53/both { ... }`
+- **Explicit VIP IP + Port [+ Protocol]**: `service 192.168.1.240:443 { ... }`, `service 10.0.1.10:53/both { ... }`
 - **Inside a `vip` block**:
-  - `80 to 169.254.20.10:8080 { ... }`
+  - `80 to 192.168.20.10:8080 { ... }`
   - `plex:32400 { ... }`
   - `443 { ... }`
 
@@ -224,16 +239,29 @@ Services can be defined either nested inside a `vip { ... }` block or at the top
 | `balance` | `balance <round-robin\|sticky>` | `round-robin` | Kernel `nftables` load-balancing algorithm. `round-robin` uses `numgen inc mod N`; `sticky` uses `ip saddr mod N` source-IP hashing. |
 | `mode` | `mode <nat\|transparent>` | `nat` | `nat` applies `masquerade` in `postrouting` so return traffic routes back through `nfty`. `transparent` preserves the original client source IP (requires backends to use `nfty` as their default gateway). |
 | `check` | `check <tcp \| http [/path] \| ping \| off> [<secs>s]` | None (or `tcp 5s` on `adopt`) | Configures active health probing. Unhealthy backends are dynamically removed from the kernel verdict map. |
-| `limit` | `limit <rate>/<sec\|min> [burst <N>] [per-ip\|global]` | None | Enforces kernel `nftables` packet rate limiting before DNAT. Defaults to `per-ip` dynamic meter sets (`size 65535; timeout 1m`). |
+| `limit` | `limit <rate>/<sec\|min> [burst <N>] [per-ip\|global]` | None | Limits first-packet matches in the kernel NAT chain; established flows are not packet-rate limited. Defaults to `per-ip` dynamic meter sets (`size 65535; timeout 1m`). |
 | `hostname` | `hostname <fqdn.local>` | None | Announces `<fqdn.local>` via multicast mDNS (`224.0.0.251:5353`), registers it in `dnsmasq` (`auto-vips on`), and enables L7 HTTP `Host` / TLS `SNI` virtual-host routing when multiple services share port `80` or `443`. |
 | `cloudflare-dns` | `cloudflare-dns <fqdn>` | None | Publishes the service publicly via a remotely-managed Cloudflare Tunnel and creates a proxied DNS `CNAME` record for `<fqdn>`. |
 | `cloudflare-auth` | `cloudflare-auth <email \| *@domain>...` | None | Configures a Cloudflare Zero-Trust Access self-hosted application and email/domain allow policy (e.g., `ops@example.com *@example.com`). |
-| `auth` | `auth <user:pass \| nfty>...` | None | Enforces HTTP Basic Authentication directly in `nfty` on both local L7 VIP traffic and Cloudflare Tunnel traffic. `auth nfty` authenticates against the appliance login in `/data/auth.json`. |
+| `auth` | `auth <user:pass \| nfty>...` | None | Enforces HTTP Basic Auth across both Cloudflare Tunnel and local TCP VIP requests (`redirect to :80` / `:18443`). Rejected on UDP or encrypted TLS passthrough port `443`. |
 | `key` | `key <new \| token> [ro\|rw]` | None | Attaches a scoped (`ro` or `rw`) API key when the service is `api:<port>`. |
 | `vip` / `interface` | `interface <iface[/prefix]>` | Inherited from `vip` block | Binds a standalone `service <ip:port>` to a specific NIC and subnet prefix. |
 | `vlan` | `vlan <1-4094>` | Inherited from `vip` block | Attaches an 802.1Q VLAN tag to the service's VIP. |
-| `allow` | `allow { <entry>... }` or `allow <entry>...` | None (inherits global `allow`) | Restricts source IPs allowed to reach this service (IPs, CIDRs, IP wildcards `169.254.1.*`, hostnames, or wildcard hostnames `*.office.lan`). |
+| `allow` | `allow { <entry>... }` or `allow <entry>...` | None (inherits global `allow`) | Restricts source IPs allowed to reach this service (IPs, CIDRs, IP wildcards `192.168.1.*`, hostnames, or wildcard hostnames `*.office.lan`). |
 | `to` | `to { <backend>... }` or `to <backend>...` | None | Defines one or more backend targets (`<ip_or_host>[:<port>] [weight <1-100>] [backup]`). |
+
+Apply rejects overlapping services on the same address, port, and protocol.
+Distinct hostnames may share TCP port `80` or `443`; UDP cannot be multiplexed
+by hostname, including the UDP half of `proto both`. Per-service `limit` is
+rejected on shared HTTP/TLS virtual-host bindings because it cannot be enforced
+per hostname before routing. Avoid overlapping a wildcard binding with a
+specific VIP as well; that case is not fully validated.
+
+> [!WARNING]
+> Avoid using the same L7 hostname on different VIPs sharing a port: the
+> listener may fall back to another VIP's service when the redirected socket
+> does not identify the original destination. TLS ClientHello messages split
+> across multiple TLS records are not supported.
 
 ### Health Check (`check`) Variations
 
@@ -248,9 +276,9 @@ check off                       # Disable active health probing
 ### Rate Limit (`limit`) Variations
 
 ```hcl
-limit 100/sec per-ip            # Max 100 packets/sec per source IP
-limit 250/sec burst 100 per-ip  # Max 250 packets/sec with a 100-packet burst bucket per source IP
-limit 60/min burst 15 per-ip    # Max 60 connections/packets per minute per source IP
+limit 100/sec per-ip            # Up to 100 first-packet matches/sec per source IP
+limit 250/sec burst 100 per-ip  # Per-source limit with a 100-packet burst bucket
+limit 60/min burst 15 per-ip    # Up to 60 first-packet matches/minute per source IP
 limit 5000/sec burst 1000 global # Global service-wide rate limit across all clients
 ```
 
@@ -266,7 +294,7 @@ vip 10.0.10.50/24 {
         limit 300/sec burst 150 per-ip
         allow {
             10.0.0.0/8
-            169.254.1.*
+            192.168.1.*
             *.corp.lan
         }
         to {
@@ -286,8 +314,8 @@ vip 10.0.10.50/24 {
 
 ## 5. `gateway <ip[/cidr] | name> { ... }` Blocks
 
-A `gateway` block provisions a Virtual Gateway IP (either a static IPv4 like `gateway 169.254.10.20/24` or a named DHCP `macvlan` host like `gateway vpn-exit { dhcp eth0 }`) that LAN hosts, VMs, or containers can use as:
-1. Their **default IPv4 gateway** (`ip route replace default via 169.254.10.20`),
+A `gateway` block provisions a Virtual Gateway IP (either a static IPv4 like `gateway 192.168.10.20/24` or a named DHCP `macvlan` host like `gateway vpn-exit { dhcp eth0 }`) that LAN hosts, VMs, or containers can use as:
+1. Their **default IPv4 gateway** (`ip route replace default via 192.168.10.20`),
 2. An **HTTP/HTTPS `CONNECT` proxy** (`privoxy:8118`),
 3. A **SOCKS5 proxy** (`socks5:1080`), or
 4. A **DNS resolver** (`dns:53`).
@@ -295,7 +323,7 @@ A `gateway` block provisions a Virtual Gateway IP (either a static IPv4 like `ga
 ### 5.1 Direct Internet NAT Mode vs. WireGuard Tunnel Mode
 
 - **Direct Internet NAT Gateway** (no `tunnels` block): `nfty` enables IPv4 forwarding and masquerades traffic out `eth0` (`oifname "eth0" masquerade`).
-- **WireGuard Multi-Tunnel Egress Gateway** (with `tunnels { ... }`): `nfty` creates kernel `wg0..wgN` interfaces, configures per-tunnel policy routing tables (`101..100+N`) and `fwmark` rules (`0x101..0x100+N`), pins connections with `ct mark`, and load-balances outbound traffic across healthy tunnels.
+- **WireGuard Multi-Tunnel Egress Gateway** (with `tunnels { ... }`): `nfty` creates managed `wgN` interfaces, per-tunnel policy routing tables and `fwmark` rules, pins connections with `ct mark`, and load-balances outbound traffic across eligible tunnels.
 
 ### 5.2 Gateway Directive Reference
 
@@ -306,7 +334,7 @@ A `gateway` block provisions a Virtual Gateway IP (either a static IPv4 like `ga
 | `vlan` | `vlan <1-4094>` | None | Places the gateway VIP on an 802.1Q VLAN sub-interface. |
 | `hostname` | `hostname <name.local>` | None | Announces the gateway IP via multicast mDNS and registers it in `dnsmasq`. |
 | `balance` | `balance <round-robin\|sticky>` | `round-robin` | Selects how new flows are distributed across active WireGuard tunnels (`numgen inc mod N` vs `jhash ip saddr . ip daddr mod N`). |
-| `killswitch` | `killswitch <on\|off>` | `on` | When `on` and tunnels are configured, installs a kernel `forward` filter rule dropping any marked traffic that attempts to egress directly out `eth0` if all WireGuard tunnels go down. |
+| `killswitch` | `killswitch <on\|off>` | `on` | Drops new gateway traffic when no tunnel is eligible and drops marked external traffic leaving a non-WireGuard interface. |
 | `check` | `check <ping\|tcp\|http> [<secs>s]` | `ping 5s` | Probes each WireGuard tunnel interface (`ping -I wgN 1.1.1.1`) and removes dead tunnels from the ECMP verdict map. |
 | `privoxy:<port>` | `privoxy:8118` (or `privoxy`) | Disabled | Starts a privacy-sanitizing HTTP + HTTPS `CONNECT` proxy bound to the gateway IP and socket-marked (`SO_MARK` + `SO_BINDTODEVICE`) to egress through the gateway's healthy WireGuard tunnels. |
 | `socks5:<port>` | `socks5:1080` (or `socks5`) | Disabled | Starts an RFC 1928 SOCKS5 proxy bound to the gateway IP and pinned to the gateway's WireGuard tunnels. |
@@ -321,8 +349,14 @@ A `gateway` block provisions a Virtual Gateway IP (either a static IPv4 like `ga
 
 Inside `tunnels { ... }`, you can reference standard WireGuard `.conf` files saved in `/data/wg/` or define tunnels inline in `Nftyfile`:
 
+File-based tunnel interface names are derived from the gateway and profile
+names, so they remain stable when other tunnels are added or removed. Existing
+installations that referred to automatically assigned `wg0`, `wg1`, etc. must
+update those references after upgrading. Explicit inline `wgN` names are
+preserved. Collisions are rejected instead of sharing an interface.
+
 ```hcl
-gateway 169.254.10.20/24 {
+gateway 192.168.10.20/24 {
     hostname vpn-gw.local
     balance sticky
     killswitch on
@@ -334,10 +368,10 @@ gateway 169.254.10.20/24 {
         key nfty_ro_99887766554433221100aabbccddeeff ro
     }
     allow {
-        169.254.0.0/16
+        192.168.0.0/16
         10.10.0.0/16
     }
-    forward 51413/both to 169.254.20.15:51413
+    forward 51413/both to 192.168.20.15:51413
     forward 6881/tcp to torrent-box:6881
     tunnels {
         # 1. File-based WireGuard configs stored in /data/wg/
@@ -356,6 +390,10 @@ gateway 169.254.10.20/24 {
 
 The top-level `dns { ... }` block configures `nfty`'s supervised `dnsmasq` instance. `nfty` compiles this block into `/run/nfty-dnsmasq.conf` and `/run/nfty-dnsmasq.hosts` and reloads host records on the fly via `SIGHUP` without dropping cached entries.
 
+DNS listen addresses and gateway DNS listeners currently use port 53. Configuring
+more than one WireGuard gateway DNS listener is rejected because one dnsmasq
+instance cannot isolate its upstream routing by receiving gateway.
+
 ### Complete `dns` Directive Reference
 
 | Directive | Syntax | Default | Description |
@@ -364,7 +402,7 @@ The top-level `dns { ... }` block configures `nfty`'s supervised `dnsmasq` insta
 | `domain` | `domain <suffix \| off>` | `lan` | Sets the authoritative local search domain (e.g., `lan`, `home.arpa`, `corp.internal`) and enables `expand-hosts` and `local=/<domain>/`. |
 | `cache-size` | `cache-size <0-65535>` | `10000` | Sets the number of cached DNS records in `dnsmasq`. |
 | `auto-vips` | `auto-vips <on\|off>` | `on` | Automatically synthesizes forward `A` and reverse `PTR` records for all configured VIPs, service `hostname`s, `cloudflare-dns` names, and gateways. |
-| `auto-hosts` | `auto-hosts <on\|off>` | `on` | Automatically synthesizes `A` and `PTR` records for hosts discovered via `scan` or registered in `/data/hosts.json`. |
+| `auto-hosts` | `auto-hosts <on\|off>` | `on` | Automatically synthesizes `A` and `PTR` records for registered/resolved hosts in the host cache. Scans do not register host mappings. |
 | `health-aware` | `health-aware <on\|off>` | `on` | Dynamically removes a service's hostname from DNS responses when all of its backends fail health checks or are drained. |
 | `all-servers` | `all-servers <on\|off>` | `on` | Queries all configured upstream resolvers in parallel and returns the fastest response. |
 | `bogus-priv` | `bogus-priv <on\|off>` | `on` | Prevents reverse DNS lookups for private RFC1918/RFC3927 IP ranges from being leaked to upstream public resolvers. |
@@ -374,7 +412,7 @@ The top-level `dns { ... }` block configures `nfty`'s supervised `dnsmasq` insta
 | `forward` | `forward <domain> [to] <srv...> [via <gw>]` | None | Conditional split-horizon zone forwarding: sends queries for `*.<domain>` to `<srv...>` and optionally routes them through a WireGuard `<gateway>`. |
 | `a` | `a <hostname> <ipv4> [ipv4...]` | None | Defines an authoritative IPv4 `A` record (and automatic `PTR` record). Single-label names automatically expand with `domain`. |
 | `aaaa` | `aaaa <hostname> <ipv6>` | None | Defines an authoritative IPv6 `AAAA` record. |
-| `address` | `address <domain_or_wildcard> <ipv4>` | None | Wildcard DNS override returning `<ipv4>` for `<domain>` and all its subdomains (e.g., `address *.k8s.lan 169.254.10.80`). |
+| `address` | `address <domain_or_wildcard> <ipv4>` | None | Wildcard DNS override returning `<ipv4>` for `<domain>` and all its subdomains (e.g., `address *.k8s.lan 192.168.10.80`). |
 | `cname` | `cname <alias> <target>` | None | Creates a `CNAME` alias pointing to `<target>`. |
 | `txt` | `txt <name> "<text>"` | None | Creates a `TXT` record (for ACME DNS-01 challenges, SPF, DKIM, or service verification). |
 | `srv` | `srv <_svc._proto.dom> <target:port> [priority <P>] [weight <W>]` | None | Creates an `SRV` service record (e.g., `_minecraft._tcp.lan`, `_ldap._tcp.corp.lan`). |
@@ -383,14 +421,14 @@ The top-level `dns { ... }` block configures `nfty`'s supervised `dnsmasq` insta
 | `route` | `route <domain...> via <gateway>` | None | Compiles a `dnsmasq` `nftset=/<domains>/4#ip#nfty#dns_route_<gw>` rule that dynamically populates the kernel `@dns_route_<gw>` set on DNS resolution, routing matching traffic through `<gateway>`. |
 | `bypass` | `bypass <domain...> from <gateway>` | None | Compiles a `dnsmasq` `nftset=/<domains>/4#ip#nfty#dns_bypass_<gw>` rule that dynamically populates `@dns_bypass_<gw>`, bypassing the VPN tunnel on `<gateway>` and routing matching traffic directly out `eth0`. |
 | `block` | `block <domain_or_wildcard...>` | None | Sinkholes the specified domains and all subdomains to `0.0.0.0`. |
-| `blocklist` | `blocklist <name> <url_or_path>` | None | Downloads and caches a remote hosts/domain blocklist into `/data/dns/lists/<name>.hosts` (auto-refreshed every 24h) and loads it into `dnsmasq`. |
+| `blocklist` | `blocklist <name> <url_or_path>` | None | Normalizes a hosts/domain list into `/data/dns/lists/<name>.hosts` and loads it into `dnsmasq`. Remote lists refresh every 24h; an existing cache is retained with a warning if refresh fails. Missing or empty lists fail reconciliation. Names use letters, digits, `.`, `_`, and `-`. |
 | `raw` | `raw <dnsmasq-option>` | None | Appends a safe native `dnsmasq` directive (e.g., `raw expand-hosts` or `raw log-queries`). Restricted file/exec options (`dhcp-script`, `conf-file`, etc.) are blocked for security. |
 
 ### Comprehensive `dns { ... }` Example
 
 ```hcl
 dns {
-    listen 169.254.10.10 169.254.10.20
+    listen 192.168.10.10 192.168.10.20
     domain lan
     cache-size 20000
     auto-vips on
@@ -401,20 +439,20 @@ dns {
     domain-needed on
 
     upstream 1.1.1.1 9.9.9.9
-    forward corp.internal to 10.100.0.2 10.100.0.3 via 169.254.10.20
+    forward corp.internal to 10.100.0.2 10.100.0.3 via 192.168.10.20
 
-    a nas.lan 169.254.1.50
-    a k8s-ingress.lan 169.254.1.80 169.254.1.81
+    a nas.lan 192.168.1.50
+    a k8s-ingress.lan 192.168.1.80 192.168.1.81
     aaaa nas.lan fd00:10::50
-    address *.apps.lan 169.254.10.10
+    address *.apps.lan 192.168.10.10
     cname files.lan nas.lan
     txt _acme-challenge.example.com "R29vZ2xlQUNNRVRva2VuMjAyNg"
     srv _ldap._tcp.lan dc01.lan:389 priority 10 weight 100
     mx lan mail.lan 10
-    ptr 169.254.1.50 nas.lan
+    ptr 192.168.1.50 nas.lan
 
-    route linuxisos.org tracker.example.org via 169.254.10.20
-    bypass plex.tv netflix.com from 169.254.10.20
+    route linuxisos.org tracker.example.org via 192.168.10.20
+    bypass plex.tv netflix.com from 192.168.10.20
 
     block doubleclick.net *.telemetry.example.com
     blocklist stevenblack https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts

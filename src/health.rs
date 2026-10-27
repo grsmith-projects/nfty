@@ -1,5 +1,5 @@
 use crate::ast::{Backend, HealthCheckConfig, HealthCheckKind};
-use crate::compiler::{apply_vip_commands, generate_vip_commands, reload_kernel_from_state};
+use crate::compiler::{apply_config, reload_kernel_from_state};
 use crate::parser::expand_ip_wildcard_to_cidr;
 use crate::state::{HealthState, SharedState};
 use std::collections::{BTreeMap, BTreeSet};
@@ -286,8 +286,10 @@ async fn run_probes_internal(shared: &SharedState, force_all: bool) -> Vec<Probe
                 }
             }
         }
-        if health_changed && !st.running.is_empty() {
-            let _ = reload_kernel_from_state(&mut st);
+        if health_changed && st.kernel_applied && !st.running.is_empty() {
+            if let Err(e) = reload_kernel_from_state(&mut st) {
+                eprintln!("[nfty health] Failed to apply health changes: {:#}", e);
+            }
         }
     }
 
@@ -385,8 +387,19 @@ pub async fn refresh_allowlist_hosts(shared: &SharedState) {
 
     // 3. Merge into AppState and reload nftables if any allow-list or backend hostname IP changed
     let mut st = shared.write().unwrap();
+    let registered_hosts =
+        match crate::unikernel::read_persisted_hosts(std::path::Path::new("/data/hosts.json")) {
+            Ok(hosts) => hosts,
+            Err(e) => {
+                eprintln!("[nfty health] Cannot read registered host mappings: {:#}", e);
+                return;
+            }
+        };
     let mut changed = false;
     for (host, ips_set) in discovered {
+        if registered_hosts.contains_key(&host) {
+            continue;
+        }
         let ips_vec: Vec<Ipv4Addr> = ips_set.into_iter().collect();
         if ips_vec.is_empty() {
             continue;
@@ -397,6 +410,12 @@ pub async fn refresh_allowlist_hosts(shared: &SharedState) {
                 st.resolved_hosts.insert(host, ips_vec);
                 changed = true;
             }
+        }
+    }
+    for (host, ips) in registered_hosts {
+        if !ips.is_empty() && st.resolved_hosts.get(&host) != Some(&ips) {
+            st.resolved_hosts.insert(host, ips);
+            changed = true;
         }
     }
 
@@ -445,8 +464,10 @@ pub async fn refresh_allowlist_hosts(shared: &SharedState) {
 
     if changed {
         st.sync_runtime_entries();
-        if !st.running.is_empty() {
-            let _ = reload_kernel_from_state(&mut st);
+        if st.kernel_applied && !st.running.is_empty() {
+            if let Err(e) = reload_kernel_from_state(&mut st) {
+                eprintln!("[nfty health] Failed to apply host resolution changes: {:#}", e);
+            }
         }
     }
 }
@@ -506,22 +527,33 @@ pub fn spawn_background_tasks(shared: SharedState) {
                 st.sync_from_disk_if_changed();
                 if let Some(pending) = &st.pending_confirm {
                     if Instant::now() >= pending.deadline {
-                        let old_running = st.running.clone();
                         let revert_cfg = pending.revert_to.clone();
-                        let vip_cmds = generate_vip_commands(&old_running, &revert_cfg);
-                        let _ = apply_vip_commands(&vip_cmds);
-                        st.running = revert_cfg.clone();
-                        st.candidate = revert_cfg;
-                        st.pending_confirm = None;
-                        let _ = reload_kernel_from_state(&mut st);
-                        reverted = true;
+                        match apply_config(&mut st, revert_cfg.clone()) {
+                            Ok(_) => {
+                                st.history.pop();
+                                st.candidate = revert_cfg;
+                                st.pending_confirm = None;
+                                reverted = true;
+                            }
+                            Err(e) => {
+                                eprintln!("[nfty watchdog] Rollback failed; retrying: {:#}", e);
+                                if let Some(pending) = &mut st.pending_confirm {
+                                    pending.deadline = Instant::now() + Duration::from_secs(5);
+                                }
+                            }
+                        }
                     }
                 }
             }
             if reverted {
-                eprintln!(
-                    "\n[nfty watchdog] Commit confirmation timer expired! Automatically rolled back to previous running configuration."
-                );
+                match crate::unikernel::persist_to_storage(&shared) {
+                    Ok(()) => eprintln!(
+                        "\n[nfty watchdog] Commit confirmation timer expired! Automatically rolled back to previous running configuration."
+                    ),
+                    Err(e) => eprintln!(
+                        "[nfty watchdog] Rollback applied but persistence failed: {:#}", e
+                    ),
+                }
             }
 
             // 2. Poll counters every 2 seconds

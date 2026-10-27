@@ -4,7 +4,7 @@ use crate::ast::{
 };
 use crate::parser::expand_ip_wildcard_to_cidr;
 use crate::state::{AppState, HealthState};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -158,7 +158,14 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
         for gw in config.gateways.values() {
             for t in &gw.tunnels {
                 let chain_id = format!("mark_wg_{}", global_idx);
-                let fwmark = 0x101 + global_idx;
+                let iface = if t.iface.is_empty() {
+                    format!("wg{}", global_idx)
+                } else {
+                    t.iface.clone()
+                };
+                let route_idx = crate::features::wireguard::wireguard_iface_index(&iface)
+                    .unwrap_or(global_idx);
+                let fwmark = crate::features::wireguard::wireguard_mark(route_idx);
                 global_idx += 1;
                 out.push_str(&format!("    chain {} {{\n", chain_id));
                 out.push_str(&format!("        meta mark set 0x{:x}\n", fwmark));
@@ -181,7 +188,9 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                 } else {
                     t.iface.clone()
                 };
-                let fwmark = 0x101 + inbound_wg_idx;
+                let route_idx = crate::features::wireguard::wireguard_iface_index(&iface)
+                    .unwrap_or(inbound_wg_idx);
+                let fwmark = crate::features::wireguard::wireguard_mark(route_idx);
                 inbound_wg_idx += 1;
                 if !gw.forwards.is_empty() {
                     out.push_str(&format!(
@@ -225,11 +234,6 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                     }
                 }
             }
-            if active_indices.is_empty() && !gw.tunnels.is_empty() {
-                for local_i in 0..gw.tunnels.len() {
-                    active_indices.push(base_idx + local_i);
-                }
-            }
             base_idx += gw.tunnels.len();
 
             let gw_id = gw.nft_id();
@@ -266,7 +270,12 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             };
             gw_scope_prefix.push_str(&gw_allow_prefix);
 
-            if active_indices.len() == 1 {
+            if active_indices.is_empty() && gw.killswitch {
+                out.push_str(&format!(
+                    "        {}counter drop comment \"nfty:gateway-no-healthy-tunnel={}\"\n",
+                    gw_scope_prefix, gw_id
+                ));
+            } else if active_indices.len() == 1 {
                 out.push_str(&format!(
                     "        {}jump mark_wg_{}\n",
                     gw_scope_prefix, active_indices[0]
@@ -320,24 +329,52 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
 
         if active_backends.is_empty() {
             out.push_str(&format!(
-                "\n        # service {} (no backends configured)\n",
+                "\n        # service {} (no eligible backends)\n",
                 svc.key
             ));
+            let healthy_vhost_peer = matches!(svc.port, 80 | 443)
+                && matches!(svc.proto, Proto::Tcp | Proto::Both)
+                && svc.hostname.is_some()
+                && config.services.values().any(|other| {
+                    other.key != svc.key
+                        && matches!(other.proto, Proto::Tcp | Proto::Both)
+                        && other.hostname.is_some()
+                        && other.listen_ip == svc.listen_ip
+                        && other.port == svc.port
+                        && match state {
+                            Some(st) => !st.active_backends_for_service(&other.backends).is_empty(),
+                            None => !other.backends.is_empty(),
+                        }
+                });
+            for proto_str in expand_protos(svc.proto) {
+                if proto_str == "tcp" && healthy_vhost_peer {
+                    continue;
+                }
+                let ip_match = svc.listen_ip.map(|ip| format!("ip daddr {} ", ip)).unwrap_or_default();
+                out.push_str(&format!(
+                    "        {}{} dport {} counter drop comment \"nfty:no-healthy-backend\"\n",
+                    ip_match, proto_str, svc.port
+                ));
+            }
             continue;
         }
 
         let has_allow_rules = !svc.allow.is_empty() || !config.global_allow.is_empty();
         let use_l7_vhost = (svc.port == 80 || svc.port == 443)
+            && matches!(svc.proto, Proto::Tcp | Proto::Both)
             && svc.hostname.is_some()
             && config
                 .services
                 .values()
                 .filter(|other| {
                     other.listen_ip == svc.listen_ip
-                        && (other.port == svc.port || other.hostname.is_some())
+                        && other.port == svc.port
+                        && matches!(other.proto, Proto::Tcp | Proto::Both)
+                        && other.hostname.is_some()
                 })
                 .count()
-                > 1;
+                > 1
+            || (svc.port == 80 && svc.hostname.is_some() && !svc.auth.is_empty());
         out.push_str(&format!("\n        # --- service {} ---\n", svc.key));
         for proto_str in expand_protos(svc.proto) {
             emit_service_prerouting(
@@ -518,6 +555,31 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
     out.push_str("    chain forward {\n");
     out.push_str("        type filter hook forward priority filter; policy accept;\n");
     out.push_str("        meta pkttype { broadcast, multicast } drop\n");
+    let mut killswitch_marks = Vec::new();
+    let mut tunnel_index = 0usize;
+    for gw in config.gateways.values() {
+        for tunnel in &gw.tunnels {
+            let iface = if tunnel.iface.is_empty() {
+                format!("wg{}", tunnel_index)
+            } else {
+                tunnel.iface.clone()
+            };
+            let route_index = crate::features::wireguard::wireguard_iface_index(&iface)
+                .unwrap_or(tunnel_index);
+            tunnel_index += 1;
+            if gw.killswitch {
+                killswitch_marks.push(format!(
+                    "0x{:x}", crate::features::wireguard::wireguard_mark(route_index)
+                ));
+            }
+        }
+    }
+    if !killswitch_marks.is_empty() {
+        out.push_str(&format!(
+            "        oifname != \"wg*\" ip daddr != {{ 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }} meta mark {{ {} }} counter drop comment \"nfty:killswitch\"\n",
+            killswitch_marks.join(", ")
+        ));
+    }
     out.push_str("        ct state established,related accept\n");
 
     for svc in config.services.values() {
@@ -551,10 +613,6 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
     if any_wg_tunnels {
         out.push_str("        oifname \"wg*\" counter accept comment \"nfty:wg-forward\"\n");
         out.push_str("        iifname \"wg*\" ct state established,related counter accept\n");
-        let any_killswitch = config.gateways.values().any(|g| !g.tunnels.is_empty() && g.killswitch);
-        if any_killswitch {
-            out.push_str("        oifname \"eth0\" ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } meta mark != 0x0 counter drop comment \"nfty:killswitch\"\n");
-        }
     }
     if any_direct_gw {
         out.push_str("        oifname \"eth0\" ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter accept comment \"nfty:direct-gw-forward\"\n");
@@ -682,6 +740,24 @@ fn emit_service_prerouting(
         return;
     }
 
+    if !svc.auth.is_empty() && proto_str == "tcp" {
+        out.push_str(&format!(
+            "        {}{}{} counter redirect to :{} comment \"nfty:svc={}\"\n",
+            match_prefix,
+            allow_guard,
+            rate_guard,
+            crate::features::CF_LOCAL_AUTH_PORT,
+            svc.key
+        ));
+        if has_allow_rules || svc.limit.is_some() {
+            out.push_str(&format!(
+                "        {} counter drop comment \"nfty:svc-policy-drop={}\"\n",
+                match_prefix, svc.key
+            ));
+        }
+        return;
+    }
+
     let mut slots: Vec<&Backend> = Vec::new();
     for b in active_backends {
         for _ in 0..b.weight.max(1) {
@@ -747,6 +823,12 @@ fn emit_service_prerouting(
             ));
         }
     }
+    if has_allow_rules || svc.limit.is_some() {
+        out.push_str(&format!(
+            "        {} counter drop comment \"nfty:svc-policy-drop={}\"\n",
+            match_prefix, svc.key
+        ));
+    }
 }
 
 pub fn dhcp_macvlan_iface_name(vip_key: &str) -> String {
@@ -785,7 +867,7 @@ pub fn dhcp_macvlan_mac(vip_key: &str) -> String {
     )
 }
 
-fn ensure_vlan_interface(vip: &crate::ast::VipConfig, logs: &mut Vec<String>) {
+fn ensure_vlan_interface(vip: &crate::ast::VipConfig, logs: &mut Vec<String>) -> Result<()> {
     let (parent_dev, vlan_id, vlan_iface) = if let Some(vid) = vip.vlan {
         let suffix = format!(".{}", vid);
         let parent = vip.interface.strip_suffix(&suffix).unwrap_or(&vip.interface);
@@ -795,44 +877,42 @@ fn ensure_vlan_interface(vip: &crate::ast::VipConfig, logs: &mut Vec<String>) {
             if (1..=4094).contains(&vid) {
                 (left.to_string(), vid, vip.interface.clone())
             } else {
-                return;
+                return Ok(());
             }
         } else {
-            return;
+            return Ok(());
         }
     } else {
-        return;
+        return Ok(());
     };
 
     let sys_path = format!("/sys/class/net/{}", vlan_iface);
     if !std::path::Path::new(&sys_path).exists() {
         let vid_str = vlan_id.to_string();
-        if let Ok(out) = Command::new("ip")
-            .args([
-                "link",
-                "add",
-                "link",
-                &parent_dev,
-                "name",
-                &vlan_iface,
-                "type",
-                "vlan",
-                "id",
-                &vid_str,
-            ])
-            .output()
-        {
-            if out.status.success() {
-                logs.push(format!(
-                    "VLAN created: {} (802.1Q tag {} on {})",
-                    vlan_iface, vlan_id, parent_dev
-                ));
-            }
-        }
+        run_ip_checked(&[
+            "link", "add", "link", &parent_dev, "name", &vlan_iface,
+            "type", "vlan", "id", &vid_str,
+        ])?;
+        logs.push(format!(
+            "VLAN created: {} (802.1Q tag {} on {})",
+            vlan_iface, vlan_id, parent_dev
+        ));
     }
-    let _ = Command::new("ip")
-        .args(["link", "set", "dev", &vlan_iface, "up"])
-        .status();
+    run_ip_checked(&["link", "set", "dev", &vlan_iface, "up"])
+}
+
+fn prepare_config_vlans(cfg: &Config) -> Result<Vec<String>> {
+    let mut logs = Vec::new();
+    if unsafe { libc::geteuid() != 0 } {
+        return Ok(logs);
+    }
+    for vip in cfg.vips.values()
+        .chain(cfg.services.values().filter_map(|service| service.vip.as_ref()))
+        .chain(cfg.gateways.values().filter_map(|gateway| gateway.vip.as_ref()))
+    {
+        ensure_vlan_interface(vip, &mut logs)?;
+    }
+    Ok(logs)
 }
 
 fn sync_primary_iface_ip_file(iface: &str, ip_file: &str) {
@@ -862,29 +942,128 @@ fn sync_primary_iface_ip_file(iface: &str, ip_file: &str) {
     }
 }
 
-pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
-    let mut logs = Vec::new();
-    if unsafe { libc::geteuid() != 0 } {
-        return logs;
+fn run_ip_checked(args: &[&str]) -> Result<()> {
+    let output = Command::new("ip").args(args).output().context("Failed to invoke ip")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ip {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
+    Ok(())
+}
 
-    // 1. Ensure 802.1Q VLAN interfaces exist for all VIPs, services, and gateways
-    let mut all_vip_cfgs = Vec::new();
-    for v in cfg.vips.values() {
-        all_vip_cfgs.push(v.clone());
+fn managed_udhcpc_pid(iface: &str) -> Result<Option<i32>> {
+    let pid_path = format!("/run/udhcpc-{}.pid", iface);
+    let raw = match std::fs::read_to_string(&pid_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("Cannot read {}", pid_path)),
+    };
+    let pid = raw.trim().parse::<i32>()
+        .with_context(|| format!("Invalid DHCP PID in {}", pid_path))?;
+    if pid <= 0 {
+        anyhow::bail!("Invalid DHCP PID in {}", pid_path);
     }
-    for s in cfg.services.values() {
-        if let Some(v) = &s.vip {
-            all_vip_cfgs.push(v.clone());
+    let proc_path = format!("/proc/{}", pid);
+    let exe = match std::fs::read_link(format!("{}/exe", proc_path)) {
+        Ok(exe) => exe,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("Cannot inspect DHCP PID {}", pid)),
+    };
+    let executable = exe.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let cmdline = std::fs::read(format!("{}/cmdline", proc_path))
+        .with_context(|| format!("Cannot inspect DHCP PID {}", pid))?;
+    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).filter(|arg| !arg.is_empty()).collect();
+    let interface_matches = args.windows(2).any(|pair| pair[0] == b"-i" && pair[1] == iface.as_bytes());
+    let hook_matches = args.windows(2).any(|pair| pair[0] == b"-s" && pair[1] == b"/bin/udhcpc-hook");
+    if !matches!(executable, "udhcpc" | "busybox") || !interface_matches || !hook_matches {
+        anyhow::bail!("Refusing to use unrelated process {} from {}", pid, pid_path);
+    }
+    Ok(Some(pid))
+}
+
+fn remove_optional_file(path: &str) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("Cannot remove {}", path)),
+    }
+}
+
+fn stop_managed_udhcpc(iface: &str) -> Result<()> {
+    if let Some(pid) = managed_udhcpc_pid(iface)? {
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).with_context(|| format!("Cannot stop DHCP process {}", pid));
+            }
+        }
+        for _ in 0..40 {
+            if managed_udhcpc_pid(iface)? != Some(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if managed_udhcpc_pid(iface)? == Some(pid) {
+            anyhow::bail!("DHCP process {} did not stop", pid);
         }
     }
-    for g in cfg.gateways.values() {
-        if let Some(v) = &g.vip {
-            all_vip_cfgs.push(v.clone());
+    remove_optional_file(&format!("/run/udhcpc-{}.pid", iface))?;
+    remove_optional_file(&format!("/run/nfty-dhcp-{}.ip", iface))
+}
+
+fn ensure_managed_macvlan(iface: &str, parent: &str, mac: &str) -> Result<()> {
+    if iface == parent {
+        return Ok(());
+    }
+    let sys_path = format!("/sys/class/net/{}", iface);
+    let marker = format!("/run/nfty-dhcp-{}.owner", iface);
+    if std::path::Path::new(&sys_path).exists() {
+        let current_mac = std::fs::read_to_string(format!("{}/address", sys_path))
+            .with_context(|| format!("Cannot inspect interface {}", iface))?;
+        if !current_mac.trim().eq_ignore_ascii_case(mac) {
+            anyhow::bail!("Refusing to modify unmanaged interface '{}'", iface);
+        }
+        if !std::path::Path::new(&marker).is_file() {
+            let legacy_ip = format!("/run/nfty-dhcp-{}.ip", iface);
+            if managed_udhcpc_pid(iface)?.is_none() || !std::path::Path::new(&legacy_ip).is_file() {
+                anyhow::bail!("Refusing to modify interface '{}' without an nfty ownership marker", iface);
+            }
+            crate::unikernel::write_atomic(std::path::Path::new(&marker), mac.as_bytes())?;
+        }
+        let owner = std::fs::read_to_string(&marker)
+            .with_context(|| format!("Cannot read {}", marker))?;
+        if !owner.trim().eq_ignore_ascii_case(mac) {
+            anyhow::bail!("Interface '{}' has a conflicting nfty ownership marker", iface);
+        }
+        let lower = format!("{}/lower_{}", sys_path, parent);
+        if !std::path::Path::new(&lower).exists() {
+            stop_managed_udhcpc(iface)?;
+            run_ip_checked(&["link", "del", "dev", iface])?;
         }
     }
-    for v in &all_vip_cfgs {
-        ensure_vlan_interface(v, &mut logs);
+    if !std::path::Path::new(&sys_path).exists() {
+        let _ = Command::new("modprobe").args(["-q", "macvlan"]).status();
+        run_ip_checked(&[
+            "link", "add", "link", parent, "name", iface, "address", mac,
+            "type", "macvlan", "mode", "bridge",
+        ])?;
+        if let Err(error) = crate::unikernel::write_atomic(std::path::Path::new(&marker), mac.as_bytes()) {
+            if let Err(cleanup) = run_ip_checked(&["link", "del", "dev", iface]) {
+                anyhow::bail!("{}; failed to remove new interface '{}': {}", error, iface, cleanup);
+            }
+            return Err(error.context("Cannot record DHCP interface ownership"));
+        }
+    }
+    Ok(())
+}
+
+pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Result<Vec<String>> {
+    let mut logs = prepare_config_vlans(cfg)?;
+    if unsafe { libc::geteuid() != 0 } {
+        return Ok(logs);
     }
 
     // 2. Reconcile DHCP VIP macvlan interfaces + udhcpc leases
@@ -900,24 +1079,12 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         let mv_iface = dhcp_macvlan_iface_name(&vip_key);
         active_mv_ifaces.insert(mv_iface.clone());
         let mac = dhcp_macvlan_mac(&vip_key);
-        let mut parent_iface = vip_cfg.effective_base_iface();
+        let parent_iface = vip_cfg.effective_base_iface();
         if !std::path::Path::new(&format!("/sys/class/net/{}", parent_iface)).exists() {
-            let resolved = crate::unikernel::ensure_primary_eth0_up();
-            if parent_iface == "eth0" {
-                parent_iface = resolved;
-            }
+            anyhow::bail!("DHCP parent interface '{}' does not exist", parent_iface);
         }
 
-        let mv_sys = format!("/sys/class/net/{}", mv_iface);
-        if mv_iface != parent_iface {
-            let lower_sys = format!("/sys/class/net/{}/lower_{}", mv_iface, parent_iface);
-            if std::path::Path::new(&mv_sys).exists() && !std::path::Path::new(&lower_sys).exists() {
-                // Parent interface changed (e.g. VLAN changed); recreate macvlan
-                let _ = Command::new("ip")
-                    .args(["link", "del", "dev", &mv_iface])
-                    .status();
-            }
-        }
+        ensure_managed_macvlan(&mv_iface, &parent_iface, &mac)?;
 
         // Prevent ARP flux and ICMP redirects on parent and macvlan BEFORE bringing link up
         for scope in ["all", "default", parent_iface.as_str()] {
@@ -927,34 +1094,6 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
             let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/send_redirects", scope), "0\n");
             let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/accept_redirects", scope), "0\n");
             let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", scope), "0\n");
-        }
-
-        if mv_iface != parent_iface && !std::path::Path::new(&mv_sys).exists() {
-            let _ = Command::new("modprobe").args(["-q", "macvlan"]).status();
-            let _ = Command::new("ip")
-                .args([
-                    "link",
-                    "add",
-                    "link",
-                    &parent_iface,
-                    "name",
-                    &mv_iface,
-                    "address",
-                    &mac,
-                    "type",
-                    "macvlan",
-                    "mode",
-                    "bridge",
-                ])
-                .status();
-        }
-
-        if !std::path::Path::new(&mv_sys).exists() {
-            logs.push(format!(
-                "Warning: failed to create macvlan interface '{}' on parent '{}' (is NIC attached to VM?)",
-                mv_iface, parent_iface
-            ));
-            continue;
         }
 
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", mv_iface), "1\n");
@@ -967,29 +1106,16 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/accept_redirects", mv_iface), "0\n");
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", mv_iface), "0\n");
 
-        let _ = Command::new("ip")
-            .args(["link", "set", "dev", &mv_iface, "up"])
-            .status();
+        run_ip_checked(&["link", "set", "dev", &mv_iface, "up"])?;
 
         let pid_file = format!("/run/udhcpc-{}.pid", mv_iface);
         let ip_file = format!("/run/nfty-dhcp-{}.ip", mv_iface);
         if mv_iface == parent_iface {
             sync_primary_iface_ip_file(&mv_iface, &ip_file);
         }
-        let udhcpc_running = std::fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .map(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists())
-            .unwrap_or(false);
+        let udhcpc_running = managed_udhcpc_pid(&mv_iface)?.is_some();
 
-        if !udhcpc_running || !std::path::Path::new(&ip_file).exists() {
-            if let Ok(old_pid_str) = std::fs::read_to_string(&pid_file) {
-                if let Ok(old_pid) = old_pid_str.trim().parse::<i32>() {
-                    unsafe {
-                        libc::kill(old_pid, libc::SIGTERM);
-                    }
-                }
-            }
+        if !udhcpc_running {
             let hostname: String = vip_key
                 .chars()
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -1000,7 +1126,7 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
             } else {
                 "udhcpc"
             };
-            let _ = Command::new(udhcpc_bin)
+            let status = Command::new(udhcpc_bin)
                 .args([
                     "-i",
                     &mv_iface,
@@ -1018,7 +1144,11 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
                     "60",
                     "-b",
                 ])
-                .status();
+                .status()
+                .with_context(|| format!("Cannot start DHCP on {}", mv_iface))?;
+            if !status.success() {
+                anyhow::bail!("DHCP client for '{}' exited with {}", mv_iface, status);
+            }
         }
 
         if let Ok(raw_ip) = std::fs::read_to_string(&ip_file) {
@@ -1053,23 +1183,12 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         let mv_iface = dhcp_macvlan_iface_name(&gw_key);
         active_mv_ifaces.insert(mv_iface.clone());
         let mac = dhcp_macvlan_mac(&gw_key);
-        let mut parent_iface = vip_cfg.effective_base_iface();
+        let parent_iface = vip_cfg.effective_base_iface();
         if !std::path::Path::new(&format!("/sys/class/net/{}", parent_iface)).exists() {
-            let resolved = crate::unikernel::ensure_primary_eth0_up();
-            if parent_iface == "eth0" {
-                parent_iface = resolved;
-            }
+            anyhow::bail!("DHCP parent interface '{}' does not exist", parent_iface);
         }
 
-        let mv_sys = format!("/sys/class/net/{}", mv_iface);
-        if mv_iface != parent_iface {
-            let lower_sys = format!("/sys/class/net/{}/lower_{}", mv_iface, parent_iface);
-            if std::path::Path::new(&mv_sys).exists() && !std::path::Path::new(&lower_sys).exists() {
-                let _ = Command::new("ip")
-                    .args(["link", "del", "dev", &mv_iface])
-                    .status();
-            }
-        }
+        ensure_managed_macvlan(&mv_iface, &parent_iface, &mac)?;
 
         for scope in ["all", "default", parent_iface.as_str()] {
             let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", scope), "1\n");
@@ -1078,34 +1197,6 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
             let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/send_redirects", scope), "0\n");
             let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/accept_redirects", scope), "0\n");
             let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", scope), "0\n");
-        }
-
-        if mv_iface != parent_iface && !std::path::Path::new(&mv_sys).exists() {
-            let _ = Command::new("modprobe").args(["-q", "macvlan"]).status();
-            let _ = Command::new("ip")
-                .args([
-                    "link",
-                    "add",
-                    "link",
-                    &parent_iface,
-                    "name",
-                    &mv_iface,
-                    "address",
-                    &mac,
-                    "type",
-                    "macvlan",
-                    "mode",
-                    "bridge",
-                ])
-                .status();
-        }
-
-        if !std::path::Path::new(&mv_sys).exists() {
-            logs.push(format!(
-                "Warning: failed to create macvlan interface '{}' on parent '{}' (is NIC attached to VM?)",
-                mv_iface, parent_iface
-            ));
-            continue;
         }
 
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", mv_iface), "1\n");
@@ -1118,29 +1209,16 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/accept_redirects", mv_iface), "0\n");
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", mv_iface), "0\n");
 
-        let _ = Command::new("ip")
-            .args(["link", "set", "dev", &mv_iface, "up"])
-            .status();
+        run_ip_checked(&["link", "set", "dev", &mv_iface, "up"])?;
 
         let pid_file = format!("/run/udhcpc-{}.pid", mv_iface);
         let ip_file = format!("/run/nfty-dhcp-{}.ip", mv_iface);
         if mv_iface == parent_iface {
             sync_primary_iface_ip_file(&mv_iface, &ip_file);
         }
-        let udhcpc_running = std::fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .map(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists())
-            .unwrap_or(false);
+        let udhcpc_running = managed_udhcpc_pid(&mv_iface)?.is_some();
 
-        if !udhcpc_running || !std::path::Path::new(&ip_file).exists() {
-            if let Ok(old_pid_str) = std::fs::read_to_string(&pid_file) {
-                if let Ok(old_pid) = old_pid_str.trim().parse::<i32>() {
-                    unsafe {
-                        libc::kill(old_pid, libc::SIGTERM);
-                    }
-                }
-            }
+        if !udhcpc_running {
             let hostname: String = gw_key
                 .chars()
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -1154,7 +1232,7 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
             } else {
                 "udhcpc"
             };
-            let _ = Command::new(udhcpc_bin)
+            let status = Command::new(udhcpc_bin)
                 .args([
                     "-i",
                     &mv_iface,
@@ -1172,7 +1250,11 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
                     "60",
                     "-b",
                 ])
-                .status();
+                .status()
+                .with_context(|| format!("Cannot start DHCP on {}", mv_iface))?;
+            if !status.success() {
+                anyhow::bail!("DHCP client for '{}' exited with {}", mv_iface, status);
+            }
         }
 
         if let Ok(raw_ip) = std::fs::read_to_string(&ip_file) {
@@ -1191,31 +1273,38 @@ pub fn reconcile_dhcp_and_vlan_vips(cfg: &mut Config) -> Vec<String> {
         }
     }
 
-    // 3. Clean up any stale mv-* interfaces no longer in cfg.vips or cfg.gateways
-    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("mv-") && !active_mv_ifaces.contains(&name) {
-                let pid_file = format!("/run/udhcpc-{}.pid", name);
-                let ip_file = format!("/run/nfty-dhcp-{}.ip", name);
-                if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        unsafe {
-                            libc::kill(pid, libc::SIGTERM);
-                        }
-                    }
-                }
-                let _ = std::fs::remove_file(&pid_file);
-                let _ = std::fs::remove_file(&ip_file);
-                let _ = Command::new("ip")
-                    .args(["link", "del", "dev", &name])
-                    .status();
-                logs.push(format!("Removed DHCP VIP interface {}", name));
-            }
+    // Only interfaces with nfty's ownership marker may be removed.
+    for entry in std::fs::read_dir("/run").context("Cannot inspect DHCP ownership markers")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(iface) = name.strip_prefix("nfty-dhcp-").and_then(|s| s.strip_suffix(".owner")) else {
+            continue;
+        };
+        if !iface.starts_with("mv-") || active_mv_ifaces.contains(iface) {
+            continue;
         }
+        let marker = entry.path();
+        let owner = std::fs::read_to_string(&marker)
+            .with_context(|| format!("Cannot read {}", marker.display()))?;
+        let sys_path = format!("/sys/class/net/{}", iface);
+        if std::path::Path::new(&sys_path).exists() {
+            let actual_mac = std::fs::read_to_string(format!("{}/address", sys_path))
+                .with_context(|| format!("Cannot inspect interface {}", iface))?;
+            if !actual_mac.trim().eq_ignore_ascii_case(owner.trim()) {
+                anyhow::bail!("Refusing to remove unmanaged interface '{}'", iface);
+            }
+            stop_managed_udhcpc(iface)?;
+            run_ip_checked(&["link", "del", "dev", iface])?;
+            logs.push(format!("Removed DHCP VIP interface {}", iface));
+        } else {
+            stop_managed_udhcpc(iface)?;
+        }
+        std::fs::remove_file(&marker)
+            .with_context(|| format!("Cannot remove {}", marker.display()))?;
     }
 
-    logs
+    Ok(logs)
 }
 
 pub fn generate_vip_commands(old_cfg: &Config, new_cfg: &Config) -> Vec<String> {
@@ -1300,9 +1389,160 @@ pub struct ValidationReport {
     pub nft_message: String,
 }
 
+fn configuration_safety_errors(config: &Config) -> Vec<String> {
+    let mut errors = Vec::new();
+    for svc in config.services.values() {
+        if !svc.auth.is_empty() {
+            if svc.proto != Proto::Tcp {
+                errors.push(format!(
+                    "service '{}': local Basic Auth ('auth') requires TCP and cannot be enforced on UDP",
+                    svc.key
+                ));
+            } else if svc.port == 443 {
+                errors.push(format!(
+                    "service '{}': local Basic Auth ('auth') cannot inspect encrypted TLS passthrough on port 443",
+                    svc.key
+                ));
+            }
+        }
+    }
+
+    let services: Vec<_> = config.services.values().collect();
+    for (index, svc) in services.iter().enumerate() {
+        for other in &services[index + 1..] {
+            let same_address = match (svc.listen_ip, other.listen_ip) {
+                (Some(left), Some(right)) => left == right,
+                (None, None) => svc.vip_id == other.vip_id,
+                _ => false,
+            };
+            if !same_address || svc.port != other.port {
+                continue;
+            }
+            let tcp_overlap = matches!(svc.proto, Proto::Tcp | Proto::Both)
+                && matches!(other.proto, Proto::Tcp | Proto::Both);
+            let udp_overlap = matches!(svc.proto, Proto::Udp | Proto::Both)
+                && matches!(other.proto, Proto::Udp | Proto::Both);
+            let distinct_vhosts = match (&svc.hostname, &other.hostname) {
+                (Some(left), Some(right)) => {
+                    let left = left.trim_end_matches('.').to_ascii_lowercase();
+                    let right = right.trim_end_matches('.').to_ascii_lowercase();
+                    left.strip_suffix(".local").unwrap_or(&left)
+                        != right.strip_suffix(".local").unwrap_or(&right)
+                }
+                _ => false,
+            };
+            let shared_vhost = tcp_overlap && matches!(svc.port, 80 | 443) && distinct_vhosts;
+            if tcp_overlap && !shared_vhost {
+                errors.push(format!(
+                    "services '{}' and '{}' overlap TCP on the same address and port without distinct HTTP/TLS hostnames",
+                    svc.key, other.key
+                ));
+            }
+            if shared_vhost && (svc.limit.is_some() || other.limit.is_some()) {
+                errors.push(format!(
+                    "services '{}' and '{}': per-service limits cannot be enforced on a shared HTTP/TLS virtual-host binding",
+                    svc.key, other.key
+                ));
+            }
+            if udp_overlap {
+                errors.push(format!(
+                    "services '{}' and '{}' overlap UDP on the same address and port",
+                    svc.key, other.key
+                ));
+            }
+        }
+    }
+
+    if let Some(dns) = &config.dns {
+        for listen in &dns.listen {
+            let (address, port) = listen.split_once(':').unwrap_or((listen.as_str(), "53"));
+            if (address != "*" && address.parse::<std::net::Ipv4Addr>().is_err()) || port != "53" {
+                errors.push(format!(
+                    "dns listen '{}': only IPv4 addresses on port 53 are supported",
+                    listen
+                ));
+            }
+        }
+    }
+    let mut tunnel_dns_gateways = 0usize;
+    for gw in config.gateways.values() {
+        for service in &gw.services {
+            if service.kind == GatewayServiceKind::Dns && service.port != 53 {
+                errors.push(format!(
+                    "gateway '{}': DNS service port {} is unsupported; use port 53",
+                    gw.key, service.port
+                ));
+            }
+            if service.kind == GatewayServiceKind::Dns && !gw.tunnels.is_empty() {
+                tunnel_dns_gateways += 1;
+            }
+        }
+    }
+    if tunnel_dns_gateways > 1 {
+        errors.push("DNS cannot isolate upstream routing for multiple WireGuard gateway listeners".to_string());
+    }
+
+    let mut dhcp_ifaces = std::collections::BTreeMap::new();
+    for (key, vip) in config.vips.iter()
+        .filter_map(|(key, vip)| vip.dhcp.then_some((key.as_str(), vip)))
+        .chain(config.gateways.iter().filter_map(|(key, gateway)| {
+            gateway.vip.as_ref().filter(|vip| vip.dhcp).map(|vip| (key.as_str(), vip))
+        }))
+    {
+        let iface = dhcp_macvlan_iface_name(key);
+        let parent = vip.effective_base_iface();
+        if key.eq_ignore_ascii_case("default") && parent != "eth0" {
+            errors.push(format!(
+                "DHCP name '{}': the default interface must be eth0 (got '{}')",
+                key, parent
+            ));
+        }
+        if let Some((previous, previous_parent)) = dhcp_ifaces.insert(iface.clone(), (key, parent.clone())) {
+            if previous != key || previous_parent != parent {
+                errors.push(format!(
+                    "DHCP names '{}' and '{}' collide on interface '{}' or use different parents",
+                    previous, key, iface
+                ));
+            }
+        }
+    }
+
+    let mut tunnel_ifaces = BTreeSet::new();
+    let mut tunnel_indices = BTreeSet::new();
+    let mut global_idx = 0usize;
+    for gw in config.gateways.values() {
+        for tunnel in &gw.tunnels {
+            let iface = if tunnel.iface.is_empty() {
+                format!("wg{}", global_idx)
+            } else {
+                tunnel.iface.clone()
+            };
+            global_idx += 1;
+            if !tunnel_ifaces.insert(iface.clone()) {
+                errors.push(format!(
+                    "gateway '{}': WireGuard interface '{}' is assigned to more than one tunnel",
+                    gw.key, iface
+                ));
+            }
+            match crate::features::wireguard::wireguard_iface_index(&iface) {
+                Some(index) if !tunnel_indices.insert(index) => errors.push(format!(
+                    "gateway '{}': WireGuard interface '{}' shares a routing index with another tunnel",
+                    gw.key, iface
+                )),
+                Some(_) => {}
+                None => errors.push(format!(
+                    "gateway '{}': invalid WireGuard interface '{}'; expected wg followed by a number up to 1999999",
+                    gw.key, iface
+                )),
+            }
+        }
+    }
+    errors
+}
+
 pub fn validate_config(config: &Config, state: Option<&AppState>) -> ValidationReport {
     let mut warnings = Vec::new();
-    let mut errors = Vec::new();
+    let mut errors = configuration_safety_errors(config);
 
     if config.vips.is_empty() && config.services.is_empty() && config.gateways.is_empty() {
         warnings.push("No VIPs, services, or gateways are defined in configuration.".to_string());
@@ -1312,7 +1552,7 @@ pub fn validate_config(config: &Config, state: Option<&AppState>) -> ValidationR
     warnings.extend(config.control_allow_list_warnings());
 
     for svc in config.services.values() {
-        if svc.backends.is_empty() {
+        if svc.backends.is_empty() && !svc.is_local_dns() {
             errors.push(format!(
                 "service '{}': has no backend targets configured (use 'to <ip:port>')",
                 svc.key
@@ -1376,6 +1616,7 @@ pub fn validate_config(config: &Config, state: Option<&AppState>) -> ValidationR
 }
 
 pub fn run_nft_command(ruleset: &str, check_only: bool) -> (bool, bool, String) {
+    let is_root = unsafe { libc::geteuid() == 0 };
     let nft_bin = if std::path::Path::new("/usr/sbin/nft").exists() {
         "/usr/sbin/nft"
     } else if std::path::Path::new("/usr/bin/nft").exists() {
@@ -1397,7 +1638,14 @@ pub fn run_nft_command(ruleset: &str, check_only: bool) -> (bool, bool, String) 
     match cmd.spawn() {
         Ok(mut child) => {
             if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(ruleset.as_bytes());
+                if let Err(e) = stdin.write_all(ruleset.as_bytes()) {
+                    drop(stdin);
+                    let _ = child.wait_with_output();
+                    return (false, false, format!("Failed to write nftables ruleset: {}", e));
+                }
+            } else {
+                let _ = child.wait_with_output();
+                return (false, false, "Failed to open nftables stdin".to_string());
             }
             match child.wait_with_output() {
                 Ok(output) => {
@@ -1412,34 +1660,55 @@ pub fn run_nft_command(ruleset: &str, check_only: bool) -> (bool, bool, String) 
                                 "Applied ruleset to kernel nftables".to_string()
                             },
                         )
-                    } else if stderr.contains("Operation not permitted")
-                        || stderr.contains("Permission denied")
-                        || stderr.contains("must be root")
+                    } else if !is_root
+                        && !stderr.contains("syntax error")
+                        && (stderr.contains("Operation not permitted")
+                            || stderr.contains("Permission denied")
+                            || stderr.contains("you must be root")
+                            || stderr.contains("cache initialization failed"))
                     {
                         (
                             false,
                             true,
-                            "Syntax verified (note: not running as root, kernel netlink simulated)"
-                                .to_string(),
+                            "Simulated nftables dry-run (unprivileged mode)".to_string(),
                         )
                     } else {
-                        (true, false, stderr)
+                        (
+                            true,
+                            false,
+                            if stderr.is_empty() {
+                                format!("nft exited with {}", output.status)
+                            } else {
+                                stderr
+                            },
+                        )
                     }
                 }
-                Err(e) => (false, true, format!("nft wait failed: {}", e)),
+                Err(e) => (false, false, format!("nft wait failed: {}", e)),
             }
         }
-        Err(_) => (
-            false,
-            true,
-            "AST & compiler verification passed (nft binary not in PATH; running in userspace/unikernel mode)"
-                .to_string(),
-        ),
+        Err(e) => {
+            if !is_root
+                && matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                )
+            {
+                (
+                    false,
+                    true,
+                    "Simulated nftables dry-run (unprivileged mode)".to_string(),
+                )
+            } else {
+                (false, false, format!("Failed to start nft: {}", e))
+            }
+        }
     }
 }
 
-pub fn apply_vip_commands(cmds: &[String]) -> Vec<String> {
+pub fn apply_vip_commands(cmds: &[String]) -> Result<Vec<String>> {
     let mut logs = Vec::new();
+    let mut errors = Vec::new();
     for cmd_str in cmds {
         let parts: Vec<&str> = cmd_str.split_whitespace().collect();
         if parts.is_empty() {
@@ -1462,22 +1731,169 @@ pub fn apply_vip_commands(cmds: &[String]) -> Vec<String> {
             }
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                logs.push(format!("VIP command '{}' (non-root/staged): {}", cmd_str, err));
+                errors.push(format!("VIP command '{}' failed: {}", cmd_str, err));
             }
-            Err(_) => {
-                logs.push(format!("VIP staged: {}", cmd_str));
+            Err(e) => {
+                errors.push(format!("VIP command '{}' failed: {}", cmd_str, e));
             }
         }
     }
-    logs
+    if errors.is_empty() {
+        Ok(logs)
+    } else {
+        Err(anyhow::anyhow!(errors.join("; ")))
+    }
+}
+
+pub struct ApplyResult {
+    pub message: String,
+    pub logs: Vec<String>,
+}
+
+/// Applies a configuration and restores the previous state on failure where possible.
+pub fn apply_config(state: &mut AppState, next: Config) -> Result<ApplyResult> {
+    let errors = configuration_safety_errors(&next);
+    if !errors.is_empty() {
+        anyhow::bail!("Configuration cannot be safely applied: {}", errors.join("; "));
+    }
+    let mut logs = prepare_config_vlans(&next)
+        .context("Failed to prepare VLAN interfaces")?;
+    let previous = state.running.clone();
+    let stopped_cloudflare = previous != next
+        && [&previous, &next].iter().any(|config| config.services.values().any(|svc| {
+            svc.cloudflare.is_some() && (!svc.auth.is_empty() || !svc.cloudflare_auth.is_empty())
+        }));
+    if stopped_cloudflare {
+        crate::features::cloudflare::prepare_cloudflare_config_update()
+            .context("Cannot safely update protected Cloudflare services")?;
+    }
+    let previous_candidate = state.candidate.clone();
+    let vip_commands = generate_vip_commands(&previous, &next);
+    let vip_logs = match apply_vip_commands(&vip_commands) {
+        Ok(logs) => logs,
+        Err(error) => {
+            let restore_commands = generate_vip_commands(&next, &previous);
+            return match apply_vip_commands(&restore_commands) {
+                Ok(_) => {
+                    if stopped_cloudflare {
+                        if let Err(restore_error) =
+                            crate::features::cloudflare::queue_cloudflare_reconcile(previous.clone())
+                        {
+                            return Err(anyhow::anyhow!(
+                                "{}; Cloudflare restoration could not be queued: {}",
+                                error,
+                                restore_error
+                            ));
+                        }
+                    }
+                    Err(error)
+                }
+                Err(restore_error) => Err(anyhow::anyhow!(
+                    "{}; VIP restoration also failed: {}",
+                    error,
+                    restore_error
+                )),
+            };
+        }
+    };
+    logs.extend(vip_logs);
+
+    state.running = next.clone();
+    state.sync_runtime_entries();
+    let (result, dhcp_logs) = reload_kernel_from_state_with_logs(state, true);
+    logs.extend(dhcp_logs);
+    match result {
+        Ok(message) => {
+            state.history.push(previous);
+            Ok(ApplyResult { message, logs })
+        }
+        Err(error) => {
+            state.running = previous.clone();
+            state.candidate = previous_candidate;
+            state.sync_runtime_entries();
+            let restore_commands = generate_vip_commands(&next, &previous);
+            let vip_restore = apply_vip_commands(&restore_commands).err();
+            let reload_restore = reload_kernel_from_state_with_logs(state, true).0.err();
+            match (vip_restore, reload_restore) {
+                (None, None) => Err(error),
+                (vip, reload) => Err(anyhow::anyhow!(
+                    "{}; restoration failed (VIPs: {}; reload: {})",
+                    error,
+                    vip.map(|e| e.to_string()).unwrap_or_else(|| "ok".to_string()),
+                    reload.map(|e| e.to_string()).unwrap_or_else(|| "ok".to_string())
+                )),
+            }
+        }
+    }
 }
 
 pub fn reload_kernel_from_state(state: &mut AppState) -> Result<String> {
-    reload_kernel_from_state_with_logs(state).0
+    reload_kernel_from_state_with_logs(state, false).0
 }
 
-pub fn reload_kernel_from_state_with_logs(state: &mut AppState) -> (Result<String>, Vec<String>) {
-    let dhcp_logs = reconcile_dhcp_and_vlan_vips(&mut state.running);
+pub fn update_host_mapping(
+    state: &mut AppState,
+    host: &str,
+    ips: &[std::net::Ipv4Addr],
+) -> Result<()> {
+    let previous_hosts = state.resolved_hosts.clone();
+    let previous_running = state.running.clone();
+    let previous_candidate = state.candidate.clone();
+    state.set_host_mapping(host, ips);
+    if !state.running.is_empty() {
+        if let Err(error) = reload_kernel_from_state(state) {
+            state.resolved_hosts = previous_hosts;
+            state.running = previous_running;
+            state.candidate = previous_candidate;
+            state.sync_runtime_entries();
+            return match reload_kernel_from_state(state) {
+                Ok(_) => Err(error.context("Failed to update host mapping")),
+                Err(restore_error) => Err(anyhow::anyhow!(
+                    "Failed to update host mapping: {}; restoration failed: {}",
+                    error, restore_error
+                )),
+            };
+        }
+    }
+    Ok(())
+}
+
+pub fn set_backend_drain_state(
+    state: &mut AppState,
+    endpoints: &[String],
+    drained: bool,
+) -> Result<()> {
+    let previous: Vec<(String, bool)> = endpoints.iter().map(|endpoint| {
+        let runtime = state.runtime.entry(endpoint.clone()).or_default();
+        let old = runtime.drained;
+        runtime.drained = drained;
+        (endpoint.clone(), old)
+    }).collect();
+    if state.running.services.is_empty() && state.running.gateways.is_empty() {
+        return Ok(());
+    }
+    if let Err(error) = reload_kernel_from_state(state) {
+        for (endpoint, old) in previous {
+            state.runtime.entry(endpoint).or_default().drained = old;
+        }
+        return match reload_kernel_from_state(state) {
+            Ok(_) => Err(error.context("Failed to update backend state")),
+            Err(restore_error) => Err(anyhow::anyhow!(
+                "Failed to update backend state: {}; restoration failed: {}", error, restore_error
+            )),
+        };
+    }
+    Ok(())
+}
+
+fn reload_kernel_from_state_with_logs(
+    state: &mut AppState,
+    reconcile_wireguard: bool,
+) -> (Result<String>, Vec<String>) {
+    let dhcp_logs = match reconcile_dhcp_and_vlan_vips(&mut state.running) {
+        Ok(logs) => logs,
+        Err(e) => return (Err(e.context("Failed to reconcile DHCP and VLAN interfaces")), Vec::new()),
+    };
     // Sync leased DHCP VIP IPs into candidate config as well so `status` and `show` stay in sync
     for (k, run_vip) in &state.running.vips {
         if let Some(leased) = run_vip.leased_ip {
@@ -1504,12 +1920,10 @@ pub fn reload_kernel_from_state_with_logs(state: &mut AppState) -> (Result<Strin
             }
         }
     }
-    let _ = crate::features::apply_wireguard_gateways(&state.running);
-    if unsafe { libc::geteuid() == 0 } {
-        let cf_cfg = state.running.clone();
-        std::thread::spawn(move || {
-            let _ = crate::features::reconcile_cloudflare_tunnel(&cf_cfg);
-        });
+    if reconcile_wireguard {
+        if let Err(e) = crate::features::apply_wireguard_gateways(&state.running) {
+            return (Err(e.context("Failed to apply WireGuard gateways")), dhcp_logs);
+        }
     }
     let ruleset = compile_nft_ruleset(&state.running, Some(state));
     let (in_kernel, ok, msg) = run_nft_command(&ruleset, false);
@@ -1519,7 +1933,100 @@ pub fn reload_kernel_from_state_with_logs(state: &mut AppState) -> (Result<Strin
     state.last_applied_nft = ruleset;
     state.kernel_applied = in_kernel;
     if unsafe { libc::geteuid() == 0 } {
-        let _ = crate::features::reconcile_dnsmasq(&state.running, Some(state));
+        if let Err(e) = crate::features::reconcile_dnsmasq(&state.running, Some(state)) {
+            return (Err(e.context("Failed to reconcile DNS")), dhcp_logs);
+        }
+        if let Err(e) = crate::features::cloudflare::queue_cloudflare_reconcile(state.running.clone()) {
+            return (Err(e.context("Failed to queue Cloudflare reconciliation")), dhcp_logs);
+        }
     }
     (Ok(msg), dhcp_logs)
+}
+
+#[cfg(test)]
+mod service_binding_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn service(key: &str, port: u16, proto: Proto, hostname: &str) -> Service {
+        let mut service = Service::new(
+            key.to_string(),
+            Some(Ipv4Addr::new(192, 0, 2, 10)),
+            port,
+            proto,
+        );
+        service.hostname = Some(hostname.to_string());
+        service
+    }
+
+    #[test]
+    fn rejects_ambiguous_bindings_but_accepts_distinct_tcp_vhosts() {
+        let mut config = Config::new();
+        config
+            .services
+            .insert("a".to_string(), service("a", 1234, Proto::Tcp, "a"));
+        config
+            .services
+            .insert("b".to_string(), service("b", 1234, Proto::Tcp, "b"));
+        assert!(configuration_safety_errors(&config)
+            .iter()
+            .any(|e| e.contains("overlap TCP")));
+
+        config
+            .services
+            .insert("a".to_string(), service("a", 80, Proto::Tcp, "a"));
+        config
+            .services
+            .insert("b".to_string(), service("b", 80, Proto::Tcp, "b"));
+        assert!(configuration_safety_errors(&config).is_empty());
+
+        config.services.get_mut("a").unwrap().limit = Some(crate::ast::RateLimit {
+            rate: 10,
+            unit: crate::ast::RateUnit::Second,
+            burst: None,
+            per_ip: true,
+        });
+        assert!(configuration_safety_errors(&config)
+            .iter()
+            .any(|e| e.contains("per-service limits")));
+        config.services.get_mut("a").unwrap().limit = None;
+
+        config
+            .services
+            .insert("b".to_string(), service("b", 80, Proto::Tcp, "a.local"));
+        assert!(configuration_safety_errors(&config)
+            .iter()
+            .any(|e| e.contains("overlap TCP")));
+
+        config
+            .services
+            .insert("a".to_string(), service("a", 80, Proto::Both, "a"));
+        config
+            .services
+            .insert("b".to_string(), service("b", 80, Proto::Both, "b"));
+        assert!(configuration_safety_errors(&config)
+            .iter()
+            .any(|e| e.contains("overlap UDP")));
+    }
+
+    #[test]
+    fn unmatched_service_policy_is_dropped_after_forwarding_rule() {
+        let mut config = Config::new();
+        let mut svc = service("test", 8080, Proto::Tcp, "test");
+        svc.allow.push("192.0.2.0/24".to_string());
+        svc.backends.push(Backend {
+            host: None,
+            ip: Ipv4Addr::new(192, 0, 2, 20),
+            port: 8080,
+            weight: 1,
+            backup: false,
+        });
+        config.services.insert(svc.key.clone(), svc);
+
+        let rules = compile_nft_ruleset(&config, None);
+        let forwarded = rules.find("comment \"nfty:svc=test\"").unwrap();
+        let dropped = rules.find("comment \"nfty:svc-policy-drop=test\"").unwrap();
+        assert!(forwarded < dropped);
+        assert!(rules.contains("tcp dport 8080 counter drop comment \"nfty:svc-policy-drop=test\""));
+    }
 }

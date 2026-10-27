@@ -4,10 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-LXD_HOST="${1:-169.254.1.3}"
+LXD_HOST="${1:-192.168.1.3}"
 INSTANCE="${2:-nfty}"
 VOLUME_NAME="${INSTANCE}-data"
 POOL_NAME="default"
+
+if [[ ! "$INSTANCE" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
+  echo "Invalid LXD instance name: ${INSTANCE}" >&2
+  exit 1
+fi
 
 echo "==> [1/4] Building latest nfty LXD image..."
 ./packaging/unikernel/build-unikernel.sh
@@ -20,9 +25,11 @@ ssh -n "${LXD_HOST}" "
   set -e
 
   # 1. Create persistent storage volume if it doesn't exist yet
+  volume_created=0
   if ! lxc storage volume show ${POOL_NAME} ${VOLUME_NAME} >/dev/null 2>&1; then
     echo '  -> Creating persistent LXD storage volume: ${POOL_NAME}/${VOLUME_NAME}'
     lxc storage volume create ${POOL_NAME} ${VOLUME_NAME} < /dev/null
+    volume_created=1
   fi
 
   # 2. Import the new image under a staging alias
@@ -33,12 +40,22 @@ ssh -n "${LXD_HOST}" "
   if lxc info ${INSTANCE} < /dev/null >/dev/null 2>&1; then
     # If the persistent volume isn't attached yet, migrate existing /data files into it first!
     if ! lxc config device show ${INSTANCE} < /dev/null | grep -q '^data:'; then
+      if [ \"\$volume_created\" != 1 ]; then
+        echo '  -> Refusing automatic migration into an existing unattached volume; inspect it first.' >&2
+        exit 1
+      fi
       echo '  -> Migrating existing /data files into persistent LXD volume ${VOLUME_NAME}...'
-      rm -rf /tmp/nfty-data-backup && mkdir -p /tmp/nfty-data-backup
-      lxc file pull -r ${INSTANCE}/data/. /tmp/nfty-data-backup/ < /dev/null 2>/dev/null || true
+      backup_dir=\$(mktemp -d /tmp/nfty-data-backup.XXXXXXXX)
+      if ! lxc file pull -r ${INSTANCE}/data/. \"\$backup_dir/\" < /dev/null; then
+        echo \"  -> Backup failed; preserving partial backup at \$backup_dir\" >&2
+        exit 1
+      fi
       lxc config device add ${INSTANCE} data disk pool=${POOL_NAME} source=${VOLUME_NAME} path=/data < /dev/null
-      lxc file push -r /tmp/nfty-data-backup/. ${INSTANCE}/data/ < /dev/null 2>/dev/null || true
-      rm -rf /tmp/nfty-data-backup
+      if ! lxc file push -r \"\$backup_dir/.\" ${INSTANCE}/data/ < /dev/null; then
+        echo \"  -> Restore failed; preserving backup at \$backup_dir\" >&2
+        exit 1
+      fi
+      rm -rf -- \"\$backup_dir\"
     fi
 
     echo '  -> Rebuilding ${INSTANCE} rootfs with new image (preserving /data volume & MAC/IP)...'

@@ -9,13 +9,24 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 const CF_CONFIG_PATH: &str = "/data/cloudflare.json";
 const CF_PID_FILE: &str = "/run/cloudflared.pid";
 const CF_LOG_FILE: &str = "/run/cloudflared.log";
+const CF_PAUSED_FILE: &str = "/run/nfty-cloudflare.paused";
+static CF_RECONCILE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CF_RECONCILE_LOCK: Mutex<()> = Mutex::new(());
+struct CloudflareQueueState {
+    config: Config,
+    pending: bool,
+    failed: bool,
+}
+static CF_LAST_QUEUED_CONFIG: Mutex<Option<CloudflareQueueState>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudflareConfig {
@@ -37,6 +48,9 @@ pub struct CloudflareConfig {
     pub managed_access_apps: BTreeMap<String, String>,
     #[serde(default)]
     pub access_api_enabled: Option<bool>,
+    /// Hostnames whose Access policies were successfully reconciled.
+    #[serde(default)]
+    pub protected_access_hosts: BTreeSet<String>,
     #[serde(default)]
     pub last_status: Option<String>,
 }
@@ -56,28 +70,44 @@ impl Default for CloudflareConfig {
             managed_dns_records: BTreeMap::new(),
             managed_access_apps: BTreeMap::new(),
             access_api_enabled: None,
+            protected_access_hosts: BTreeSet::new(),
             last_status: None,
         }
     }
 }
 
-pub fn load_cloudflare_config() -> CloudflareConfig {
-    fs::read_to_string(CF_CONFIG_PATH)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+pub fn load_cloudflare_config() -> Result<CloudflareConfig> {
+    match fs::read_to_string(CF_CONFIG_PATH) {
+        Ok(raw) => serde_json::from_str(&raw).context("Failed to parse Cloudflare configuration"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CloudflareConfig::default()),
+        Err(e) => Err(e).context("Failed to read Cloudflare configuration"),
+    }
 }
 
 pub fn save_cloudflare_config(cfg: &CloudflareConfig) -> Result<()> {
-    let _ = fs::create_dir_all("/data");
+    fs::create_dir_all("/data")?;
     let json_str = serde_json::to_string_pretty(cfg)?;
-    fs::write(CF_CONFIG_PATH, json_str)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(CF_CONFIG_PATH, fs::Permissions::from_mode(0o600));
+    crate::unikernel::write_atomic(Path::new(CF_CONFIG_PATH), json_str.as_bytes())
+}
+
+fn resume_cloudflare_supervision() -> Result<()> {
+    match fs::remove_file(CF_PAUSED_FILE) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("Failed to resume Cloudflare supervision"),
     }
-    Ok(())
+}
+
+fn load_cloudflare_config_or_stop() -> Result<CloudflareConfig> {
+    match load_cloudflare_config() {
+        Ok(config) => Ok(config),
+        Err(error) => {
+            if let Err(stop_error) = stop_cloudflared_daemon() {
+                bail!("{}; connector stop failed: {}", error, stop_error);
+            }
+            Err(error.context("Cloudflare connector stopped"))
+        }
+    }
 }
 
 fn cf_api_request(
@@ -215,7 +245,10 @@ pub fn check_http_basic_auth(req_buf: &[u8], auth_rules: &[String]) -> bool {
     if auth_rules.is_empty() {
         return true;
     }
-    let Ok(text) = std::str::from_utf8(req_buf) else {
+    let Some(header_end) = req_buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&req_buf[..header_end]) else {
         return false;
     };
     let mut provided_user_pass: Option<(String, String)> = None;
@@ -253,21 +286,6 @@ pub fn check_http_basic_auth(req_buf: &[u8], auth_rules: &[String]) -> bool {
             }
         } else if let Some((ru, rp)) = rule.split_once(':') {
             if user == ru && pass == rp {
-                return true;
-            }
-        } else if rule.contains('@') {
-            // Fallback when Cloudflare Access API is not enabled on the Cloudflare account:
-            // accept either the email username / 'nfty' with the nfty appliance password
-            let email_prefix = rule.split('@').next().unwrap_or("");
-            let auth_cfg = crate::ssh::load_auth_config();
-            let pw_ok = auth_cfg.password_sha256 == crate::ssh::hash_password(&pass);
-            if pw_ok
-                && (user.eq_ignore_ascii_case(&auth_cfg.username)
-                    || user.eq_ignore_ascii_case(rule)
-                    || (!email_prefix.is_empty()
-                        && email_prefix != "*"
-                        && user.eq_ignore_ascii_case(email_prefix)))
-            {
                 return true;
             }
         }
@@ -318,8 +336,33 @@ pub fn sanitize_authenticated_http_request(req_buf: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn get_original_dst(stream: &TcpStream) -> Option<(std::net::Ipv4Addr, u16)> {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        let mut len: libc::socklen_t =
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        let ret = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_IP,
+            libc::SO_ORIGINAL_DST,
+            &mut addr as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+        if ret == 0 && addr.sin_family as i32 == libc::AF_INET {
+            let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+            let port = u16::from_be(addr.sin_port);
+            return Some((ip, port));
+        }
+    }
+    stream.local_addr().ok().and_then(|sa| match sa.ip() {
+        std::net::IpAddr::V4(ip) => Some((ip, sa.port())),
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|ip| (ip, sa.port())),
+    })
+}
+
 pub(crate) async fn run_cf_auth_proxy_listener(shared: SharedState) {
-    let bind_addr = format!("127.0.0.1:{}", CF_LOCAL_AUTH_PORT);
+    let bind_addr = format!("0.0.0.0:{}", CF_LOCAL_AUTH_PORT);
     let listener = loop {
         match TcpListener::bind(&bind_addr).await {
             Ok(l) => break l,
@@ -330,62 +373,120 @@ pub(crate) async fn run_cf_auth_proxy_listener(shared: SharedState) {
     };
 
     loop {
-        let Ok((mut client, _peer)) = listener.accept().await else {
+        let Ok((mut client, peer)) = listener.accept().await else {
             continue;
         };
+        let peer_ip = match peer.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => v4,
+                None => continue,
+            },
+        };
+        let orig_dst = get_original_dst(&client);
         let shared_conn = shared.clone();
         tokio::spawn(async move {
-            let mut peek_buf = [0u8; 4096];
-            let Ok(Ok(n)) =
-                tokio::time::timeout(Duration::from_secs(5), client.read(&mut peek_buf)).await
-            else {
+            let Ok(peek_buf) = super::read_http_headers(&mut client, Duration::from_secs(5)).await else {
                 return;
             };
-            if n == 0 {
+            if peek_buf.first() == Some(&0x16) {
                 return;
             }
-            let Some(host) = extract_host_or_sni(&peek_buf[..n]) else {
-                return;
-            };
+            let host_opt = extract_host_or_sni(&peek_buf);
 
-            let route_match: Option<(String, Vec<String>, String)> = {
+            let route_match: Option<(String, Vec<String>, String, String)> = {
                 let st = shared_conn.read().unwrap();
                 let cfg = st.active_config();
-                cfg.services.values().find_map(|svc| {
-                    let cf_host = svc.cloudflare.as_ref()?;
-                    if cf_host.eq_ignore_ascii_case(&host) {
-                        let b = svc.backends.first()?;
-                        let addr = format!("{}:{}", b.ip, b.port);
-                        let mut rules = svc.auth.clone();
-                        for r in &svc.cloudflare_auth {
-                            if !rules.contains(r) {
-                                rules.push(r.clone());
+                let is_direct_cf_loopback = peer_ip.is_loopback()
+                    && orig_dst.map(|(_, p)| p == CF_LOCAL_AUTH_PORT).unwrap_or(true);
+
+                if is_direct_cf_loopback {
+                    let Some(host) = host_opt.as_deref() else {
+                        return;
+                    };
+                    cfg.services.values().find_map(|svc| {
+                        let cf_host = svc.cloudflare.as_ref()?;
+                        if cf_host.eq_ignore_ascii_case(host) {
+                            let eligible = st.active_backends_for_service(&svc.backends);
+                            let b = eligible.first()?;
+                            let addr = format!("{}:{}", b.ip, b.port);
+                            let mut rules = svc.auth.clone();
+                            for r in &svc.cloudflare_auth {
+                                if !rules.contains(r) {
+                                    rules.push(r.clone());
+                                }
                             }
+                            Some((addr, rules, b.endpoint(), host.to_string()))
+                        } else {
+                            None
                         }
-                        Some((addr, rules, b.endpoint()))
-                    } else {
-                        None
+                    })
+                } else if let Some((orig_ip, orig_port)) = orig_dst {
+                    let mut candidates: Vec<&crate::ast::Service> = cfg
+                        .services
+                        .values()
+                        .filter(|svc| {
+                            !svc.auth.is_empty()
+                                && svc.port == orig_port
+                                && matches!(svc.proto, crate::ast::Proto::Tcp | crate::ast::Proto::Both)
+                                && (svc.listen_ip.is_none() || svc.listen_ip == Some(orig_ip))
+                        })
+                        .collect();
+                    if let Some(req_host) = host_opt.as_deref() {
+                        let req_short = req_host.strip_suffix(".local").unwrap_or(req_host);
+                        candidates.sort_by_key(|svc| {
+                            let host_match = svc
+                                .hostname
+                                .as_deref()
+                                .map(|sh| {
+                                    let sh_clean = sh.trim_end_matches('.').to_ascii_lowercase();
+                                    let sh_short = sh_clean.strip_suffix(".local").unwrap_or(&sh_clean);
+                                    req_host == sh_clean || req_short == sh_short
+                                })
+                                .unwrap_or(false)
+                                || svc
+                                    .cloudflare
+                                    .as_deref()
+                                    .map(|cf| cf.eq_ignore_ascii_case(req_host))
+                                    .unwrap_or(false);
+                            let ip_exact = svc.listen_ip == Some(orig_ip);
+                            (!host_match, !ip_exact)
+                        });
                     }
-                })
+                    candidates.first().and_then(|svc| {
+                        if !st.is_ip_allowed(peer_ip, &svc.allow, &cfg.global_allow) {
+                            return None;
+                        }
+                        let eligible = st.active_backends_for_service(&svc.backends);
+                        let b = eligible.first()?;
+                        let addr = format!("{}:{}", b.ip, b.port);
+                        let realm = host_opt
+                            .clone()
+                            .unwrap_or_else(|| svc.display_name());
+                        Some((addr, svc.auth.clone(), b.endpoint(), realm))
+                    })
+                } else {
+                    None
+                }
             };
 
-            let Some((upstream_addr, auth_rules, ep_key)) = route_match else {
+            let Some((upstream_addr, auth_rules, ep_key, realm_label)) = route_match else {
                 let _ = client
                     .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 10\r\n\r\nNot Found\n")
                     .await;
                 return;
             };
 
-            if !check_http_basic_auth(&peek_buf[..n], &auth_rules) {
+            if !check_http_basic_auth(&peek_buf, &auth_rules) {
                 let resp = format!(
                     "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"nfty ({})\"\r\nContent-Type: text/plain\r\nContent-Length: 26\r\nConnection: close\r\n\r\n401 Authentication Needed\n",
-                    host
+                    realm_label
                 );
                 let _ = client.write_all(resp.as_bytes()).await;
                 return;
             }
 
-            let sanitized_req = sanitize_authenticated_http_request(&peek_buf[..n]);
+            let sanitized_req = sanitize_authenticated_http_request(&peek_buf);
             if let Ok(Ok(mut upstream)) =
                 tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(&upstream_addr))
                     .await
@@ -408,7 +509,7 @@ pub(crate) async fn run_cf_auth_proxy_listener(shared: SharedState) {
 
 pub fn service_uses_local_cf_auth_proxy(
     svc: &crate::ast::Service,
-    access_api_enabled: Option<bool>,
+    cf_cfg: &CloudflareConfig,
 ) -> bool {
     if !svc.auth.is_empty() {
         return true;
@@ -420,17 +521,27 @@ pub fn service_uses_local_cf_auth_proxy(
         .cloudflare_auth
         .iter()
         .any(|r| r.eq_ignore_ascii_case("nfty") || r.contains(':'));
-    has_local_rule || access_api_enabled == Some(false)
+    let protected = svc.cloudflare.as_ref()
+        .map(|host| cf_cfg.protected_access_hosts.contains(&host.to_ascii_lowercase()))
+        .unwrap_or(false);
+    has_local_rule || !protected
 }
 
-pub fn collect_cloudflare_routes(config: &Config) -> Vec<(String, String, String)> {
-    let cf_cfg = load_cloudflare_config();
+pub fn collect_cloudflare_routes(config: &Config) -> Result<Vec<(String, String, String)>> {
+    let cf_cfg = load_cloudflare_config()?;
+    Ok(collect_cloudflare_routes_with_config(config, &cf_cfg))
+}
+
+fn collect_cloudflare_routes_with_config(
+    config: &Config,
+    cf_cfg: &CloudflareConfig,
+) -> Vec<(String, String, String)> {
     let mut routes = Vec::new();
     for svc in config.services.values() {
         let Some(cf_host) = &svc.cloudflare else {
             continue;
         };
-        let upstream = if service_uses_local_cf_auth_proxy(svc, cf_cfg.access_api_enabled) {
+        let upstream = if service_uses_local_cf_auth_proxy(svc, cf_cfg) {
             format!("http://127.0.0.1:{}", CF_LOCAL_AUTH_PORT)
         } else if let Some(b) = svc.backends.first() {
             let scheme = if b.port == 443 || b.port == 8443 {
@@ -455,22 +566,40 @@ pub fn cloudflared_running_pid() -> Option<u32> {
     let pid = fs::read_to_string(CF_PID_FILE)
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())?;
-    let cmdline_path = format!("/proc/{}/cmdline", pid);
-    if let Ok(cmdline) = fs::read_to_string(cmdline_path) {
-        if cmdline.contains("cloudflared") {
-            return Some(pid);
-        }
+    let exe_is_cloudflared = fs::read_link(format!("/proc/{}/exe", pid))
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name == "cloudflared"))
+        .unwrap_or(false);
+    if exe_is_cloudflared {
+        return Some(pid);
     }
     None
 }
 
-pub fn stop_cloudflared_daemon() {
+pub fn stop_cloudflared_daemon() -> Result<()> {
     if let Some(pid) = cloudflared_running_pid() {
         unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
+            if libc::kill(pid as i32, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("Failed to stop cloudflared {}", pid));
+            }
+        }
+        for _ in 0..40 {
+            if cloudflared_running_pid() != Some(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if cloudflared_running_pid() == Some(pid) {
+            bail!("cloudflared {} did not stop", pid);
         }
     }
-    let _ = fs::remove_file(CF_PID_FILE);
+    match fs::remove_file(CF_PID_FILE) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("Failed to remove cloudflared PID file"),
+    }
+    Ok(())
 }
 
 pub fn start_or_ensure_cloudflared_daemon(tunnel_token: &str) -> Result<u32> {
@@ -510,7 +639,7 @@ pub fn start_or_ensure_cloudflared_daemon(tunnel_token: &str) -> Result<u32> {
         .open(CF_LOG_FILE)?;
     let log_err = log_file.try_clone()?;
 
-    let child = Command::new(bin)
+    let mut child = Command::new(bin)
         .args([
             "tunnel",
             "--metrics",
@@ -530,50 +659,291 @@ pub fn start_or_ensure_cloudflared_daemon(tunnel_token: &str) -> Result<u32> {
         .with_context(|| "Failed to spawn cloudflared daemon")?;
 
     let pid = child.id();
-    let _ = fs::write(CF_PID_FILE, format!("{}\n", pid));
+    if let Err(e) = fs::write(CF_PID_FILE, format!("{}\n", pid)) {
+        if let Err(cleanup) = child.kill() {
+            bail!("Cannot record cloudflared PID: {}; failed to stop child: {}", e, cleanup);
+        }
+        let _ = child.wait();
+        return Err(e).context("Cannot record cloudflared PID");
+    }
+    let child = Arc::new(Mutex::new(child));
+    let reaper_child = child.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("nfty-cloudflared-reaper".to_string())
+        .spawn(move || {
+            match reaper_child.lock() {
+                Ok(mut child) => {
+                    if let Err(e) = child.wait() {
+                        eprintln!("nfty: failed to reap cloudflared: {}", e);
+                    }
+                }
+                Err(_) => eprintln!("nfty: cloudflared reaper lock is poisoned"),
+            }
+        })
+    {
+        let mut child = child.lock().map_err(|_| anyhow::anyhow!("cloudflared child lock is poisoned"))?;
+        if child.try_wait()?.is_none() {
+            child.kill().context("Failed to stop cloudflared after reaper startup failed")?;
+            child.wait().context("Failed to reap cloudflared after reaper startup failed")?;
+        }
+        match fs::remove_file(CF_PID_FILE) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("Failed to remove cloudflared PID after reaper startup failed"),
+        }
+        return Err(error).context("Failed to start cloudflared reaper");
+    }
     Ok(pid)
 }
 
 /// Reconciles Cloudflare Tunnel, ingress rules, DNS CNAME records, and the local `cloudflared` daemon.
-pub fn reconcile_cloudflare_tunnel(config: &Config) -> Vec<String> {
+pub fn reconcile_cloudflare_tunnel(config: &Config) -> Result<Vec<String>> {
+    resume_cloudflare_supervision()?;
+    let generation = {
+        let mut last = CF_LAST_QUEUED_CONFIG
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cloudflare queue lock is poisoned"))?;
+        *last = Some(CloudflareQueueState { config: config.clone(), pending: true, failed: false });
+        CF_RECONCILE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+    };
+    let result = reconcile_cloudflare_generation(config, generation);
+    if result.is_ok() {
+        complete_cloudflare_reconcile(config, generation);
+    } else {
+        mark_failed_cloudflare_reconcile(config, generation);
+    }
+    result
+}
+
+pub(crate) fn update_cloudflare_config_and_reconcile<F>(
+    config: &Config,
+    update: F,
+) -> Result<Vec<String>>
+where
+    F: FnOnce(&mut CloudflareConfig),
+{
+    resume_cloudflare_supervision()?;
+    let generation = {
+        let mut last = CF_LAST_QUEUED_CONFIG
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cloudflare queue lock is poisoned"))?;
+        *last = Some(CloudflareQueueState { config: config.clone(), pending: true, failed: false });
+        CF_RECONCILE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+    };
+    let result = (|| {
+        let _guard = CF_RECONCILE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cloudflare supervisor lock is poisoned"))?;
+        if generation != CF_RECONCILE_GENERATION.load(Ordering::SeqCst) {
+            bail!("Cloudflare reconciliation superseded by a newer configuration");
+        }
+        let mut cf_cfg = load_cloudflare_config_or_stop()?;
+        update(&mut cf_cfg);
+        save_cloudflare_config(&cf_cfg)?;
+        reconcile_cloudflare_locked(config)
+    })();
+    if result.is_ok() {
+        complete_cloudflare_reconcile(config, generation);
+    } else {
+        mark_failed_cloudflare_reconcile(config, generation);
+    }
+    result
+}
+
+pub(crate) fn prepare_cloudflare_config_update() -> Result<()> {
+    let _guard = CF_RECONCILE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Cloudflare supervisor lock is poisoned"))?;
+    let mut last = CF_LAST_QUEUED_CONFIG
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Cloudflare queue lock is poisoned"))?;
+    CF_RECONCILE_GENERATION.fetch_add(1, Ordering::SeqCst);
+    *last = None;
+    drop(last);
+    stop_cloudflared_daemon()
+}
+
+fn mark_failed_cloudflare_reconcile(config: &Config, generation: u64) {
+    match CF_LAST_QUEUED_CONFIG.lock() {
+        Ok(mut last) => {
+            if generation == CF_RECONCILE_GENERATION.load(Ordering::SeqCst)
+                && last.as_ref().map(|state| &state.config) == Some(config)
+            {
+                if let Some(state) = last.as_mut() {
+                    state.pending = false;
+                    state.failed = true;
+                }
+            }
+        }
+        Err(_) => eprintln!("nfty: Cloudflare queue lock is poisoned"),
+    }
+}
+
+fn complete_cloudflare_reconcile(config: &Config, generation: u64) {
+    match CF_LAST_QUEUED_CONFIG.lock() {
+        Ok(mut last) => {
+            if generation == CF_RECONCILE_GENERATION.load(Ordering::SeqCst) {
+                if let Some(state) = last.as_mut().filter(|state| &state.config == config) {
+                    state.pending = false;
+                    state.failed = false;
+                }
+            }
+        }
+        Err(_) => eprintln!("nfty: Cloudflare queue lock is poisoned"),
+    }
+}
+
+pub(crate) fn queue_cloudflare_reconcile(config: Config) -> Result<()> {
+    if Path::new(CF_PAUSED_FILE).exists() {
+        return Ok(());
+    }
+    let generation = {
+        let mut last = CF_LAST_QUEUED_CONFIG
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cloudflare queue lock is poisoned"))?;
+        if let Some(state) = last.as_ref().filter(|state| state.config == config) {
+            let has_routes = config.services.values().any(|service| service.cloudflare.is_some());
+            if state.pending
+                || (!state.failed && (!has_routes || cloudflared_running_pid().is_some()))
+            {
+                return Ok(());
+            }
+        }
+        *last = Some(CloudflareQueueState { config: config.clone(), pending: true, failed: false });
+        CF_RECONCILE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+    };
+    let worker_config = config.clone();
+    let worker = std::thread::Builder::new().name("nfty-cloudflare".to_string()).spawn(move || {
+        match reconcile_cloudflare_generation(&worker_config, generation) {
+            Ok(logs) => {
+                complete_cloudflare_reconcile(&worker_config, generation);
+                for log in logs {
+                    eprintln!("nfty: {}", log);
+                }
+            }
+            Err(e) => {
+                mark_failed_cloudflare_reconcile(&worker_config, generation);
+                eprintln!("nfty: Cloudflare reconciliation failed: {:#}", e);
+            }
+        }
+    });
+    if let Err(e) = worker {
+        mark_failed_cloudflare_reconcile(&config, generation);
+        return Err(e).context("Failed to start Cloudflare reconciliation worker");
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_cloudflare_supervisor(shared: SharedState) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        if unsafe { libc::geteuid() != 0 } {
+            continue;
+        }
+        if Path::new(CF_PAUSED_FILE).exists() {
+            continue;
+        }
+        {
+            let st = shared.read().unwrap();
+            let config = st.active_config();
+            let has_routes = config.services.values().any(|service| service.cloudflare.is_some());
+            let should_retry = match CF_LAST_QUEUED_CONFIG.lock() {
+                Ok(last) => last.as_ref()
+                    .map(|state| {
+                        if state.config != *config {
+                            return true;
+                        }
+                        !state.pending
+                            && (state.failed || (has_routes && cloudflared_running_pid().is_none()))
+                    })
+                    .unwrap_or(has_routes),
+                Err(_) => {
+                    eprintln!("nfty: Cloudflare queue lock is poisoned");
+                    false
+                }
+            };
+            if should_retry {
+                if let Err(e) = queue_cloudflare_reconcile(config.clone()) {
+                    eprintln!("nfty: cannot restart Cloudflare reconciliation: {:#}", e);
+                }
+            }
+        }
+    }
+}
+
+fn reconcile_cloudflare_generation(config: &Config, generation: u64) -> Result<Vec<String>> {
+    let Ok(_guard) = CF_RECONCILE_LOCK.lock() else {
+        bail!("Cloudflare supervisor lock is poisoned");
+    };
+    if generation != CF_RECONCILE_GENERATION.load(Ordering::SeqCst) {
+        bail!("Cloudflare reconciliation superseded by a newer configuration");
+    }
+    if Path::new(CF_PAUSED_FILE).exists() {
+        return Ok(vec!["Cloudflare connector is manually stopped".to_string()]);
+    }
+    reconcile_cloudflare_locked(config)
+}
+
+fn reconcile_cloudflare_locked(config: &Config) -> Result<Vec<String>> {
     let mut logs = Vec::new();
-    let routes = collect_cloudflare_routes(config);
-    let mut cf_cfg = load_cloudflare_config();
+    let mut cf_cfg = load_cloudflare_config_or_stop()?;
+    let routes = collect_cloudflare_routes_with_config(config, &cf_cfg);
+    if config.services.values().any(|svc| {
+        svc.cloudflare.is_some() && (!svc.auth.is_empty() || !svc.cloudflare_auth.is_empty())
+    }) {
+        stop_cloudflared_daemon()?;
+    }
 
     if routes.is_empty() && cf_cfg.managed_dns_records.is_empty() {
         if cloudflared_running_pid().is_some() {
-            stop_cloudflared_daemon();
+            stop_cloudflared_daemon()?;
             logs.push(
                 "Cloudflare: stopped cloudflared daemon (no cloudflare-dns services active)"
                     .to_string(),
             );
         }
-        return logs;
+        return Ok(logs);
     }
 
     if let Some(api_token) = cf_cfg.api_token.clone() {
         match reconcile_with_cf_api(config, &api_token, &routes, &mut cf_cfg) {
             Ok(mut api_logs) => {
                 cf_cfg.last_status = Some("OK (synced with Cloudflare API)".to_string());
-                let _ = save_cloudflare_config(&cf_cfg);
+                if let Err(e) = save_cloudflare_config(&cf_cfg) {
+                    if let Err(stop_error) = stop_cloudflared_daemon() {
+                        bail!("Cannot save Cloudflare configuration: {}; connector stop failed: {}", e, stop_error);
+                    }
+                    return Err(e.context("Cloudflare connector stopped: cannot save configuration"));
+                }
                 logs.append(&mut api_logs);
             }
             Err(e) => {
                 let err_msg = format!("ERROR: {}", e);
                 cf_cfg.last_status = Some(err_msg);
-                let _ = save_cloudflare_config(&cf_cfg);
-                logs.push(format!("Cloudflare API sync failed: {}", e));
+                let save_error = save_cloudflare_config(&cf_cfg).err();
+                if let Err(stop_error) = stop_cloudflared_daemon() {
+                    bail!("Cloudflare API sync failed: {}; connector stop failed: {}", e, stop_error);
+                }
+                if let Some(save_error) = save_error {
+                    bail!("Cloudflare API sync failed: {}; status could not be saved: {}", e, save_error);
+                }
+                return Err(e.context("Cloudflare API sync failed; connector stopped"));
             }
         }
+    } else if config.services.values().any(|svc| {
+        svc.cloudflare.is_some() && svc.cloudflare_auth.iter().any(|rule| rule.contains('@'))
+    }) {
+        stop_cloudflared_daemon()?;
+        bail!("Cloudflare connector stopped: email policies cannot be verified without an API token");
     } else if !routes.is_empty() && cf_cfg.tunnel_token.is_none() {
-        logs.push(
-            "Cloudflare: services have 'cloudflare-dns' configured, but no API token is set yet (run 'cf token <API_TOKEN>')".to_string(),
-        );
-        return logs;
+        bail!("Cloudflare services are configured, but no API token or tunnel token is set");
     }
 
-    if routes.is_empty() {
-        stop_cloudflared_daemon();
+    if Path::new(CF_PAUSED_FILE).exists() {
+        stop_cloudflared_daemon()?;
+        logs.push("Cloudflare connector is manually stopped".to_string());
+    } else if routes.is_empty() {
+        stop_cloudflared_daemon()?;
     } else if let Some(tok) = &cf_cfg.tunnel_token {
         match start_or_ensure_cloudflared_daemon(tok) {
             Ok(pid) => {
@@ -584,12 +954,14 @@ pub fn reconcile_cloudflare_tunnel(config: &Config) -> Vec<String> {
                 ));
             }
             Err(e) => {
-                logs.push(format!("Cloudflare: failed to start cloudflared: {}", e));
+                return Err(e.context("Failed to start cloudflared"));
             }
         }
+    } else {
+        bail!("Cloudflare reconciliation did not provide a tunnel token");
     }
 
-    logs
+    Ok(logs)
 }
 
 fn reconcile_with_cf_api(
@@ -599,6 +971,7 @@ fn reconcile_with_cf_api(
     cf_cfg: &mut CloudflareConfig,
 ) -> Result<Vec<String>> {
     let mut logs = Vec::new();
+    cf_cfg.protected_access_hosts.clear();
     let (discovered_acct, zones) = discover_cf_account_and_zones(api_token)?;
     if cf_cfg.account_id.is_none() {
         cf_cfg.account_id = discovered_acct;
@@ -718,8 +1091,11 @@ fn reconcile_with_cf_api(
                 };
 
                 let app_id = if let Some(aid) = existing_app_id {
+                    if cf_cfg.managed_access_apps.get(hostname) != Some(&aid) {
+                        bail!("Refusing to modify unmanaged Cloudflare Access application for '{}'", hostname);
+                    }
                     let put_app = format!("accounts/{}/access/apps/{}", account_id, aid);
-                    let _ = cf_api_request("PUT", &put_app, api_token, Some(app_body));
+                    cf_api_request("PUT", &put_app, api_token, Some(app_body))?;
                     aid
                 } else {
                     let created_app =
@@ -728,7 +1104,8 @@ fn reconcile_with_cf_api(
                         .get("result")
                         .and_then(|r| r.get("id"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or("")
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("Cloudflare Access application creation returned no id"))?
                         .to_string()
                 };
 
@@ -738,16 +1115,21 @@ fn reconcile_with_cf_api(
                         .insert(hostname.clone(), app_id.clone());
                     let pols_path =
                         format!("accounts/{}/access/apps/{}/policies", account_id, app_id);
-                    let existing_pol_id = cf_api_request("GET", &pols_path, api_token, None)
-                        .ok()
-                        .and_then(|p| {
-                            p.get("result")
-                                .and_then(|v| v.as_array())
-                                .and_then(|arr| arr.first())
-                                .and_then(|item| item.get("id"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        });
+                    let policies = cf_api_request("GET", &pols_path, api_token, None)?;
+                    let policies = policies.get("result")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| anyhow::anyhow!("Cloudflare returned an invalid Access policy list"))?;
+                    if policies.len() > 1 || policies.iter().any(|policy| {
+                        policy.get("name").and_then(|v| v.as_str()) != Some("nfty allow policy")
+                    }) {
+                        bail!("Refusing to modify additional or unmanaged Access policies for '{}'", hostname);
+                    }
+                    let existing_pol_id = policies.first()
+                        .map(|item| item.get("id").and_then(|v| v.as_str())
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string)
+                            .ok_or_else(|| anyhow::anyhow!("Cloudflare Access policy has no id")))
+                        .transpose()?;
                     let pol_body = serde_json::json!({
                         "name": "nfty allow policy",
                         "decision": "allow",
@@ -756,10 +1138,11 @@ fn reconcile_with_cf_api(
                     });
                     if let Some(pid) = existing_pol_id {
                         let put_pol = format!("{}/{}", pols_path, pid);
-                        let _ = cf_api_request("PUT", &put_pol, api_token, Some(pol_body));
+                        cf_api_request("PUT", &put_pol, api_token, Some(pol_body))?;
                     } else {
-                        let _ = cf_api_request("POST", &pols_path, api_token, Some(pol_body));
+                        cf_api_request("POST", &pols_path, api_token, Some(pol_body))?;
                     }
+                    cf_cfg.protected_access_hosts.insert(hostname.to_ascii_lowercase());
                     logs.push(format!(
                         "Cloudflare Access: synced Zero-Trust policy for {} ({:?})",
                         hostname, email_rules
@@ -768,18 +1151,7 @@ fn reconcile_with_cf_api(
             }
             Err(e) => {
                 cf_cfg.access_api_enabled = Some(false);
-                let err_s = e.to_string();
-                if err_s.contains("not_enabled") {
-                    logs.push(format!(
-                        "Cloudflare Auth: Access Zero-Trust is not enabled in Cloudflare dashboard yet — enabled local nfty Basic-Auth gate on '{}' (login with your 'nfty' password)",
-                        hostname
-                    ));
-                } else {
-                    logs.push(format!(
-                        "Cloudflare Auth: Access API unavailable ({}) — enabled local nfty Basic-Auth gate on '{}'",
-                        err_s, hostname
-                    ));
-                }
+                return Err(e.context(format!("Cloudflare Access unavailable for '{}'", hostname)));
             }
         }
     }
@@ -795,7 +1167,7 @@ fn reconcile_with_cf_api(
         for stale in stale_apps {
             if let Some(app_id) = cf_cfg.managed_access_apps.remove(&stale) {
                 let del_path = format!("accounts/{}/access/apps/{}", account_id, app_id);
-                let _ = cf_api_request("DELETE", &del_path, api_token, None);
+                cf_api_request("DELETE", &del_path, api_token, None)?;
                 logs.push(format!(
                     "Cloudflare Access: removed Access Application for '{}'",
                     stale
@@ -804,13 +1176,13 @@ fn reconcile_with_cf_api(
         }
     }
 
-    // Recompute routes in case `access_api_enabled` changed to `Some(false)` (switching to local Basic-Auth proxy)
+    // Route to the local gate when Access is unavailable so email policies fail closed.
     let effective_routes: Vec<(String, String, String)> = config
         .services
         .values()
         .filter_map(|svc| {
             let cf_host = svc.cloudflare.as_ref()?;
-            let upstream = if service_uses_local_cf_auth_proxy(svc, cf_cfg.access_api_enabled) {
+            let upstream = if service_uses_local_cf_auth_proxy(svc, cf_cfg) {
                 format!("http://127.0.0.1:{}", CF_LOCAL_AUTH_PORT)
             } else if let Some(b) = svc.backends.first() {
                 let scheme = if b.port == 443 || b.port == 8443 {
@@ -1005,7 +1377,7 @@ fn reconcile_with_cf_api(
     for stale in stale_hosts {
         if let Some((zone_id, rec_id)) = cf_cfg.managed_dns_records.remove(&stale) {
             let del_path = format!("zones/{}/dns_records/{}", zone_id, rec_id);
-            let _ = cf_api_request("DELETE", &del_path, api_token, None);
+            cf_api_request("DELETE", &del_path, api_token, None)?;
             logs.push(format!(
                 "Cloudflare DNS: removed stale CNAME record '{}'",
                 stale
@@ -1020,10 +1392,10 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
     let sub = args.first().map(|s| s.to_ascii_lowercase());
     match sub.as_deref() {
         None | Some("status") | Some("list") | Some("show") => {
-            let cf_cfg = load_cloudflare_config();
+            let cf_cfg = load_cloudflare_config()?;
             let st = shared.read().unwrap();
             let cfg = st.active_config();
-            let routes = collect_cloudflare_routes(cfg);
+            let routes = collect_cloudflare_routes_with_config(cfg, &cf_cfg);
             let pid_opt = cloudflared_running_pid();
 
             println!("{}", "Cloudflare Tunnel & Automated DNS Status:".bold().cyan());
@@ -1111,12 +1483,15 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
             let explicit_acct = args.get(2).map(|s| s.trim().to_string());
             println!("Verifying Cloudflare API token...");
             let (disc_acct, zones) = discover_cf_account_and_zones(&api_token)?;
-            let mut cf_cfg = load_cloudflare_config();
-            cf_cfg.api_token = Some(api_token);
-            if let Some(a) = explicit_acct.or(disc_acct) {
-                cf_cfg.account_id = Some(a);
-            }
-            save_cloudflare_config(&cf_cfg)?;
+            let st = shared.read().unwrap();
+            let account = explicit_acct.or(disc_acct);
+            let logs = update_cloudflare_config_and_reconcile(st.active_config(), move |cf_cfg| {
+                cf_cfg.api_token = Some(api_token);
+                if let Some(a) = account {
+                    cf_cfg.account_id = Some(a);
+                }
+            })?;
+            let cf_cfg = load_cloudflare_config()?;
             println!(
                 "  {} Saved Cloudflare API token in {} (Account: {}, Zones discovered: {:?})",
                 "✔".green().bold(),
@@ -1124,8 +1499,7 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
                 cf_cfg.account_id.as_deref().unwrap_or("pending"),
                 zones.keys().collect::<Vec<_>>()
             );
-            let cfg_clone = shared.read().unwrap().active_config().clone();
-            for log in reconcile_cloudflare_tunnel(&cfg_clone) {
+            for log in logs {
                 println!("  {} {}", "→".cyan(), log);
             }
             Ok(())
@@ -1134,20 +1508,23 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
             if args.len() < 2 {
                 bail!("Usage: cf tunnel-token <EYJH...>");
             }
-            let mut cf_cfg = load_cloudflare_config();
-            cf_cfg.tunnel_token = Some(args[1].trim().to_string());
-            save_cloudflare_config(&cf_cfg)?;
-            let pid = start_or_ensure_cloudflared_daemon(args[1].trim())?;
+            let st = shared.read().unwrap();
+            let tunnel_token = args[1].trim().to_string();
+            let logs = update_cloudflare_config_and_reconcile(st.active_config(), move |cf_cfg| {
+                cf_cfg.tunnel_token = Some(tunnel_token);
+            })?;
+            for log in logs {
+                println!("  {} {}", "→".cyan(), log);
+            }
             println!(
-                "  {} Saved Cloudflare tunnel connector token & started cloudflared (PID {})",
-                "✔".green().bold(),
-                pid
+                "  {} Saved Cloudflare tunnel connector token",
+                "✔".green().bold()
             );
             Ok(())
         }
         Some("sync") | Some("apply") => {
-            let cfg_clone = shared.read().unwrap().active_config().clone();
-            let logs = reconcile_cloudflare_tunnel(&cfg_clone);
+            let st = shared.read().unwrap();
+            let logs = reconcile_cloudflare_tunnel(st.active_config())?;
             if logs.is_empty() {
                 println!("  (No Cloudflare Tunnel routes configured)");
             } else {
@@ -1171,9 +1548,16 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
             Ok(())
         }
         Some("stop") | Some("clear") | Some("logout") => {
-            stop_cloudflared_daemon();
+            let _st = shared.write().unwrap();
+            crate::unikernel::write_atomic(Path::new(CF_PAUSED_FILE), b"paused\n")
+                .context("Failed to pause Cloudflare supervision")?;
+            prepare_cloudflare_config_update()?;
             if sub.as_deref() != Some("stop") {
-                let _ = fs::remove_file(CF_CONFIG_PATH);
+                match fs::remove_file(CF_CONFIG_PATH) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).context("Failed to clear Cloudflare configuration"),
+                }
                 println!(
                     "  {} Stopped cloudflared and cleared {}",
                     "✔".green().bold(),

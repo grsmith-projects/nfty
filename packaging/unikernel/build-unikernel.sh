@@ -197,7 +197,7 @@ properties:
   architecture: x86_64
   description: nfty Static Rust Appliance Container
   os: nfty-unikernel
-  release: 0.4.0
+  release: 0.6.0
 EOF
 tar -czf "$ROOT_DIR/dist/lxd-container/lxd.tar.gz" -C "$WORK_DIR/meta-ct" metadata.yaml
 tar -czf "$ROOT_DIR/dist/lxd-container/rootfs.tar.gz" -C "$STAGE_DIR" .
@@ -454,7 +454,7 @@ properties:
   architecture: x86_64
   description: nfty Rust Unikernel L4 Load Balancer (with 128MB persistent /data partition)
   os: nfty-unikernel
-  release: 0.4.0
+  release: 0.6.0
 EOF
     tar -czf "$ROOT_DIR/dist/lxd-vm/lxd.tar.gz" -C "$WORK_DIR/meta-vm" metadata.yaml
 fi

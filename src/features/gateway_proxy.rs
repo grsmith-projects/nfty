@@ -1,7 +1,7 @@
 use super::wireguard::resolve_tunnel_config;
 use crate::ast::GatewayServiceKind;
 use crate::state::{HealthState, SharedState};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -15,9 +15,10 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 static GW_PROXY_RR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn run_gateway_proxy_supervisor(shared: SharedState) {
-    let _ = fs::write("/proc/sys/net/ipv4/ip_nonlocal_bind", "1\n");
-    let mut active_tasks: HashMap<(Ipv4Addr, u16, GatewayServiceKind), tokio::task::JoinHandle<()>> =
-        HashMap::new();
+    if let Err(e) = fs::write("/proc/sys/net/ipv4/ip_nonlocal_bind", "1\n") {
+        eprintln!("nfty: cannot enable nonlocal proxy binding: {}", e);
+    }
+    let mut active_tasks: HashMap<(String, Ipv4Addr, u16, GatewayServiceKind), tokio::task::JoinHandle<()>> = HashMap::new();
 
     loop {
         let mut desired: Vec<(String, Ipv4Addr, u16, GatewayServiceKind)> = Vec::new();
@@ -26,6 +27,9 @@ pub async fn run_gateway_proxy_supervisor(shared: SharedState) {
                 st.sync_from_disk_if_changed();
                 let cfg = st.active_config();
                 for gw in cfg.gateways.values() {
+                    if gw.listen_ip.is_unspecified() {
+                        continue;
+                    }
                     for gs in &gw.services {
                         if matches!(
                             gs.kind,
@@ -42,7 +46,8 @@ pub async fn run_gateway_proxy_supervisor(shared: SharedState) {
         active_tasks.retain(|k, handle| {
             let keep = desired
                 .iter()
-                .any(|(_, ip, port, kind)| *ip == k.0 && *port == k.1 && *kind == k.2);
+                .any(|(gw, ip, port, kind)| *gw == k.0 && *ip == k.1 && *port == k.2 && *kind == k.3)
+                && !handle.is_finished();
             if !keep {
                 handle.abort();
             }
@@ -51,7 +56,7 @@ pub async fn run_gateway_proxy_supervisor(shared: SharedState) {
 
         // Start new listeners
         for (gw_key, ip, port, kind) in desired {
-            let key = (ip, port, kind);
+            let key = (gw_key.clone(), ip, port, kind);
             if !active_tasks.contains_key(&key) {
                 let shared_cl = shared.clone();
                 let handle = tokio::spawn(async move {
@@ -86,7 +91,7 @@ fn select_gateway_tunnel(shared: &SharedState, gw_key: &str) -> GatewayRouteDeci
         st.sync_from_disk_if_changed();
     }
     let Ok(st) = shared.read() else {
-        return GatewayRouteDecision::DirectHost;
+        return GatewayRouteDecision::KillswitchBlocked("Gateway state is unavailable".to_string());
     };
     let cfg = st.active_config();
 
@@ -99,12 +104,13 @@ fn select_gateway_tunnel(shared: &SharedState, gw_key: &str) -> GatewayRouteDeci
             let mut active = Vec::new();
             for (local_i, t) in gw.tunnels.iter().enumerate() {
                 let global_i = base_idx + local_i;
-                let fwmark = (0x101 + global_i) as u32;
                 let iface = if t.iface.is_empty() {
                     format!("wg{}", global_i)
                 } else {
                     t.iface.clone()
                 };
+                let route_idx = super::wireguard::wireguard_iface_index(&iface).unwrap_or(global_i);
+                let fwmark = super::wireguard::wireguard_mark(route_idx) as u32;
                 let iface_exists = Path::new(&format!("/sys/class/net/{}", iface)).exists();
                 let healthy = iface_exists
                     && st
@@ -118,31 +124,6 @@ fn select_gateway_tunnel(shared: &SharedState, gw_key: &str) -> GatewayRouteDeci
                         .and_then(|p| p.address.split('/').next()?.trim().parse::<Ipv4Addr>().ok());
                     for _ in 0..t.weight.max(1) {
                         active.push((iface.clone(), fwmark, t.endpoint_key(), local_ip));
-                    }
-                }
-            }
-            // If runtime hasn't probed yet, check if any configured tunnel interface is present in kernel
-            if active.is_empty() {
-                for (local_i, t) in gw.tunnels.iter().enumerate() {
-                    let global_i = base_idx + local_i;
-                    let fwmark = (0x101 + global_i) as u32;
-                    let iface = if t.iface.is_empty() {
-                        format!("wg{}", global_i)
-                    } else {
-                        t.iface.clone()
-                    };
-                    if Path::new(&format!("/sys/class/net/{}", iface)).exists() {
-                        let not_down = st
-                            .runtime
-                            .get(&t.endpoint_key())
-                            .map(|rt| !rt.drained && rt.health != HealthState::Down)
-                            .unwrap_or(true);
-                        if not_down {
-                            let local_ip = resolve_tunnel_config(t).ok().and_then(|p| {
-                                p.address.split('/').next()?.trim().parse::<Ipv4Addr>().ok()
-                            });
-                            active.push((iface, fwmark, t.endpoint_key(), local_ip));
-                        }
                     }
                 }
             }
@@ -167,7 +148,7 @@ fn select_gateway_tunnel(shared: &SharedState, gw_key: &str) -> GatewayRouteDeci
         }
         base_idx += gw.tunnels.len();
     }
-    GatewayRouteDecision::DirectHost
+    GatewayRouteDecision::KillswitchBlocked(format!("Gateway {} is no longer configured", gw_key))
 }
 
 async fn resolve_target_ipv4(target_host: &str, target_port: u16) -> Option<Ipv4Addr> {
@@ -195,15 +176,33 @@ async fn connect_via_gateway_tunnel(
     target_host: &str,
     target_port: u16,
 ) -> Result<(TcpStream, Option<String>)> {
-    let resolved_ip = resolve_target_ipv4(target_host, target_port)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Could not resolve '{}'", target_host))?;
+    let decision = select_gateway_tunnel(shared, gw_key);
+    let resolved_ip = match &decision {
+        GatewayRouteDecision::ViaTunnel { .. } => {
+            if let Ok(ip) = target_host.trim().parse::<Ipv4Addr>() {
+                ip
+            } else {
+                let st = shared.read().map_err(|_| anyhow::anyhow!("Gateway state is unavailable"))?;
+                st.resolved_hosts
+                    .get(&target_host.trim().to_ascii_lowercase())
+                    .and_then(|ips| ips.first().copied())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "Cannot resolve '{}' through the selected tunnel; use an IPv4 address or a cached host mapping",
+                        target_host
+                    ))?
+            }
+        }
+        GatewayRouteDecision::KillswitchBlocked(reason) => bail!("{}", reason),
+        GatewayRouteDecision::DirectHost => resolve_target_ipv4(target_host, target_port)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve '{}'", target_host))?,
+    };
     let target_addr = SocketAddr::new(std::net::IpAddr::V4(resolved_ip), target_port);
 
     let sock = TcpSocket::new_v4()?;
     let mut ep_key_opt = None;
 
-    match select_gateway_tunnel(shared, gw_key) {
+    match decision {
         GatewayRouteDecision::KillswitchBlocked(reason) => {
             bail!("{}", reason);
         }
@@ -217,25 +216,30 @@ async fn connect_via_gateway_tunnel(
             let fd = sock.as_raw_fd();
             unsafe {
                 let mark_val: libc::c_uint = fwmark;
-                let _ = libc::setsockopt(
+                if libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_MARK,
                     &mark_val as *const _ as *const libc::c_void,
                     std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-                );
+                ) != 0 {
+                    return Err(std::io::Error::last_os_error()).context("Failed to set gateway socket mark");
+                }
                 let mut iface_cstr = iface.into_bytes();
                 iface_cstr.push(0);
-                let _ = libc::setsockopt(
+                if libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_BINDTODEVICE,
                     iface_cstr.as_ptr() as *const libc::c_void,
                     iface_cstr.len() as libc::socklen_t,
-                );
+                ) != 0 {
+                    return Err(std::io::Error::last_os_error()).context("Failed to bind gateway socket to tunnel");
+                }
             }
             if let Some(ip) = local_ip {
-                let _ = sock.bind(SocketAddr::new(std::net::IpAddr::V4(ip), 0));
+                sock.bind(SocketAddr::new(std::net::IpAddr::V4(ip), 0))
+                    .context("Failed to bind gateway socket to tunnel address")?;
             }
         }
         GatewayRouteDecision::DirectHost => {}
@@ -256,7 +260,8 @@ async fn run_single_gateway_proxy(
     let listener = loop {
         match TcpListener::bind(bind_addr).await {
             Ok(l) => break l,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("nfty: gateway proxy could not bind {}: {}", bind_addr, e);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -268,7 +273,7 @@ async fn run_single_gateway_proxy(
         };
         let peer_ip = match peer.ip() {
             std::net::IpAddr::V4(v4) => v4,
-            std::net::IpAddr::V6(_) => Ipv4Addr::LOCALHOST,
+            std::net::IpAddr::V6(_) => continue,
         };
         let allowed = {
             if let Ok(st) = shared.read() {
@@ -276,10 +281,10 @@ async fn run_single_gateway_proxy(
                 if let Some(gw) = cfg.gateways.get(&gw_key) {
                     st.is_ip_allowed(peer_ip, &gw.allow, &cfg.global_allow)
                 } else {
-                    true
+                    false
                 }
             } else {
-                true
+                false
             }
         };
         if !allowed {
@@ -290,10 +295,14 @@ async fn run_single_gateway_proxy(
         tokio::spawn(async move {
             match kind {
                 GatewayServiceKind::Privoxy => {
-                    let _ = handle_privoxy_client(client, shared_c, gw_k).await;
+                    if let Err(e) = handle_privoxy_client(client, shared_c, gw_k).await {
+                        eprintln!("[nfty gateway proxy] HTTP proxy request failed: {:#}", e);
+                    }
                 }
                 GatewayServiceKind::Socks5 => {
-                    let _ = handle_socks5_client(client, shared_c, gw_k).await;
+                    if let Err(e) = handle_socks5_client(client, shared_c, gw_k).await {
+                        eprintln!("[nfty gateway proxy] SOCKS5 request failed: {:#}", e);
+                    }
                 }
                 GatewayServiceKind::Ssh
                 | GatewayServiceKind::Dns
@@ -304,46 +313,56 @@ async fn run_single_gateway_proxy(
     }
 }
 
+fn parse_proxy_authority(authority: &str, default_port: u16) -> Result<(&str, u16)> {
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().context("Invalid proxy target port")?),
+        None => (authority, default_port),
+    };
+    if host.is_empty() || host.contains('[') || host.contains(']') || port == 0 {
+        bail!("Invalid or unsupported proxy target");
+    }
+    Ok((host, port))
+}
+
 async fn handle_privoxy_client(
     mut client: TcpStream,
     shared: SharedState,
     gw_key: String,
 ) -> Result<()> {
-    let mut buf = [0u8; 4096];
-    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf)).await??;
-    if n == 0 {
-        return Ok(());
-    }
-    let header_end = buf[..n]
+    let buf = super::read_http_headers(&mut client, Duration::from_secs(5)).await?;
+    let n = buf.len();
+    let header_end = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|p| p + 4)
-        .or_else(|| {
-            buf[..n]
-                .windows(2)
-                .position(|w| w == b"\n\n")
-                .map(|p| p + 2)
-        })
-        .unwrap_or(n);
+        .expect("HTTP headers were framed");
     let req_str = String::from_utf8_lossy(&buf[..header_end]);
     let mut lines = req_str.lines();
     let first_line = lines.next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return Ok(());
+    if parts.len() != 3 {
+        client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+        bail!("Invalid HTTP proxy request line");
     }
     let method = parts[0];
     let raw_target = parts[1];
     let http_ver = parts.get(2).copied().unwrap_or("HTTP/1.1");
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        let (host, port) = if let Some((h, p)) = raw_target.split_once(':') {
-            (h, p.parse::<u16>().unwrap_or(443))
-        } else {
-            (raw_target, 443)
+        let (host, port) = match parse_proxy_authority(raw_target, 443) {
+            Ok(target) => target,
+            Err(e) => {
+                client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+                return Err(e);
+            }
         };
-        let (mut upstream, ep_opt) =
-            connect_via_gateway_tunnel(&shared, &gw_key, host, port).await?;
+        let (mut upstream, ep_opt) = match connect_via_gateway_tunnel(&shared, &gw_key, host, port).await {
+            Ok(result) => result,
+            Err(e) => {
+                client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+                return Err(e);
+            }
+        };
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: nfty-privoxy\r\n\r\n")
             .await?;
@@ -369,13 +388,21 @@ async fn handle_privoxy_client(
         Some(idx) => (&without_scheme[..idx], &without_scheme[idx..]),
         None => (without_scheme, "/"),
     };
-    let (host, port) = if let Some((h, p)) = host_port.split_once(':') {
-        (h, p.parse::<u16>().unwrap_or(80))
-    } else {
-        (host_port, 80)
+    let (host, port) = match parse_proxy_authority(host_port, 80) {
+        Ok(target) => target,
+        Err(e) => {
+            client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+            return Err(e);
+        }
     };
 
-    let (mut upstream, ep_opt) = connect_via_gateway_tunnel(&shared, &gw_key, host, port).await?;
+    let (mut upstream, ep_opt) = match connect_via_gateway_tunnel(&shared, &gw_key, host, port).await {
+        Ok(result) => result,
+        Err(e) => {
+            client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+            return Err(e);
+        }
+    };
 
     // Rebuild privacy-sanitized HTTP request (strip Proxy-Connection, Via, X-Forwarded-For)
     let mut sanitized = format!("{} {} {}\r\n", method, rel_path, http_ver);
@@ -387,7 +414,7 @@ async fn handle_privoxy_client(
             let kl = k.trim().to_ascii_lowercase();
             if matches!(
                 kl.as_str(),
-                "proxy-connection" | "proxy-authorization" | "x-forwarded-for" | "via"
+                "connection" | "proxy-connection" | "proxy-authorization" | "x-forwarded-for" | "via"
             ) {
                 continue;
             }
@@ -425,11 +452,12 @@ async fn handle_socks5_client(
 ) -> Result<()> {
     let mut buf = Vec::with_capacity(512);
     let mut tmp = [0u8; 512];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 
     while buf.len() < 2 {
-        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut tmp)).await??;
+        let n = tokio::time::timeout_at(deadline, client.read(&mut tmp)).await??;
         if n == 0 {
-            return Ok(());
+            bail!("Incomplete SOCKS5 greeting");
         }
         buf.extend_from_slice(&tmp[..n]);
     }
@@ -439,35 +467,43 @@ async fn handle_socks5_client(
     let nmethods = buf[1] as usize;
     let greet_len = 2 + nmethods;
     while buf.len() < greet_len {
-        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut tmp)).await??;
+        let n = tokio::time::timeout_at(deadline, client.read(&mut tmp)).await??;
         if n == 0 {
-            return Ok(());
+            bail!("Incomplete SOCKS5 authentication methods");
         }
         buf.extend_from_slice(&tmp[..n]);
+    }
+    if !buf[2..greet_len].contains(&0x00) {
+        client.write_all(&[0x05, 0xff]).await?;
+        bail!("SOCKS5 client did not offer no-authentication mode");
     }
     client.write_all(&[0x05, 0x00]).await?;
 
     let mut req = buf.split_off(greet_len);
     while req.len() < 5 {
-        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut tmp)).await??;
+        let n = tokio::time::timeout_at(deadline, client.read(&mut tmp)).await??;
         if n == 0 {
-            return Ok(());
+            bail!("Incomplete SOCKS5 request");
         }
         req.extend_from_slice(&tmp[..n]);
     }
-    if req[0] != 0x05 || req[1] != 0x01 {
-        return Ok(());
+    if req[0] != 0x05 || req[1] != 0x01 || req[2] != 0x00 {
+        client.write_all(&[0x05, 0x07, 0, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        bail!("Unsupported SOCKS5 request");
     }
 
     let req_hdr_len = match req[3] {
         0x01 => 10usize,
         0x03 => 5 + (req[4] as usize) + 2,
-        _ => return Ok(()),
+        _ => {
+            client.write_all(&[0x05, 0x08, 0, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            bail!("Unsupported SOCKS5 address type");
+        }
     };
     while req.len() < req_hdr_len {
-        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut tmp)).await??;
+        let n = tokio::time::timeout_at(deadline, client.read(&mut tmp)).await??;
         if n == 0 {
-            return Ok(());
+            bail!("Incomplete SOCKS5 destination");
         }
         req.extend_from_slice(&tmp[..n]);
     }
@@ -487,10 +523,24 @@ async fn handle_socks5_client(
         _ => return Ok(()),
     };
 
-    let (mut upstream, ep_opt) = connect_via_gateway_tunnel(&shared, &gw_key, &host, port).await?;
-    client
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
+    if host.is_empty() || port == 0 {
+        client.write_all(&[0x05, 0x01, 0, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        bail!("Invalid SOCKS5 destination");
+    }
+    let (mut upstream, ep_opt) = match connect_via_gateway_tunnel(&shared, &gw_key, &host, port).await {
+        Ok(result) => result,
+        Err(e) => {
+            client.write_all(&[0x05, 0x01, 0, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            return Err(e);
+        }
+    };
+    let bound = match upstream.local_addr()? {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(_) => bail!("Unexpected IPv6 SOCKS5 upstream"),
+    };
+    let ip = bound.ip().octets();
+    let port = bound.port().to_be_bytes();
+    client.write_all(&[0x05, 0x00, 0x00, 0x01, ip[0], ip[1], ip[2], ip[3], port[0], port[1]]).await?;
 
     let extra_payload = &req[req_hdr_len..];
     if !extra_payload.is_empty() {

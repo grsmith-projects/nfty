@@ -393,7 +393,7 @@ pub fn print_status_table(shared: &SharedState) {
             "READY (dnsmasq)".cyan().to_string()
         };
         let upstreams = if dns.upstreams.is_empty() {
-            "1.1.1.1,9.9.9.9".to_string()
+            "(none)".to_string()
         } else {
             dns.upstreams.join(",")
         };

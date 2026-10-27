@@ -8,13 +8,13 @@
 ## 1. Overview
 
 `nfty` separates its two HTTP control-plane directives by port role:
-- **`web:<port>`** (default `:8000`): Serves the interactive single-page JavaScript Web Console (`GET /`, `/ui`, `/dashboard`, `/index.html`) and its backing `/api/v1/*` JSON endpoints on the same port. It is typically secured via an IP/CIDR/hostname `allow` list (e.g., `allow 192.168.0.0/16`).
-- **`api:<port>`** (default `:9090`): Serves only the headless `/api/v1/*` JSON Control API (`GET /` returns `404 Not Found` JSON), secured via scoped `ro` / `rw` API keys.
+- **`web:<port>`** (default `:8000`): Serves the interactive single-page JavaScript Web Console and its `/api/v1/*` JSON endpoints, protected by an IP/CIDR allow-list.
+- **`api:<port>`** (default `:9090`): Serves only the headless `/api/v1/*` JSON Control API (`GET /` returns `404 Not Found` JSON), protected by an IP/CIDR allow-list and optional scoped keys.
 
 Core properties:
 1. **Declarative `Nftyfile` and CLI Directive (`web:<port>`)**:
-   - Declare `web:8000` (or `web`) inside any `vip` or `gateway` block, with `allow`, `limit`, `auth`, `hostname` (mDNS `.local`), `cloudflare-dns`, and optional `key` sub-directives.
-   - Kernel `nftables` `prerouting` and `input` chains enforce any attached `allow` CIDR/hostname sets (`@allow_<id>`) and `limit` meters (`@meter_<id>`) before accepting traffic to the local `web:<port>` listener.
+   - Declare `web:8000` (or `web`) inside any `vip` or `gateway` block, with `allow`, `limit`, `hostname` (mDNS `.local`), `cloudflare-dns`, and optional `key` sub-directives. Local service `auth` is currently rejected on apply.
+   - Kernel `nftables` `prerouting` and `input` chains enforce applicable IP/CIDR allow sets (`@allow_<id>`) and `limit` meters (`@meter_<id>`) before accepting traffic to the local `web:<port>` listener.
 2. **Required IP Allow-List, with Optional Token/Login Auth**:
    - **Allow-List Required**: Every `web:<port>` and `api:<port>` listener must be covered by at least one IP, CIDR, or IPv4-wildcard `allow` entry (its own, its gateway's, or the global allow-list). `validate`, `apply`, `bootstrap`, `PUT /api/v1/config`, and allow-list updates with `"apply": true` refuse configs that break this rule. Hostname entries (e.g. `*.office.lan`) are rejected on these listeners because DHCP clients choose their own names. If a config loaded at boot breaks the rule, the dataplane still starts, but remote access to the listener is denied (`403`). Loopback clients (the local CLI) are not affected.
    - **IP Allow-List Auth**: Clients matching the allow-list of a listener with no API keys receive `rw` access (`authenticate_api_request_with_context`). If the listener has API keys, allow-listed clients must also present a key. Remote clients connecting to a port with no `web:`/`api:` listener (including the default `--api-bind 0.0.0.0:9090` when `api:9090` is not configured) are denied.
@@ -134,12 +134,13 @@ flowchart LR
 ## 5. View Specifications
 
 ### 5.1 Top Bar & Uncommitted Changes Banner
-- **Status Indicator**: Displays `KERNEL NFT ACTIVE` or `USERSPACE MODE`, scope badge, and refresh controls.
+- **Status Indicator**: Shows whether the controller reports an nftables apply, no reported apply, or unknown status. It does not independently verify the current kernel state.
 - **Uncommitted Changes Banner** (shown when `candidate != running` in `rw` mode):
-  - **`Apply / Commit Now`** (`POST /api/v1/apply`)
-  - **`Apply Confirm 60s`** (`POST /api/v1/cli` with `apply confirm 60`)
-  - **`Discard`** (`POST /api/v1/cli` with `discard`)
-  - **`Rollback`** (`POST /api/v1/cli` with `rollback 1`)
+  - **`Apply Candidate`** (`POST /api/v1/apply`)
+  - Confirmed apply, discard, and rollback commands are available through the
+    Web CLI (`POST /api/v1/cli`), rather than dedicated banner buttons.
+    Confirmed apply is limited to the long-running controller and uses a
+    process-local timer.
 
 ### 5.2 Tab 1: Overview & Topology
 - **Summary Cards**: Active VIP count, L4/L7 services count, healthy/drained/down backend counts, WireGuard gateway/tunnel status, and active conntrack flow count.

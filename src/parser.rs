@@ -254,7 +254,7 @@ pub fn parse_vip(raw: &str) -> Result<VipConfig> {
 /// Parses a `vip <ipv4[/cidr] | hostname> [dhcp [iface]] [vlan <id>]` header
 pub fn parse_vip_header(tokens: &[&str]) -> Result<(String, Option<Ipv4Addr>, VipConfig)> {
     if tokens.is_empty() {
-        bail!("Expected VIP IPv4 address or DHCP hostname (e.g. 'vip 169.254.1.4' or 'vip sonarr')");
+        bail!("Expected VIP IPv4 address or DHCP hostname (e.g. 'vip 192.168.1.4' or 'vip sonarr')");
     }
     let first = tokens[0].trim();
     let (key, ip_opt, mut vip_cfg) = if let Ok((ip, cidr_opt)) = parse_ip_and_optional_cidr(first) {
@@ -276,7 +276,7 @@ pub fn parse_vip_header(tokens: &[&str]) -> Result<(String, Option<Ipv4Addr>, Vi
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
         if !valid_name {
             bail!(
-                "Invalid VIP IPv4 or DHCP hostname '{}' (expected e.g. '169.254.1.4' or 'sonarr')",
+                "Invalid VIP IPv4 or DHCP hostname '{}' (expected e.g. '192.168.1.4' or 'sonarr')",
                 first
             );
         }
@@ -579,9 +579,9 @@ pub fn parse_api_key_directive(tokens: &[&str]) -> Result<(ApiKey, bool)> {
 
 /// Validates and normalizes an allow-list entry:
 /// Supports:
-/// - Exact IPv4: `169.254.1.50`
-/// - CIDR: `169.254.1.0/24`
-/// - IPv4 Wildcard: `169.254.1.*`, `10.0.*.*`, `*`
+/// - Exact IPv4: `192.168.1.50`
+/// - CIDR: `192.168.1.0/24`
+/// - IPv4 Wildcard: `192.168.1.*`, `10.0.*.*`, `*`
 /// - Hostname: `admin.office.lan`, `plex.local`
 /// - Hostname Wildcard: `*.office.lan`, `*.trusted.example.com`, `web-*.corp.lan`
 pub fn validate_allow_entry(raw: &str) -> Result<String> {
@@ -612,7 +612,7 @@ pub fn validate_allow_entry(raw: &str) -> Result<String> {
         return Ok(ip.to_string());
     }
 
-    // 3. Check IPv4 wildcard (e.g. "169.254.1.*" or "10.*.*.*")
+    // 3. Check IPv4 wildcard (e.g. "192.168.1.*" or "10.*.*.*")
     let dot_parts: Vec<&str> = trimmed.split('.').collect();
     if dot_parts.len() == 4
         && dot_parts
@@ -628,7 +628,7 @@ pub fn validate_allow_entry(raw: &str) -> Result<String> {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*'));
     if !valid_chars || trimmed.starts_with('.') || trimmed.ends_with('.') {
         bail!(
-            "Invalid allow-list host/IP/wildcard '{}'. Examples: '169.254.1.0/24', '169.254.1.*', '*.office.lan', 'laptop.lan'",
+            "Invalid allow-list host/IP/wildcard '{}'. Examples: '192.168.1.0/24', '192.168.1.*', '*.office.lan', 'laptop.lan'",
             raw
         );
     }
@@ -636,7 +636,20 @@ pub fn validate_allow_entry(raw: &str) -> Result<String> {
     Ok(trimmed)
 }
 
-/// Converts an IPv4 wildcard like `169.254.1.*` or `10.*.*.*` into a CIDR (`169.254.1.0/24`, `10.0.0.0/8`),
+pub fn validate_host_mapping_name(raw: &str) -> Result<String> {
+    let host = validate_allow_entry(raw)?;
+    if host.contains('*')
+        || host.contains('/')
+        || host.parse::<Ipv4Addr>().is_ok()
+        || host.len() > 253
+        || host.split('.').any(|label| label.is_empty() || label.len() > 63)
+    {
+        bail!("Invalid hostname for a host mapping: '{}'", raw);
+    }
+    Ok(host)
+}
+
+/// Converts an IPv4 wildcard like `192.168.1.*` or `10.*.*.*` into a CIDR (`192.168.1.0/24`, `10.0.0.0/8`),
 /// or returns `None` if it's a hostname / hostname wildcard.
 pub fn expand_ip_wildcard_to_cidr(entry: &str) -> Option<String> {
     if entry == "*" {
@@ -789,6 +802,7 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
     }
 
     let mut ctx = ParseContext::Root;
+    let mut explicit_dns_upstreams = false;
 
     for (line_idx, raw_line) in input.lines().enumerate() {
         let line_no = line_idx + 1;
@@ -827,7 +841,7 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         } else if tokens[0].eq_ignore_ascii_case("vip") {
                             if tokens.len() < 2 {
                                 bail!(
-                                    "Line {}: expected VIP IPv4 address or DHCP hostname after 'vip' (e.g. 'vip 169.254.1.4' or 'vip sonarr')",
+                                    "Line {}: expected VIP IPv4 address or DHCP hostname after 'vip' (e.g. 'vip 192.168.1.4' or 'vip sonarr')",
                                     line_no
                                 );
                             }
@@ -1224,8 +1238,7 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         ParseContext::Gateway(gw)
                     } else {
                         let tokens: Vec<&str> = stmt.split_whitespace().collect();
-                        let next_idx = gw.tunnels.len();
-                        let t = parse_wg_tunnel(&tokens, next_idx)
+                        let t = parse_wg_tunnel(&tokens, &gw.key)
                             .with_context(|| format!("Line {}", line_no))?;
                         if let Some(existing) = gw.tunnels.iter_mut().find(|x| x.name == t.name) {
                             *existing = t;
@@ -1254,6 +1267,18 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         ParseContext::Root
                     } else {
                         let dns = config.dns.get_or_insert_with(DnsConfig::default);
+                        let tokens: Vec<&str> = stmt.split_whitespace().collect();
+                        let directive = tokens.first().map(|s| s.to_ascii_lowercase());
+                        if matches!(directive.as_deref(), Some("upstream" | "upstreams" | "server" | "nameserver")) {
+                            if !explicit_dns_upstreams {
+                                dns.upstreams.clear();
+                                explicit_dns_upstreams = true;
+                            }
+                        } else if directive.as_deref() == Some("no")
+                            && tokens.get(1).map(|s| s.eq_ignore_ascii_case("upstream") || s.eq_ignore_ascii_case("upstreams") || s.eq_ignore_ascii_case("server")).unwrap_or(false)
+                        {
+                            explicit_dns_upstreams = true;
+                        }
                         apply_dns_directive(dns, stmt)
                             .with_context(|| format!("Line {}", line_no))?;
                         ParseContext::Dns
@@ -1263,32 +1288,8 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
         }
     }
 
-    match ctx {
-        ParseContext::Root
-        | ParseContext::GlobalAllow
-        | ParseContext::Dns
-        | ParseContext::Vip(_)
-        | ParseContext::VipServices(_) => {}
-        ParseContext::VipServiceItem(vip_key, svc, _)
-        | ParseContext::VipServiceTo(vip_key, svc, _)
-        | ParseContext::VipServiceAllow(vip_key, svc, _) => {
-            insert_vip_service_disambiguated(&mut config, &vip_key, svc);
-        }
-        ParseContext::Service(svc)
-        | ParseContext::ServiceTo(svc)
-        | ParseContext::ServiceAllow(svc) => {
-            config.services.insert(svc.key.clone(), svc);
-        }
-        ParseContext::Gateway(gw)
-        | ParseContext::GatewayTunnels(gw)
-        | ParseContext::GatewayService(gw)
-        | ParseContext::GatewayAllow(gw) => {
-            config.gateways.insert(gw.key.clone(), gw);
-        }
-        ParseContext::GatewayServiceItem(mut gw, gs, _) => {
-            upsert_gateway_service(&mut gw, gs);
-            config.gateways.insert(gw.key.clone(), gw);
-        }
+    if !matches!(ctx, ParseContext::Root) {
+        bail!("Unexpected end of Nftyfile: unclosed configuration block");
     }
 
     // Hydrate any active DHCP leases from `/run/nfty-dhcp-*.ip` so SSH/CLI sessions immediately see leased IPs
@@ -1355,7 +1356,7 @@ pub fn parse_ip_and_optional_cidr(raw: &str) -> Result<(Ipv4Addr, Option<u8>)> {
 }
 
 /// Creates or looks up a service inside a `vip <ip> -> service` container from a spec such as:
-/// - `plex:32400` or `app-backend:9090` or `169.254.1.165:32400` (backend host/IP:port, listen port defaults to backend port)
+/// - `plex:32400` or `app-backend:9090` or `192.168.1.165:32400` (backend host/IP:port, listen port defaults to backend port)
 /// - `ssh:22` or `ssh` (local SSH service on port 22 -> `127.0.0.1:22`)
 /// - `80` or `53/udp` (listen port on the VIP)
 pub fn insert_vip_service_disambiguated(
@@ -1619,7 +1620,7 @@ pub fn create_or_find_vip_service_by_key(
         return Ok(key);
     }
 
-    // 4. Target `<host_or_ip>:<port>` (e.g. `plex:32400`, `app-backend:9090`, `169.254.1.165:32400`)
+    // 4. Target `<host_or_ip>:<port>` (e.g. `plex:32400`, `app-backend:9090`, `192.168.1.165:32400`)
     let b = parse_backend(&[spec], 80)?;
     let port = b.port;
     let key = format!("{}:{}", vip_key, port);
@@ -1912,18 +1913,23 @@ pub fn remove_backend_from_service(svc: &mut Service, raw_target: &str) -> Resul
     Ok(svc.backends.len() < before)
 }
 
-pub fn parse_wg_tunnel(tokens: &[&str], index_hint: usize) -> Result<WgTunnel> {
+pub fn parse_wg_tunnel(tokens: &[&str], gateway_key: &str) -> Result<WgTunnel> {
     if tokens.is_empty() {
         bail!("Expected tunnel config name (e.g. 'mullvad-us-sea-001.conf') or inline tunnel definition");
     }
     let name = tokens[0].trim().to_string();
     let iface = if name.starts_with("wg")
+        && name.len() > 2
         && name[2..].chars().all(|c| c.is_ascii_digit())
         && !name.ends_with(".conf")
     {
         name.clone()
     } else {
-        format!("wg{}", index_hint)
+        let mut hash = 2_166_136_261u32;
+        for byte in gateway_key.bytes().chain(std::iter::once(0)).chain(name.bytes()) {
+            hash = (hash ^ u32::from(byte)).wrapping_mul(16_777_619);
+        }
+        format!("wg{}", 1_000_000 + hash % 1_000_000)
     };
 
     let mut address = None;
@@ -2089,8 +2095,7 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
             if tokens.len() < 2 {
                 bail!("Expected tunnel config filename or inline spec after 'tunnel'");
             }
-            let next_idx = gw.tunnels.len();
-            let t = parse_wg_tunnel(&tokens[1..], next_idx)?;
+            let t = parse_wg_tunnel(&tokens[1..], &gw.key)?;
             if let Some(existing) = gw.tunnels.iter_mut().find(|x| x.name == t.name) {
                 *existing = t;
             } else {
@@ -2432,7 +2437,7 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
     match tokens[0].to_ascii_lowercase().as_str() {
         "listen" | "bind" => {
             if tokens.len() < 2 {
-                bail!("Expected IP or IP:PORT after 'listen' (e.g. 'listen 169.254.10.10')");
+                bail!("Expected IP or IP:PORT after 'listen' (e.g. 'listen 192.168.10.10')");
             }
             for tok in &tokens[1..] {
                 let s = tok.trim().to_string();
@@ -2506,7 +2511,6 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
             if tokens.len() < 2 {
                 bail!("Expected upstream DNS IP[:PORT][@iface] after 'upstream' (e.g. 'upstream 1.1.1.1 9.9.9.9')");
             }
-            // If replacing default upstreams on first explicit upstream command, allow clean list
             for tok in &tokens[1..] {
                 if tok.eq_ignore_ascii_case("fastest") || tok.eq_ignore_ascii_case("all-servers") {
                     dns.all_servers = true;
@@ -2592,7 +2596,7 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
         }
         "address" | "wildcard" => {
             if tokens.len() < 3 {
-                bail!("Usage: address <domain-or-wildcard> <ipv4> (e.g. 'address *.k8s.lan 169.254.10.80')");
+                bail!("Usage: address <domain-or-wildcard> <ipv4> (e.g. 'address *.k8s.lan 192.168.10.80')");
             }
             let domain = tokens[1].trim().to_ascii_lowercase();
             let ip: Ipv4Addr = tokens[2]
@@ -2815,6 +2819,9 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
                 bail!("Usage: blocklist <name> <url-or-path>");
             }
             let name = tokens[1].trim().to_ascii_lowercase();
+            if !DnsBlocklist::valid_name(&name) {
+                bail!("Blocklist name must contain only letters, digits, '.', '_' or '-'");
+            }
             let url = tokens[2].trim().to_string();
             if let Some(existing) = dns.blocklists.iter_mut().find(|b| b.name == name) {
                 existing.url = url;

@@ -297,9 +297,9 @@ pub fn generate_api_key(scope: ApiKeyScope) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Service {
-    /// Canonical key, e.g. "9000", "169.254.1.240:443", "sonarr:80", "53/udp"
+    /// Canonical key, e.g. "9000", "192.168.1.240:443", "sonarr:80", "53/udp"
     pub key: String,
-    /// Optional parent VIP key (e.g. "169.254.1.4" or DHCP VIP hostname "sonarr")
+    /// Optional parent VIP key (e.g. "192.168.1.4" or DHCP VIP hostname "sonarr")
     #[serde(default)]
     pub vip_id: Option<String>,
     /// Optional human/target name inside a `vip <ip> -> service` container (e.g. "plex:32400", "app-backend:9090", "ssh:22", "api:9090")
@@ -328,7 +328,7 @@ pub struct Service {
     pub mode: ForwardMode,
     pub check: Option<HealthCheckConfig>,
     pub limit: Option<RateLimit>,
-    /// Allow-list entries: can be IP/CIDR ("169.254.1.0/24"), IP wildcard ("169.254.1.*"),
+    /// Allow-list entries: can be IP/CIDR ("192.168.1.0/24"), IP wildcard ("192.168.1.*"),
     /// hostname ("admin.office.lan"), or wildcard hostname ("*.trusted.lan", "*")
     pub allow: Vec<String>,
     pub backends: Vec<Backend>,
@@ -774,7 +774,7 @@ impl fmt::Display for GatewayPortForward {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gateway {
-    /// Virtual Gateway IPv4 address (e.g. "169.254.1.5")
+    /// Virtual Gateway IPv4 address (e.g. "192.168.1.5")
     pub key: String,
     pub listen_ip: Ipv4Addr,
     pub vip: Option<VipConfig>,
@@ -788,7 +788,7 @@ pub struct Gateway {
     /// Gateway-attached local services (e.g. `privoxy:8118`, `socks5:1080`, `ssh:22`, `api:9090`)
     #[serde(default)]
     pub services: Vec<GatewayService>,
-    /// Inbound port forwards from the gateway's WireGuard tunnel interfaces to LAN backends (e.g. `forward 51413 to 169.254.20.10:51413`)
+    /// Inbound port forwards from the gateway's WireGuard tunnel interfaces to LAN backends (e.g. `forward 51413 to 192.168.20.10:51413`)
     #[serde(default)]
     pub forwards: Vec<GatewayPortForward>,
     pub tunnels: Vec<WgTunnel>,
@@ -1011,6 +1011,15 @@ pub struct DnsBlocklist {
     pub url: String,
 }
 
+impl DnsBlocklist {
+    pub fn valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            && name != "."
+            && name != ".."
+    }
+}
+
 impl fmt::Display for DnsBlocklist {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "blocklist {} {}", self.name, self.url)
@@ -1223,7 +1232,7 @@ pub struct Config {
     /// Optional dnsmasq-backed programmable DNS endpoint configuration (`dns { ... }`)
     #[serde(default)]
     pub dns: Option<DnsConfig>,
-    /// Explicitly defined VIP containers (`vip 169.254.1.4 { ... }` or `vip sonarr { dhcp eth0 ... }`)
+    /// Explicitly defined VIP containers (`vip 192.168.1.4 { ... }` or `vip sonarr { dhcp eth0 ... }`)
     #[serde(default)]
     pub vips: BTreeMap<String, VipConfig>,
     pub services: BTreeMap<String, Service>,
@@ -1505,11 +1514,51 @@ impl Config {
         matched
     }
 
-    /// Returns a clone of the `Config` with `ReadWrite` API keys masked so read-only callers
-    /// cannot escalate privileges by inspecting `/api/v1/status` or `/api/v1/config`.
+    /// A shared port requires the key to be accepted by every keyed listener on that port.
+    pub fn verify_api_key_for_port(
+        &self,
+        candidate_key: &str,
+        port: u16,
+    ) -> Option<ApiKeyScope> {
+        let candidate_key = candidate_key.trim();
+        if candidate_key.is_empty() {
+            return None;
+        }
+        let mut matched = None;
+        for listener in self.control_listeners().into_iter().filter(|listener| {
+            listener.port == port && !listener.api_keys.is_empty()
+        }) {
+            let listener_scope = listener
+                .api_keys
+                .iter()
+                .filter(|key| key.key == candidate_key)
+                .map(|key| key.scope)
+                .fold(None, |scope, next| match (scope, next) {
+                    (Some(ApiKeyScope::ReadWrite), _) | (_, ApiKeyScope::ReadWrite) => {
+                        Some(ApiKeyScope::ReadWrite)
+                    }
+                    _ => Some(ApiKeyScope::ReadOnly),
+                })?;
+            matched = Some(match (matched, listener_scope) {
+                (Some(ApiKeyScope::ReadOnly), _) | (_, ApiKeyScope::ReadOnly) => {
+                    ApiKeyScope::ReadOnly
+                }
+                _ => ApiKeyScope::ReadWrite,
+            });
+        }
+        matched
+    }
+
+    /// Masks write-capable keys and other secrets in read-only configuration responses.
     pub fn redacted_for_readonly(&self) -> Self {
         let mut c = self.clone();
         for svc in c.services.values_mut() {
+            for rule in &mut svc.auth {
+                *rule = "<redacted>".to_string();
+            }
+            for rule in &mut svc.cloudflare_auth {
+                *rule = "<redacted>".to_string();
+            }
             for k in &mut svc.api_keys {
                 if k.scope == ApiKeyScope::ReadWrite {
                     k.key = "<redacted-rw-key>".to_string();
@@ -1517,6 +1566,11 @@ impl Config {
             }
         }
         for gw in c.gateways.values_mut() {
+            for tunnel in &mut gw.tunnels {
+                if tunnel.private_key.is_some() {
+                    tunnel.private_key = Some("<redacted>".to_string());
+                }
+            }
             for gs in &mut gw.services {
                 for k in &mut gs.api_keys {
                     if k.scope == ApiKeyScope::ReadWrite {

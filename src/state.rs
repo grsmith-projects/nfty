@@ -114,6 +114,7 @@ pub struct AppState {
     pub last_disk_nftyfile: String,
     pub kernel_applied: bool,
     pub api_bind: String,
+    pub controller_is_authoritative: bool,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -134,30 +135,23 @@ impl AppState {
             last_disk_nftyfile: initial_txt,
             kernel_applied: false,
             api_bind: "127.0.0.1:9090".to_string(),
+            controller_is_authoritative: false,
         };
         s.sync_runtime_entries();
         s
     }
 
-    /// Returns the active configuration (`&self.running` if any VIPs, services, gateways, or allow rules
-    /// have been committed, otherwise `&self.candidate`).
+    /// Returns the committed configuration, including when it is empty.
     pub fn active_config(&self) -> &Config {
-        if !self.running.is_empty() {
-            &self.running
-        } else {
-            &self.candidate
-        }
+        &self.running
     }
 
-    /// Reloads `/data/Nftyfile` (or `self.config_path`) if another session or API call updated it on disk.
+    /// Refreshes an unmodified candidate from disk without claiming it was applied.
     pub fn sync_from_disk_if_changed(&mut self) {
-        let path = if self.config_path.exists() {
-            self.config_path.clone()
-        } else if std::path::Path::new("/data/Nftyfile").exists() {
-            PathBuf::from("/data/Nftyfile")
-        } else {
+        let path = self.config_path.clone();
+        if !path.exists() {
             return;
-        };
+        }
 
         if let Ok(raw) = std::fs::read_to_string(&path) {
             if raw != self.last_disk_nftyfile {
@@ -189,7 +183,6 @@ impl AppState {
                     }
                     let candidate_unmodified =
                         self.candidate.format_nftyfile() == self.running.format_nftyfile();
-                    self.running = parsed.clone();
                     if candidate_unmodified {
                         self.candidate = parsed;
                     }
@@ -221,6 +214,43 @@ impl AppState {
                 self.runtime.entry(t.endpoint_key()).or_default();
             }
         }
+    }
+
+    pub fn set_host_mapping(&mut self, host: &str, ips: &[Ipv4Addr]) {
+        if ips.is_empty() {
+            self.resolved_hosts.remove(host);
+        } else {
+            self.resolved_hosts.insert(host.to_string(), ips.to_vec());
+        }
+        if let Some(&first_ip) = ips.first() {
+            for config in [&mut self.running, &mut self.candidate] {
+                for svc in config.services.values_mut() {
+                    for backend in &mut svc.backends {
+                        if backend.host.as_deref().map(|name| name.eq_ignore_ascii_case(host)) == Some(true) {
+                            backend.ip = first_ip;
+                        }
+                    }
+                }
+                for gateway in config.gateways.values_mut() {
+                    for forward in &mut gateway.forwards {
+                        if forward.backend.host.as_deref().map(|name| name.eq_ignore_ascii_case(host)) == Some(true) {
+                            forward.backend.ip = first_ip;
+                        }
+                    }
+                }
+            }
+        }
+        self.sync_runtime_entries();
+    }
+
+    pub fn has_runtime_endpoint(&self, endpoint: &str) -> bool {
+        [&self.running, &self.candidate].iter().any(|config| {
+            config.services.values().any(|svc| {
+                svc.backends.iter().any(|backend| backend.endpoint() == endpoint)
+            }) || config.gateways.values().any(|gateway| {
+                gateway.tunnels.iter().any(|tunnel| tunnel.endpoint_key() == endpoint)
+            })
+        })
     }
 
     /// Expands a service's allow-list + global allow-list (including IP wildcards, hostnames,
@@ -282,36 +312,6 @@ impl AppState {
             .collect();
         if !backups.is_empty() {
             return backups;
-        }
-
-        let non_drained: Vec<&Backend> = backends
-            .iter()
-            .filter(|b| {
-                !b.backup
-                    && self
-                        .runtime
-                        .get(&b.endpoint())
-                        .map(|rt| !rt.drained)
-                        .unwrap_or(true)
-            })
-            .collect();
-        if !non_drained.is_empty() {
-            return non_drained;
-        }
-
-        let non_drained_backups: Vec<&Backend> = backends
-            .iter()
-            .filter(|b| {
-                b.backup
-                    && self
-                        .runtime
-                        .get(&b.endpoint())
-                        .map(|rt| !rt.drained)
-                        .unwrap_or(true)
-            })
-            .collect();
-        if !non_drained_backups.is_empty() {
-            return non_drained_backups;
         }
 
         Vec::new()

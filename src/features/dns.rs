@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::Path;
 use std::process::Command;
@@ -14,21 +15,27 @@ pub const DNSMASQ_HOSTS_PATH: &str = "/run/nfty-dnsmasq.hosts";
 pub const DNSMASQ_PID_PATH: &str = "/run/nfty-dnsmasq.pid";
 pub const DNS_LISTS_DIR: &str = "/data/dns/lists";
 
-fn find_healthy_wg_iface_for_gateway(
-    cfg: &Config,
-    st: Option<&AppState>,
-    gw_name_or_ip: &str,
-) -> Option<String> {
-    let gw = cfg.gateways.get(gw_name_or_ip).or_else(|| {
+fn find_gateway<'a>(cfg: &'a Config, gw_name_or_ip: &str) -> Option<&'a crate::ast::Gateway> {
+    cfg.gateways.get(gw_name_or_ip).or_else(|| {
         cfg.gateways.values().find(|g| {
             g.key.eq_ignore_ascii_case(gw_name_or_ip)
                 || g.listen_ip.to_string() == gw_name_or_ip
                 || g.hostname.as_deref() == Some(gw_name_or_ip)
         })
-    })?;
+    })
+}
+
+fn find_healthy_wg_iface_for_gateway(
+    cfg: &Config,
+    st: Option<&AppState>,
+    gw_name_or_ip: &str,
+) -> Option<String> {
+    let gw = find_gateway(cfg, gw_name_or_ip)?;
+    let base_idx = cfg.gateways.values().take_while(|g| g.key != gw.key)
+        .map(|g| g.tunnels.len()).sum::<usize>();
     for (idx, t) in gw.tunnels.iter().enumerate() {
         let iface = if t.iface.is_empty() {
-            format!("wg{}", idx)
+            format!("wg{}", base_idx + idx)
         } else {
             t.iface.clone()
         };
@@ -40,13 +47,7 @@ fn find_healthy_wg_iface_for_gateway(
             return Some(iface);
         }
     }
-    gw.tunnels.first().map(|t| {
-        if t.iface.is_empty() {
-            "wg0".to_string()
-        } else {
-            t.iface.clone()
-        }
-    })
+    None
 }
 
 fn service_is_healthy_for_dns(
@@ -54,7 +55,7 @@ fn service_is_healthy_for_dns(
     st: Option<&AppState>,
 ) -> bool {
     if svc.backends.is_empty() {
-        return true;
+        return svc.is_local_dns();
     }
     let Some(s) = st else {
         return true;
@@ -136,24 +137,31 @@ pub fn compile_dnsmasq_config(cfg: &Config, st: Option<&AppState>) -> (String, S
     }
 
     // Default gateway interface if a WireGuard gateway exposes dns:53 and upstreams don't specify @iface
-    let default_wg_iface = cfg
+    let default_wg_gateway = cfg
         .gateways
         .values()
         .find(|gw| {
             !gw.tunnels.is_empty()
                 && gw.services.iter().any(|gs| gs.kind == GatewayServiceKind::Dns)
-        })
+        });
+    let default_wg_iface = default_wg_gateway
         .and_then(|gw| find_healthy_wg_iface_for_gateway(cfg, st, &gw.key));
 
     for u in &dns_cfg.upstreams {
         let formatted = if let Some((srv, target)) = u.split_once('@') {
             if let Some(wg_if) = find_healthy_wg_iface_for_gateway(cfg, st, target) {
                 format!("{}@{}", srv.replace(':', "#"), wg_if)
+            } else if find_gateway(cfg, target).is_some() {
+                conf.push_str(&format!("# upstream {} blocked: gateway has no healthy tunnel\n", u));
+                continue;
             } else {
                 format!("{}@{}", srv.replace(':', "#"), target)
             }
         } else if let Some(wg_if) = &default_wg_iface {
             format!("{}@{}", u.replace(':', "#"), wg_if)
+        } else if default_wg_gateway.is_some() {
+            conf.push_str(&format!("# upstream {} blocked: gateway has no healthy tunnel\n", u));
+            continue;
         } else {
             u.replace(':', "#")
         };
@@ -163,12 +171,17 @@ pub fn compile_dnsmasq_config(cfg: &Config, st: Option<&AppState>) -> (String, S
     // Conditional forward zones
     for fz in &dns_cfg.forward_zones {
         let dom = fz.domain.trim_start_matches("*.").trim_start_matches('.');
-        let suffix = fz
-            .via_gateway
-            .as_ref()
-            .and_then(|gw| find_healthy_wg_iface_for_gateway(cfg, st, gw))
-            .map(|iface| format!("@{}", iface))
-            .unwrap_or_default();
+        let suffix = match &fz.via_gateway {
+            Some(gw) => match find_healthy_wg_iface_for_gateway(cfg, st, gw) {
+                Some(iface) => format!("@{}", iface),
+                None => {
+                    conf.push_str(&format!("local=/{}/\n", dom));
+                    conf.push_str(&format!("# forward zone {} blocked: gateway has no healthy tunnel\n", dom));
+                    continue;
+                }
+            },
+            None => String::new(),
+        };
         for srv in &fz.servers {
             let srv_clean = srv.replace(':', "#");
             conf.push_str(&format!("server=/{}/{}{}\n", dom, srv_clean, suffix));
@@ -343,14 +356,7 @@ pub fn compile_dnsmasq_config(cfg: &Config, st: Option<&AppState>) -> (String, S
     }
 
     if dns_cfg.auto_hosts {
-        let mut resolved = st.map(|s| s.resolved_hosts.clone()).unwrap_or_default();
-        if resolved.is_empty() && Path::new("/data/hosts.json").exists() {
-            if let Ok(raw) = fs::read_to_string("/data/hosts.json") {
-                if let Ok(parsed) = serde_json::from_str::<BTreeMap<String, Vec<Ipv4Addr>>>(&raw) {
-                    resolved = parsed;
-                }
-            }
-        }
+        let resolved = st.map(|s| s.resolved_hosts.clone()).unwrap_or_default();
         for (h, ips) in resolved {
             if h.contains('*') {
                 continue;
@@ -376,10 +382,23 @@ pub fn compile_dnsmasq_config(cfg: &Config, st: Option<&AppState>) -> (String, S
     (conf, hosts_txt)
 }
 
+fn is_managed_dnsmasq(pid: u32) -> bool {
+    let proc_path = format!("/proc/{}", pid);
+    let exe_is_dnsmasq = fs::read_link(format!("{}/exe", proc_path))
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name == "dnsmasq"))
+        .unwrap_or(false);
+    let uses_config = fs::read(format!("{}/cmdline", proc_path))
+        .ok()
+        .map(|cmdline| cmdline.split(|b| *b == 0).any(|arg| arg == DNSMASQ_CONF_PATH.as_bytes()))
+        .unwrap_or(false);
+    exe_is_dnsmasq && uses_config
+}
+
 pub fn dnsmasq_running_pid() -> Option<u32> {
     if let Ok(raw) = fs::read_to_string(DNSMASQ_PID_PATH) {
         if let Ok(pid) = raw.trim().parse::<u32>() {
-            if Path::new(&format!("/proc/{}", pid)).exists() {
+            if is_managed_dnsmasq(pid) {
                 return Some(pid);
             }
         }
@@ -389,12 +408,9 @@ pub fn dnsmasq_running_pid() -> Option<u32> {
             let name = entry.file_name();
             let s = name.to_string_lossy();
             if s.chars().all(|c| c.is_ascii_digit()) {
-                let cmdline_path = entry.path().join("cmdline");
-                if let Ok(cmd) = fs::read_to_string(cmdline_path) {
-                    if cmd.contains("dnsmasq") && cmd.contains("nfty-dnsmasq.conf") {
-                        if let Ok(pid) = s.parse::<u32>() {
-                            return Some(pid);
-                        }
+                if let Ok(pid) = s.parse::<u32>() {
+                    if is_managed_dnsmasq(pid) {
+                        return Some(pid);
                     }
                 }
             }
@@ -403,13 +419,30 @@ pub fn dnsmasq_running_pid() -> Option<u32> {
     None
 }
 
-pub fn stop_dnsmasq_daemon() {
+pub fn stop_dnsmasq_daemon() -> Result<()> {
     if let Some(pid) = dnsmasq_running_pid() {
         unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
+            if libc::kill(pid as i32, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("Failed to stop dnsmasq {}", pid));
+            }
+        }
+        for _ in 0..20 {
+            if !is_managed_dnsmasq(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if is_managed_dnsmasq(pid) {
+            bail!("dnsmasq {} did not stop", pid);
         }
     }
-    let _ = fs::remove_file(DNSMASQ_PID_PATH);
+    match fs::remove_file(DNSMASQ_PID_PATH) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("Failed to remove dnsmasq PID file"),
+    }
+    Ok(())
 }
 
 fn find_dnsmasq_binary() -> Option<&'static str> {
@@ -431,61 +464,98 @@ fn blocklist_needs_refresh(path: &str, force: bool) -> bool {
         return true;
     };
     let Ok(modified) = meta.modified() else {
-        return false;
+        return true;
     };
     match modified.elapsed() {
         Ok(age) => age >= BLOCKLIST_REFRESH_INTERVAL,
-        Err(_) => false,
+        Err(_) => true,
     }
+}
+
+fn blocklist_cache_has_domains(path: &Path) -> Result<bool> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("Failed to read {}", path.display())),
+    };
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("Failed to read {}", path.display()))?;
+        if !normalize_blocklist_to_hosts(&line).is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Fetches or refreshes configured blocklists into `/data/dns/lists/<name>.hosts`.
 /// Re-downloads remote lists automatically when missing, older than 24 hours, or when `force` is true.
 /// Returns `(log_messages, any_file_changed)`.
-pub fn sync_dns_blocklists(dns_cfg: &DnsConfig, force: bool) -> (Vec<String>, bool) {
+pub fn sync_dns_blocklists(dns_cfg: &DnsConfig, force: bool) -> Result<(Vec<String>, bool)> {
     let mut logs = Vec::new();
     let mut changed = false;
     if dns_cfg.blocklists.is_empty() {
-        return (logs, changed);
+        return Ok((logs, changed));
     }
-    let _ = fs::create_dir_all(DNS_LISTS_DIR);
+    fs::create_dir_all(DNS_LISTS_DIR).context("Failed to prepare DNS blocklist directory")?;
     for bl in &dns_cfg.blocklists {
+        if !crate::ast::DnsBlocklist::valid_name(&bl.name) {
+            bail!("Invalid DNS blocklist name '{}'", bl.name);
+        }
         let dest = format!("{}/{}.hosts", DNS_LISTS_DIR, bl.name);
-        if bl.url.starts_with("http://") || bl.url.starts_with("https://") {
-            if !blocklist_needs_refresh(&dest, force) {
+        let is_remote = bl.url.starts_with("http://") || bl.url.starts_with("https://");
+        let valid_cache = blocklist_cache_has_domains(Path::new(&dest))?;
+        if is_remote {
+            if valid_cache && !blocklist_needs_refresh(&dest, force) {
                 continue;
             }
-            if let Ok(resp) = ureq::get(&bl.url).timeout(Duration::from_secs(15)).call() {
-                if let Ok(body) = resp.into_string() {
-                    let normalized = normalize_blocklist_to_hosts(&body);
-                    let count = normalized.lines().count();
-                    let prev = fs::read_to_string(&dest).unwrap_or_default();
-                    let tmp = format!("{}.tmp", dest);
-                    if fs::write(&tmp, &normalized).is_ok() && fs::rename(&tmp, &dest).is_ok() {
-                        if prev != normalized {
-                            changed = true;
-                        }
-                        logs.push(format!(
-                            "Synced blocklist '{}' ({} domains) -> {}",
-                            bl.name, count, dest
-                        ));
-                    }
-                }
-            }
-        } else if Path::new(&bl.url).exists() && bl.url != dest {
-            if let Ok(body) = fs::read_to_string(&bl.url) {
-                let normalized = normalize_blocklist_to_hosts(&body);
-                let prev = fs::read_to_string(&dest).unwrap_or_default();
-                let tmp = format!("{}.tmp", dest);
-                if fs::write(&tmp, &normalized).is_ok() && fs::rename(&tmp, &dest).is_ok() {
-                    if prev != normalized {
-                        changed = true;
-                    }
-                }
-            }
+        } else if bl.url == dest && valid_cache {
+            continue;
         }
+
+        let loaded: Result<String> = if is_remote {
+            ureq::get(&bl.url)
+                .timeout(Duration::from_secs(15))
+                .call()
+                .map_err(|e| anyhow::anyhow!("Failed to fetch blocklist '{}': {}", bl.name, e))
+                .and_then(|response| response.into_string().context("Failed to read blocklist response"))
+        } else {
+            fs::read_to_string(&bl.url)
+                .with_context(|| format!("Failed to read blocklist '{}'", bl.name))
+        };
+        let normalized = loaded.and_then(|body| {
+            let normalized = normalize_blocklist_to_hosts(&body);
+            if normalized.is_empty() {
+                bail!("DNS blocklist '{}' contains no usable domains", bl.name);
+            }
+            Ok(normalized)
+        });
+        let normalized = match normalized {
+            Ok(normalized) => normalized,
+            Err(error) if !force && valid_cache => {
+                eprintln!(
+                    "nfty: DNS blocklist '{}' refresh failed; retaining cached list: {:#}",
+                    bl.name, error
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let previous = match fs::read_to_string(&dest) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("Failed to read {}", dest)),
+        };
+        if previous != normalized || is_remote {
+            crate::unikernel::write_atomic_with_mode(Path::new(&dest), normalized.as_bytes(), 0o644)
+                .with_context(|| format!("Failed to update blocklist '{}'", bl.name))?;
+            changed |= previous != normalized;
+        }
+        logs.push(format!(
+            "Synced blocklist '{}' ({} domains) -> {}",
+            bl.name, normalized.lines().count(), dest
+        ));
     }
-    (logs, changed)
+    Ok((logs, changed))
 }
 
 fn normalize_blocklist_to_hosts(raw: &str) -> String {
@@ -496,60 +566,98 @@ fn normalize_blocklist_to_hosts(raw: &str) -> String {
             continue;
         }
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() >= 2 && (parts[0] == "0.0.0.0" || parts[0] == "127.0.0.1") {
-            out.push_str(&format!("0.0.0.0 {}\n", parts[1]));
+        let candidate = if parts.len() >= 2 && (parts[0] == "0.0.0.0" || parts[0] == "127.0.0.1") {
+            parts[1]
         } else if parts.len() == 1 {
             let d = parts[0].trim_start_matches("*.").trim_start_matches('.');
             if d.contains('.') && !d.contains('/') {
-                out.push_str(&format!("0.0.0.0 {}\n", d));
+                d
+            } else {
+                continue;
             }
+        } else {
+            continue;
+        };
+        if let Ok(domain) = crate::parser::validate_host_mapping_name(candidate) {
+            out.push_str(&format!("0.0.0.0 {}\n", domain));
         }
     }
     out
 }
 
+#[cfg(test)]
+mod blocklist_tests {
+    use super::*;
+
+    #[test]
+    fn empty_or_invalid_cached_lists_are_not_usable() {
+        let path = std::env::temp_dir().join(format!(
+            "nfty-blocklist-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "# no domains\n0.0.0.0 0.0.0.0\n").unwrap();
+        assert!(!blocklist_cache_has_domains(&path).unwrap());
+        fs::write(&path, "0.0.0.0 ads.example\n").unwrap();
+        assert!(blocklist_cache_has_domains(&path).unwrap());
+        fs::remove_file(path).unwrap();
+    }
+}
+
 /// Reconciles `/run/nfty-dnsmasq.conf` and `/run/nfty-dnsmasq.hosts` and starts/reloads `dnsmasq`.
 pub fn reconcile_dnsmasq(cfg: &Config, st: Option<&AppState>) -> Result<String> {
-    let _ = fs::create_dir_all("/run");
+    fs::create_dir_all("/run").context("Failed to prepare dnsmasq runtime directory")?;
     if !cfg.has_any_dns_enabled() {
-        stop_dnsmasq_daemon();
+        stop_dnsmasq_daemon()?;
         return Ok("DNS disabled".to_string());
     }
 
     let blocklists_changed = if let Some(dns_cfg) = &cfg.dns {
-        sync_dns_blocklists(dns_cfg, false).1
+        sync_dns_blocklists(dns_cfg, false)?.1
     } else {
         false
     };
 
     let (conf_txt, hosts_txt) = compile_dnsmasq_config(cfg, st);
-    let old_conf = fs::read_to_string(DNSMASQ_CONF_PATH).unwrap_or_default();
-    let old_hosts = fs::read_to_string(DNSMASQ_HOSTS_PATH).unwrap_or_default();
+    let read_existing = |path: &str| -> Result<String> {
+        match fs::read_to_string(path) {
+            Ok(contents) => Ok(contents),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e).with_context(|| format!("Failed to read {}", path)),
+        }
+    };
+    let old_conf = read_existing(DNSMASQ_CONF_PATH)?;
+    let old_hosts = read_existing(DNSMASQ_HOSTS_PATH)?;
 
     let conf_changed = old_conf != conf_txt;
     let hosts_changed = old_hosts != hosts_txt || blocklists_changed;
 
     if hosts_changed || !Path::new(DNSMASQ_HOSTS_PATH).exists() {
-        fs::write(DNSMASQ_HOSTS_PATH, &hosts_txt)
+        crate::unikernel::write_atomic_with_mode(Path::new(DNSMASQ_HOSTS_PATH), hosts_txt.as_bytes(), 0o644)
             .with_context(|| format!("Failed to write {}", DNSMASQ_HOSTS_PATH))?;
     }
     if conf_changed || !Path::new(DNSMASQ_CONF_PATH).exists() {
-        fs::write(DNSMASQ_CONF_PATH, &conf_txt)
+        crate::unikernel::write_atomic_with_mode(Path::new(DNSMASQ_CONF_PATH), conf_txt.as_bytes(), 0o644)
             .with_context(|| format!("Failed to write {}", DNSMASQ_CONF_PATH))?;
     }
 
     let Some(bin) = find_dnsmasq_binary() else {
-        return Ok("Staged dnsmasq config (dnsmasq binary not installed on host)".to_string());
+        bail!("dnsmasq is enabled but its binary is not installed");
     };
 
     if let Some(pid) = dnsmasq_running_pid() {
         if conf_changed {
-            stop_dnsmasq_daemon();
-            std::thread::sleep(Duration::from_millis(80));
+            stop_dnsmasq_daemon()?;
         } else {
             if hosts_changed {
                 unsafe {
-                    libc::kill(pid as i32, libc::SIGHUP);
+                    if libc::kill(pid as i32, libc::SIGHUP) != 0 {
+                        return Err(std::io::Error::last_os_error())
+                            .context("Failed to reload dnsmasq hosts");
+                    }
                 }
                 return Ok(format!("Reloaded dnsmasq hosts via SIGHUP (PID {})", pid));
             }
@@ -564,36 +672,18 @@ pub fn reconcile_dnsmasq(cfg: &Config, st: Option<&AppState>) -> Result<String> 
     if !status.success() {
         bail!("dnsmasq exited with status {}", status);
     }
-    let pid = dnsmasq_running_pid().unwrap_or(0);
+    let pid = dnsmasq_running_pid().context("dnsmasq started but its managed process was not found")?;
     Ok(format!("Started dnsmasq (PID {})", pid))
 }
 
 pub async fn run_dns_supervisor(shared: SharedState) {
     loop {
         if unsafe { libc::geteuid() == 0 } {
-            let dns_cfg_opt = {
-                let st = shared.read().unwrap();
-                let cfg = st.active_config();
-                if cfg.has_any_dns_enabled() {
-                    cfg.dns.clone()
-                } else {
-                    None
-                }
-            };
-            let mut blocklists_updated = false;
-            if let Some(dns_cfg) = dns_cfg_opt {
-                blocklists_updated = sync_dns_blocklists(&dns_cfg, false).1;
-            }
             {
                 let st = shared.read().unwrap();
                 let cfg = st.active_config().clone();
-                let _ = reconcile_dnsmasq(&cfg, Some(&st));
-            }
-            if blocklists_updated {
-                if let Some(pid) = dnsmasq_running_pid() {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGHUP);
-                    }
+                if let Err(e) = reconcile_dnsmasq(&cfg, Some(&st)) {
+                    eprintln!("nfty: DNS reconciliation failed: {:#}", e);
                 }
             }
         }
@@ -634,7 +724,7 @@ pub fn print_dns_status(shared: &SharedState) {
         "  {:<20} {}",
         "Upstreams:".bold(),
         if dns_cfg.upstreams.is_empty() {
-            "1.1.1.1, 9.9.9.9".to_string()
+            "(none)".to_string()
         } else {
             dns_cfg.upstreams.join(", ")
         }
@@ -866,27 +956,21 @@ pub fn handle_dns_cli_command(args: &[&str], shared: &SharedState) -> Result<()>
             print!("{}", hosts_txt);
         }
         "reload" | "flush" | "sync" => {
-            let cfg = {
-                let st = shared.read().unwrap();
-                st.active_config().clone()
-            };
+            let st = shared.read().unwrap();
+            let cfg = st.active_config();
             let mut blocklist_changed = false;
             if let Some(dns_cfg) = &cfg.dns {
-                let (logs, changed) = sync_dns_blocklists(dns_cfg, true);
+                let (logs, changed) = sync_dns_blocklists(dns_cfg, true)?;
                 blocklist_changed = changed;
                 for l in logs {
                     println!("  → {}", l);
                 }
             }
-            let msg = {
-                let st = shared.read().unwrap();
-                reconcile_dnsmasq(&cfg, Some(&st))?
-            };
+            let msg = reconcile_dnsmasq(cfg, Some(&st))?;
             if blocklist_changed {
-                if let Some(pid) = dnsmasq_running_pid() {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGHUP);
-                    }
+                let pid = dnsmasq_running_pid().context("dnsmasq is not running after blocklist refresh")?;
+                if unsafe { libc::kill(pid as i32, libc::SIGHUP) } != 0 {
+                    return Err(std::io::Error::last_os_error()).context("Failed to reload DNS blocklists");
                 }
             }
             println!("  {} {}", "✔".green(), msg);

@@ -1,16 +1,15 @@
 use crate::ast::{ApiKeyScope, Config, ControlAccess, Service};
 use crate::compiler::{
-    apply_vip_commands, compile_nft_ruleset, generate_vip_commands, reload_kernel_from_state,
-    validate_config,
+    apply_config, compile_nft_ruleset, update_host_mapping, validate_config,
 };
 use crate::health::{refresh_allowlist_hosts, run_all_probes_once};
-use crate::parser::{parse_nftyfile, validate_allow_entry};
-use crate::repl::{handle_line, ShellLevel};
-use crate::state::SharedState;
+use crate::parser::{parse_nftyfile, validate_allow_entry, validate_host_mapping_name};
+use crate::repl::{handle_line_checked, ShellLevel};
+use crate::state::{AppState, SharedState};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,9 +18,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug, Deserialize)]
 pub struct AllowListRequest {
-    /// Optional service key (e.g. "9000" or "169.254.1.240:443"). If omitted, applies to global allow-list.
+    /// Optional service key (e.g. "9000" or "192.168.1.240:443"). If omitted, applies to global allow-list.
     pub service: Option<String>,
-    /// List of hostnames, wildcard hostnames ("*.office.lan"), IP wildcards ("169.254.1.*"), or CIDRs
+    /// List of hostnames, wildcard hostnames ("*.office.lan"), IP wildcards ("192.168.1.*"), or CIDRs
     pub hosts: Vec<String>,
     /// Whether to immediately apply changes to running config & kernel nftables (defaults to true)
     #[serde(default = "default_true")]
@@ -101,54 +100,68 @@ pub struct AllowStatusResponse {
 }
 
 pub fn spawn_api_server(shared: SharedState, bind_addr: String) {
+    let primary_port = bind_addr.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok());
     let shared_main = shared.clone();
     tokio::spawn(async move {
         let listener = match TcpListener::bind(&bind_addr).await {
             Ok(l) => l,
-            Err(_) => return,
-        };
-        loop {
-            if let Ok((stream, _)) = listener.accept().await {
-                let st = shared_main.clone();
-                tokio::spawn(async move {
-                    let _ = handle_http_connection(stream, st).await;
-                });
+            Err(e) => {
+                eprintln!("[nfty api] Failed to bind {}: {}", bind_addr, e);
+                return;
             }
-        }
+        };
+        run_api_listener(listener, shared_main).await;
     });
 
     // Dynamically bind any custom `api:<port>` ports configured on VIPs or Gateways
     tokio::spawn(async move {
-        let mut bound_ports: HashSet<u16> = HashSet::new();
-        bound_ports.insert(9090);
+        let mut listeners: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let desired_ports = {
                 let Ok(st) = shared.read() else { continue };
                 st.active_config().api_ports()
             };
+            listeners.retain(|port, handle| {
+                let keep = desired_ports.contains(port) && !handle.is_finished();
+                if !keep {
+                    handle.abort();
+                }
+                keep
+            });
             for port in desired_ports {
-                if bound_ports.contains(&port) {
+                if Some(port) == primary_port || listeners.contains_key(&port) {
                     continue;
                 }
                 let addr = format!("0.0.0.0:{}", port);
-                if let Ok(listener) = TcpListener::bind(&addr).await {
-                    bound_ports.insert(port);
-                    let st_clone = shared.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            if let Ok((stream, _)) = listener.accept().await {
-                                let s = st_clone.clone();
-                                tokio::spawn(async move {
-                                    let _ = handle_http_connection(stream, s).await;
-                                });
-                            }
-                        }
-                    });
+                match TcpListener::bind(&addr).await {
+                    Ok(listener) => {
+                        listeners.insert(port, tokio::spawn(run_api_listener(listener, shared.clone())));
+                    }
+                    Err(e) => eprintln!("[nfty api] Failed to bind {}: {}", addr, e),
                 }
             }
         }
     });
+}
+
+async fn run_api_listener(listener: TcpListener, shared: SharedState) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let state = shared.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_http_connection(stream, state).await {
+                        eprintln!("[nfty api] Connection failed: {:#}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("[nfty api] Accept failed: {}", e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 fn extract_api_key_from_request(header_part: &str, query: &str) -> (Option<String>, bool) {
@@ -261,6 +274,43 @@ fn control_allow_list_rejection(cfg: &Config) -> Option<(u16, serde_json::Value)
     ))
 }
 
+fn validate_and_apply(
+    state: &mut AppState,
+    config: Config,
+) -> std::result::Result<(), (u16, serde_json::Value)> {
+    if state.pending_confirm.is_some() {
+        return Err((409, json!({"ok": false, "error": "Confirm or roll back the pending trial first"})));
+    }
+    if let Some(rejection) = control_allow_list_rejection(&config) {
+        return Err(rejection);
+    }
+    let report = validate_config(&config, Some(state));
+    if !report.valid {
+        return Err((400, serde_json::to_value(report).unwrap()));
+    }
+    apply_config(state, config)
+        .map(|_| ())
+        .map_err(|error| (500, json!({"ok": false, "error": format!("{:#}", error)})))
+}
+
+fn decode_path_component(encoded: &str) -> Result<String> {
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut bytes = encoded.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes.next().ok_or_else(|| anyhow::anyhow!("Incomplete percent escape"))?;
+            let low = bytes.next().ok_or_else(|| anyhow::anyhow!("Incomplete percent escape"))?;
+            let digit = |b: u8| (b as char).to_digit(16);
+            let high = digit(high).ok_or_else(|| anyhow::anyhow!("Invalid percent escape"))?;
+            let low = digit(low).ok_or_else(|| anyhow::anyhow!("Invalid percent escape"))?;
+            decoded.push(((high << 4) | low) as u8);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    Ok(String::from_utf8(decoded)?)
+}
+
 /// Remote clients must first pass the listener's IP allow-list; loopback clients (local CLI/IPC) skip it.
 pub fn authenticate_api_request_with_context(
     shared: &SharedState,
@@ -286,7 +336,15 @@ pub fn authenticate_api_request_with_context(
     };
 
     if let Some(key_str) = candidate_key {
-        if let Some(scope) = cfg.verify_api_key(key_str) {
+        let configured_port = local_port.filter(|port| {
+            cfg.control_listeners().iter().any(|listener| listener.port == *port)
+        });
+        let key_scope = match configured_port {
+            Some(port) => cfg.verify_api_key_for_port(key_str, port),
+            None if peer_is_loopback => cfg.verify_api_key(key_str),
+            None => None,
+        };
+        if let Some(scope) = key_scope {
             return Ok(scope);
         }
         if verify_appliance_credential(key_str) {
@@ -305,52 +363,150 @@ pub fn authenticate_api_request_with_context(
     }
 }
 
-async fn read_full_http_request(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
-    let mut buf = Vec::with_capacity(8192);
-    let mut chunk = [0u8; 8192];
-    let mut header_end: Option<usize> = None;
-    let mut content_length: usize = 0;
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
-    loop {
-        let read_res = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk)).await;
-        let n = match read_res {
-            Ok(Ok(n)) => n,
-            _ => break,
+fn http_content_length(header: &[u8]) -> Result<usize> {
+    let header = std::str::from_utf8(header)?;
+    let mut lines = header.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() != 3
+        || !parts[1].starts_with('/')
+        || !matches!(parts[2], "HTTP/1.0" | "HTTP/1.1")
+    {
+        anyhow::bail!("Malformed HTTP request line");
+    }
+
+    let mut content_length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            anyhow::bail!("Malformed HTTP header");
         };
-        if n == 0 {
-            break;
+        if name.is_empty()
+            || !name.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+            })
+        {
+            anyhow::bail!("Malformed HTTP header name");
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > 4 * 1024 * 1024 {
-            anyhow::bail!("HTTP request payload exceeds 4MB limit");
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            anyhow::bail!("HTTP transfer encoding is not supported");
         }
+        if name.eq_ignore_ascii_case("content-length") {
+            let value = value.trim();
+            if content_length.is_some()
+                || value.is_empty()
+                || !value.bytes().all(|b| b.is_ascii_digit())
+            {
+                anyhow::bail!("Invalid or duplicate Content-Length");
+            }
+            let length = value.parse::<usize>()?;
+            if length > MAX_HTTP_BODY_BYTES {
+                anyhow::bail!("HTTP request body exceeds 4MB limit");
+            }
+            content_length = Some(length);
+        }
+    }
+    Ok(content_length.unwrap_or(0))
+}
 
-        if header_end.is_none() {
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let end = pos + 4;
-                header_end = Some(end);
-                let hdr_str = String::from_utf8_lossy(&buf[..pos]);
-                for line in hdr_str.lines().skip(1) {
-                    if let Some((k, v)) = line.split_once(':') {
-                        if k.trim().eq_ignore_ascii_case("content-length") {
-                            content_length = v.trim().parse::<usize>().unwrap_or(0);
-                        }
+#[cfg(test)]
+mod http_framing_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_ambiguous_request_framing() {
+        for header in [
+            "POST /api/v1/config HTTP/1.1\r\nContent-Length: nope",
+            "POST /api/v1/config HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1",
+            "POST /api/v1/config HTTP/1.1\r\nTransfer-Encoding: chunked",
+            "POST /api/v1/config HTTP/1.1\r\nContent-Length : 1",
+        ] {
+            assert!(http_content_length(header.as_bytes()).is_err());
+        }
+        assert_eq!(
+            http_content_length(b"POST /api/v1/config HTTP/1.1\r\nContent-Length: 4")
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn only_committed_configuration_requests_need_config_persistence() {
+        let applied = json!({"applied": true});
+        let staged = json!({"applied": false});
+        assert!(request_persists_config("PUT", "/api/v1/config", &applied));
+        assert!(request_persists_config("POST", "/api/v1/apply", &applied));
+        assert!(request_persists_config("DELETE", "/api/v1/services/example", &applied));
+        assert!(request_persists_config("POST", "/api/v1/allow", &applied));
+        assert!(!request_persists_config("POST", "/api/v1/allow", &staged));
+        for path in [
+            "/api/v1/scan",
+            "/api/v1/allow/hosts",
+            "/api/v1/drain",
+            "/api/v1/wg",
+            "/api/v1/cloudflare",
+            "/api/v1/cli",
+        ] {
+            assert!(!request_persists_config("POST", path, &applied));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_request_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"PUT /api/v1/config HTTP/1.1\r\nContent-Length: 4\r\n\r\nabc")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(read_full_http_request(&mut stream).await.is_err());
+        client.await.unwrap();
+    }
+}
+
+async fn read_full_http_request(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut buf = Vec::with_capacity(8192);
+        let mut chunk = [0u8; 8192];
+        let mut request_end = None;
+
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                anyhow::bail!("Incomplete HTTP request");
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if request_end.is_none() {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header_end = pos + 4;
+                    if header_end > MAX_HTTP_HEADER_BYTES {
+                        anyhow::bail!("HTTP request headers exceed 64KB limit");
                     }
+                    request_end = Some(header_end + http_content_length(&buf[..pos])?);
+                } else if buf.len() > MAX_HTTP_HEADER_BYTES {
+                    anyhow::bail!("HTTP request headers exceed 64KB limit");
+                }
+            }
+            if let Some(end) = request_end {
+                if buf.len() >= end {
+                    buf.truncate(end);
+                    return Ok(Some(buf));
                 }
             }
         }
-
-        if let Some(end) = header_end {
-            if buf.len() >= end + content_length {
-                break;
-            }
-        }
-    }
-
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(buf))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("HTTP request deadline exceeded"))?
 }
 
 async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> Result<()> {
@@ -362,11 +518,22 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
     });
     let local_port = stream.local_addr().ok().map(|a| a.port());
 
-    let Some(buf) = read_full_http_request(&mut stream).await? else {
-        return Ok(());
+    let buf = match read_full_http_request(&mut stream).await {
+        Ok(Some(buf)) => buf,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            send_json(&mut stream, 400, &json!({"ok": false, "error": e.to_string()})).await?;
+            return Ok(());
+        }
     };
-    let raw = String::from_utf8_lossy(&buf);
-    let (header_part, body_part) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+    let raw = match std::str::from_utf8(&buf) {
+        Ok(raw) => raw,
+        Err(_) => {
+            send_json(&mut stream, 400, &json!({"ok": false, "error": "HTTP request is not UTF-8"})).await?;
+            return Ok(());
+        }
+    };
+    let (header_part, body_part) = raw.split_once("\r\n\r\n").expect("request was framed");
     let request_line = header_part.lines().next().unwrap_or("");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
@@ -430,7 +597,14 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
             if !trimmed.is_empty() {
                 let scope_opt = {
                     let st = shared.read().unwrap();
-                    st.active_config().verify_api_key(trimmed)
+                    let cfg = st.active_config();
+                    match local_port {
+                        Some(port) if cfg.control_listeners().iter().any(|listener| listener.port == port) => {
+                            cfg.verify_api_key_for_port(trimmed, port)
+                        }
+                        _ if peer_is_loopback => cfg.verify_api_key(trimmed),
+                        _ => None,
+                    }
                 };
                 if let Some(scope) = scope_opt {
                     send_json(
@@ -535,11 +709,31 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
 
     let (status, resp_val) =
         route_api_request_scoped(&method, path, body_part.trim(), &shared, scope).await;
-    if matches!(method.as_str(), "POST" | "PUT" | "DELETE") && status == 200 {
-        crate::unikernel::persist_to_storage(&shared);
+    if status == 200 && request_persists_config(&method, path, &resp_val) {
+        if let Err(e) = crate::unikernel::persist_to_storage(&shared) {
+            send_json(
+                &mut stream,
+                500,
+                &json!({"ok": false, "error": format!("Operation completed but persistence failed: {:#}", e)}),
+            )
+            .await?;
+            return Ok(());
+        }
     }
     send_json(&mut stream, status, &resp_val).await?;
     Ok(())
+}
+
+fn request_persists_config(method: &str, path: &str, response: &serde_json::Value) -> bool {
+    match (method, path) {
+        ("PUT", "/api/v1/config") | ("POST", "/api/v1/apply") => true,
+        ("POST" | "PUT" | "DELETE", "/api/v1/allow") => {
+            response.get("applied").and_then(|value| value.as_bool()) == Some(true)
+        }
+        ("POST" | "PUT" | "DELETE", service_path)
+            if service_path.starts_with("/api/v1/services/") => true,
+        _ => false,
+    }
 }
 
 pub async fn route_api_request(
@@ -569,6 +763,7 @@ pub async fn route_api_request_scoped(
     }
 
     if let Ok(mut st) = shared.write() {
+        st.controller_is_authoritative = true;
         st.sync_from_disk_if_changed();
     }
     match (method, path) {
@@ -634,8 +829,10 @@ pub async fn route_api_request_scoped(
         }
         ("GET", "/api/v1/scan") | ("POST", "/api/v1/scan") => {
             let filter = if body.is_empty() { None } else { Some(body) };
-            let discovered = crate::features::scan_network_services(filter, shared);
-            (200, json!({"ok": true, "discovered": discovered}))
+            match crate::features::scan_network_services_async(filter, shared).await {
+                Ok(discovered) => (200, json!({"ok": true, "discovered": discovered})),
+                Err(e) => (400, json!({"ok": false, "error": format!("{:#}", e)})),
+            }
         }
         ("GET", "/api/v1/wg") => {
             let mut wg_configs = crate::features::list_saved_wg_configs();
@@ -650,10 +847,16 @@ pub async fn route_api_request_scoped(
             (200, json!({"ok": true, "wg_configs": wg_configs}))
         }
         ("GET", "/api/v1/cloudflare") | ("GET", "/api/v1/cf") => {
-            let cf = crate::features::load_cloudflare_config();
+            let cf = match crate::features::load_cloudflare_config() {
+                Ok(cf) => cf,
+                Err(e) => return (500, json!({"ok": false, "error": format!("{:#}", e)})),
+            };
             let routes = {
                 let st = shared.read().unwrap();
-                crate::features::collect_cloudflare_routes(st.active_config())
+                match crate::features::collect_cloudflare_routes(st.active_config()) {
+                    Ok(routes) => routes,
+                    Err(e) => return (500, json!({"ok": false, "error": format!("{:#}", e)})),
+                }
             };
             (
                 200,
@@ -675,25 +878,27 @@ pub async fn route_api_request_scoped(
                 Ok(r) => r,
                 Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
             };
-            let mut cf = crate::features::load_cloudflare_config();
-            if let Some(tok) = req.api_token {
-                cf.api_token = Some(tok.trim().to_string());
+            let st = shared.read().unwrap();
+            match crate::features::cloudflare::update_cloudflare_config_and_reconcile(
+                st.active_config(),
+                move |cf| {
+                    if let Some(tok) = req.api_token {
+                        cf.api_token = Some(tok.trim().to_string());
+                    }
+                    if let Some(acc) = req.account_id {
+                        cf.account_id = Some(acc.trim().to_string());
+                    }
+                    if let Some(name) = req.tunnel_name {
+                        cf.tunnel_name = name.trim().to_string();
+                    }
+                    if let Some(tt) = req.tunnel_token {
+                        cf.tunnel_token = Some(tt.trim().to_string());
+                    }
+                },
+            ) {
+                Ok(logs) => (200, json!({"ok": true, "logs": logs})),
+                Err(e) => (500, json!({"ok": false, "error": e.to_string()})),
             }
-            if let Some(acc) = req.account_id {
-                cf.account_id = Some(acc.trim().to_string());
-            }
-            if let Some(name) = req.tunnel_name {
-                cf.tunnel_name = name.trim().to_string();
-            }
-            if let Some(tt) = req.tunnel_token {
-                cf.tunnel_token = Some(tt.trim().to_string());
-            }
-            if let Err(e) = crate::features::save_cloudflare_config(&cf) {
-                return (500, json!({"ok": false, "error": e.to_string()}));
-            }
-            let cfg = shared.read().unwrap().active_config().clone();
-            let logs = crate::features::reconcile_cloudflare_tunnel(&cfg);
-            (200, json!({"ok": true, "logs": logs}))
         }
         ("POST", "/api/v1/wg") => {
             let req: WgUploadRequest = match serde_json::from_str(body) {
@@ -735,24 +940,13 @@ pub async fn route_api_request_scoped(
             )
         }
         ("PUT", "/api/v1/config") => match parse_nftyfile(body) {
-            Ok(mut cfg) => {
-                if let Some(rejection) = control_allow_list_rejection(&cfg) {
-                    return rejection;
-                }
-                let prev = {
-                    let st = shared.read().unwrap();
-                    st.running.clone()
-                };
-                let _ = crate::compiler::reconcile_dhcp_and_vlan_vips(&mut cfg);
-                let vip_cmds = generate_vip_commands(&prev, &cfg);
-                let _ = apply_vip_commands(&vip_cmds);
+            Ok(cfg) => {
                 {
                     let mut st = shared.write().unwrap();
-                    st.history.push(prev);
-                    st.candidate = cfg.clone();
-                    st.running = cfg;
-                    st.sync_runtime_entries();
-                    let _ = reload_kernel_from_state(&mut st);
+                    if let Err(rejection) = validate_and_apply(&mut st, cfg) {
+                        return rejection;
+                    }
+                    st.candidate = st.running.clone();
                 }
                 refresh_allowlist_hosts(shared).await;
                 let st = shared.read().unwrap();
@@ -796,7 +990,7 @@ pub async fn route_api_request_scoped(
             };
             (200, serde_json::to_value(resp).unwrap())
         }
-        // Add or replace allow-list entries (supports wildcards like "*.office.lan", "169.254.1.*", hostnames, CIDRs)
+        // Add or replace allow-list entries (supports wildcards like "*.office.lan", "192.168.1.*", hostnames, CIDRs)
         ("POST", "/api/v1/allow") | ("PUT", "/api/v1/allow") => {
             let req: AllowListRequest = match serde_json::from_str(body) {
                 Ok(r) => r,
@@ -840,11 +1034,11 @@ pub async fn route_api_request_scoped(
                 }
 
                 if req.apply {
-                    if let Some(rejection) = control_allow_list_rejection(&st.candidate) {
+                    let next = st.candidate.clone();
+                    if let Err(rejection) = validate_and_apply(&mut st, next) {
                         return rejection;
                     }
-                    st.running = st.candidate.clone();
-                    let _ = reload_kernel_from_state(&mut st);
+                    st.candidate = st.running.clone();
                 }
             }
 
@@ -855,6 +1049,7 @@ pub async fn route_api_request_scoped(
                 200,
                 json!({
                     "ok": true,
+                    "applied": req.apply,
                     "global_allow": st.running.global_allow,
                     "resolved_hosts": st.resolved_hosts,
                 }),
@@ -881,11 +1076,11 @@ pub async fn route_api_request_scoped(
                     st.candidate.global_allow.retain(|x| !targets.contains(x));
                 }
                 if req.apply {
-                    if let Some(rejection) = control_allow_list_rejection(&st.candidate) {
+                    let next = st.candidate.clone();
+                    if let Err(rejection) = validate_and_apply(&mut st, next) {
                         return rejection;
                     }
-                    st.running = st.candidate.clone();
-                    let _ = reload_kernel_from_state(&mut st);
+                    st.candidate = st.running.clone();
                 }
             }
             let st = shared.read().unwrap();
@@ -893,6 +1088,7 @@ pub async fn route_api_request_scoped(
                 200,
                 json!({
                     "ok": true,
+                    "applied": req.apply,
                     "global_allow": st.running.global_allow,
                 }),
             )
@@ -903,16 +1099,20 @@ pub async fn route_api_request_scoped(
                 Ok(r) => r,
                 Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
             };
-            let host = req.host.trim().to_ascii_lowercase();
+            let host = match validate_host_mapping_name(&req.host) {
+                Ok(host) => host,
+                Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
+            };
             {
                 let mut st = shared.write().unwrap();
-                if req.ips.is_empty() {
-                    st.resolved_hosts.remove(&host);
-                } else {
-                    st.resolved_hosts.insert(host.clone(), req.ips.clone());
+                if let Err(e) = update_host_mapping(&mut st, &host, &req.ips) {
+                    return (500, json!({"ok": false, "error": format!("{:#}", e)}));
                 }
-                if !st.running.services.is_empty() {
-                    let _ = reload_kernel_from_state(&mut st);
+                if let Err(e) = crate::unikernel::persist_host_mapping(&host, &req.ips) {
+                    return (500, json!({
+                        "ok": false,
+                        "error": format!("Host mapping was updated but could not be persisted: {:#}", e)
+                    }));
                 }
             }
             let st = shared.read().unwrap();
@@ -943,10 +1143,24 @@ pub async fn route_api_request_scoped(
                 Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
             };
             let level = Arc::new(Mutex::new(ShellLevel::ConfigRoot));
-            for cmd in req.command.lines().flat_map(|l| l.split(';')) {
+            for cmd in req.command.lines().flat_map(crate::parser::split_statements_preserving_quotes) {
                 let trimmed = cmd.trim();
                 if !trimmed.is_empty() {
-                    handle_line(trimmed, &level, shared).await;
+                    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                    let command = tokens[0].to_ascii_lowercase();
+                    let interactive_wg = matches!(command.as_str(), "wg" | "wireguard")
+                        && tokens.get(1).map(|sub| {
+                            !matches!(sub.to_ascii_lowercase().as_str(),
+                                "list" | "ls" | "show" | "cat" | "view" | "rm" | "del" | "delete" | "remove")
+                        }).unwrap_or(false);
+                    if matches!(command.as_str(), "password" | "passwd" | "watch") || interactive_wg {
+                        return (400, json!({"ok": false, "error": "Interactive commands are not available over the API"}));
+                    }
+                    match handle_line_checked(trimmed, &level, shared).await {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(e) => return (400, json!({"ok": false, "error": format!("{:#}", e)})),
+                    }
                 }
             }
             refresh_allowlist_hosts(shared).await;
@@ -962,25 +1176,13 @@ pub async fn route_api_request_scoped(
             )
         }
         ("POST", "/api/v1/apply") => {
-            let report = {
-                let st = shared.read().unwrap();
-                validate_config(&st.candidate, Some(&st))
-            };
-            if !report.valid {
-                return (400, serde_json::to_value(report).unwrap());
-            }
-            let (prev, next) = {
-                let st = shared.read().unwrap();
-                (st.running.clone(), st.candidate.clone())
-            };
-            let vip_cmds = generate_vip_commands(&prev, &next);
-            let _ = apply_vip_commands(&vip_cmds);
             {
                 let mut st = shared.write().unwrap();
-                st.history.push(prev);
-                st.running = next;
-                st.sync_runtime_entries();
-                let _ = reload_kernel_from_state(&mut st);
+                let next = st.candidate.clone();
+                if let Err(rejection) = validate_and_apply(&mut st, next) {
+                    return rejection;
+                }
+                st.candidate = st.running.clone();
             }
             refresh_allowlist_hosts(shared).await;
             let _ = run_all_probes_once(shared).await;
@@ -996,8 +1198,12 @@ pub async fn route_api_request_scoped(
                 Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
             };
             let mut st = shared.write().unwrap();
-            st.runtime.entry(req.backend.clone()).or_default().drained = true;
-            let _ = reload_kernel_from_state(&mut st);
+            if !st.has_runtime_endpoint(&req.backend) {
+                return (404, json!({"ok": false, "error": "Backend not found"}));
+            }
+            if let Err(e) = crate::compiler::set_backend_drain_state(&mut st, &[req.backend.clone()], true) {
+                return (500, json!({"ok": false, "error": format!("{:#}", e)}));
+            }
             (200, json!({"ok": true, "backend": req.backend, "drained": true}))
         }
         ("POST", "/api/v1/enable") => {
@@ -1006,8 +1212,12 @@ pub async fn route_api_request_scoped(
                 Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
             };
             let mut st = shared.write().unwrap();
-            st.runtime.entry(req.backend.clone()).or_default().drained = false;
-            let _ = reload_kernel_from_state(&mut st);
+            if !st.has_runtime_endpoint(&req.backend) {
+                return (404, json!({"ok": false, "error": "Backend not found"}));
+            }
+            if let Err(e) = crate::compiler::set_backend_drain_state(&mut st, &[req.backend.clone()], false) {
+                return (500, json!({"ok": false, "error": format!("{:#}", e)}));
+            }
             (200, json!({"ok": true, "backend": req.backend, "drained": false}))
         }
         ("GET", "/api/v1/services") => {
@@ -1020,7 +1230,10 @@ pub async fn route_api_request_scoped(
             (200, json!({"services": cfg.services}))
         }
         _ if path.starts_with("/api/v1/services/") => {
-            let key = path.trim_start_matches("/api/v1/services/");
+            let key = match decode_path_component(path.trim_start_matches("/api/v1/services/")) {
+                Ok(key) => key,
+                Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
+            };
             match method {
                 "GET" => {
                     let st = shared.read().unwrap();
@@ -1029,27 +1242,41 @@ pub async fn route_api_request_scoped(
                     } else {
                         st.candidate.clone()
                     };
-                    match cfg.services.get(key) {
+                    match cfg.services.get(&key) {
                         Some(svc) => (200, serde_json::to_value(svc).unwrap()),
                         None => (404, json!({"error": "Service not found"})),
                     }
                 }
                 "PUT" | "POST" => match serde_json::from_str::<Service>(body) {
                     Ok(svc) => {
+                        if svc.key != key {
+                            return (400, json!({"ok": false, "error": "Service key does not match the request path"}));
+                        }
                         let mut st = shared.write().unwrap();
-                        st.candidate.services.insert(svc.key.clone(), svc.clone());
-                        st.running.services.insert(svc.key.clone(), svc);
+                        let mut next = st.running.clone();
+                        next.services.insert(svc.key.clone(), svc.clone());
+                        if let Err(rejection) = validate_and_apply(&mut st, next) {
+                            return rejection;
+                        }
+                        st.candidate.services.insert(svc.key.clone(), svc);
                         st.sync_runtime_entries();
-                        let _ = reload_kernel_from_state(&mut st);
                         (200, json!({"ok": true, "key": key}))
                     }
                     Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
                 },
                 "DELETE" => {
                     let mut st = shared.write().unwrap();
-                    st.candidate.services.remove(key);
-                    st.running.services.remove(key);
-                    let _ = reload_kernel_from_state(&mut st);
+                    if !st.running.services.contains_key(&key)
+                        && !st.candidate.services.contains_key(&key)
+                    {
+                        return (404, json!({"ok": false, "error": "Service not found"}));
+                    }
+                    let mut next = st.running.clone();
+                    next.services.remove(&key);
+                    if let Err(rejection) = validate_and_apply(&mut st, next) {
+                        return rejection;
+                    }
+                    st.candidate.services.remove(&key);
                     (200, json!({"ok": true, "deleted": key}))
                 }
                 _ => (405, json!({"error": "Method not allowed"})),
@@ -1071,6 +1298,7 @@ async fn send_json(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         _ => "Internal Server Error",
     };
     let body = serde_json::to_string_pretty(val)?;
@@ -1552,7 +1780,7 @@ const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
 <div class="main-wrap">
   <header class="topbar">
     <div class="topbar-left">
-      <span id="kernel-badge" class="badge badge-rw">● KERNEL NFTABLES ACTIVE</span>
+      <span id="kernel-badge" class="badge badge-warn">● NFT STATUS UNKNOWN</span>
       <span id="diff-badge" class="badge badge-warn" style="display:none">● UNCOMMITTED CANDIDATE CHANGES</span>
       <span id="last-updated" style="font-size:0.8rem;color:var(--muted)">Connecting...</span>
     </div>
@@ -1920,6 +2148,12 @@ let stateData = null;
 let currentScope = 'ro';
 let flowsPaused = false;
 let editorDirty = false;
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[ch]);
+}
 
 function getAuthToken() {
   const params = new URLSearchParams(window.location.search);
@@ -2303,12 +2537,12 @@ async function runNetworkScan() {
       wrap.innerHTML = `<div class="empty">No open services discovered on target subnet.</div>`;
     } else {
       const rows = list.map(d => `<tr>
-        <td><code>#${d.index}</code></td>
-        <td><strong>${d.host || d.ip}</strong> <span class="tag">${d.ip}</span></td>
-        <td><span class="tag">${d.port}/${d.proto}</span></td>
-        <td>${d.banner || '<span style="color:var(--muted)">tcp open</span>'}</td>
+        <td><code>#${escapeHtml(d.index)}</code></td>
+        <td><strong>${escapeHtml(d.host || d.ip)}</strong> <span class="tag">${escapeHtml(d.ip)}</span></td>
+        <td><span class="tag">${escapeHtml(d.port)}/${escapeHtml(d.service_name || 'tcp')}</span></td>
+        <td>${d.banner ? escapeHtml(d.banner) : '<span style="color:var(--muted)">tcp open</span>'}</td>
         <td>
-          <button class="btn btn-sm btn-primary" onclick="adoptDiscovered(${d.index}, '${d.host || d.ip}', ${d.port})">+ Adopt into VIP</button>
+          <button class="btn btn-sm btn-primary" data-index="${escapeHtml(d.index)}" data-host="${escapeHtml(d.host || d.ip)}" data-port="${escapeHtml(d.port)}" onclick="adoptDiscovered(Number(this.dataset.index), this.dataset.host, Number(this.dataset.port))">+ Adopt into VIP</button>
         </td>
       </tr>`).join('');
       wrap.innerHTML = `<table>
@@ -2361,13 +2595,13 @@ function renderFlowsTable() {
     return;
   }
   const rows = filtered.slice(0, 100).map(f => `<tr>
-    <td><span class="tag">${f.proto}</span></td>
-    <td><span class="pill ${f.state === 'ESTABLISHED' ? 'pill-up' : 'pill-unknown'}">${f.state}</span></td>
-    <td><code>${f.src}:${f.sport}</code></td>
-    <td><strong>${f.dst}:${f.dport}</strong></td>
-    <td><code style="color:var(--green)">${f.nat_target || 'local / direct'}</code></td>
-    <td><code>${f.mark && f.mark !== '0' ? '0x' + f.mark : '-'}</code></td>
-    <td><code>${f.packets} pkts / ${f.bytes} B</code></td>
+    <td><span class="tag">${escapeHtml(f.proto)}</span></td>
+    <td><span class="pill ${f.state === 'ESTABLISHED' ? 'pill-up' : 'pill-unknown'}">${escapeHtml(f.state)}</span></td>
+    <td><code>${escapeHtml(f.src)}:${escapeHtml(f.sport)}</code></td>
+    <td><strong>${escapeHtml(f.dst)}:${escapeHtml(f.dport)}</strong></td>
+    <td><code style="color:var(--green)">${escapeHtml(f.nat_target || 'local / direct')}</code></td>
+    <td><code>${escapeHtml(f.mark && f.mark !== '0' ? '0x' + f.mark : '-')}</code></td>
+    <td><code>${escapeHtml(f.packets)} pkts / ${escapeHtml(f.bytes)} B</code></td>
   </tr>`).join('');
   wrap.innerHTML = `<table>
     <thead>
@@ -2385,16 +2619,26 @@ function renderFlowsTable() {
   </table>`;
 }
 
+function setKernelBadge(applied) {
+  const badge = document.getElementById('kernel-badge');
+  badge.textContent = applied === true ? '● NFT APPLY REPORTED'
+    : applied === false ? '● NO NFT APPLY REPORTED' : '● NFT STATUS UNKNOWN';
+  badge.className = applied === true ? 'badge badge-rw' : 'badge badge-warn';
+  badge.title = 'Controller-reported apply state; current kernel state is not independently verified.';
+}
+
 async function refreshDashboard() {
   try {
     const res = await apiFetch('/api/v1/status');
-    if (res.status === 401) {
-      openAuthModal();
+    if (!res.ok) {
+      setKernelBadge(null);
+      document.getElementById('last-updated').textContent = 'Status unavailable';
+      if (res.status === 401) openAuthModal();
       return;
     }
-    if (!res.ok) return;
     const data = await res.json();
     stateData = data;
+    setKernelBadge(data.kernel_applied);
 
     const cfg = data.active_config || { vips: {}, services: {}, gateways: {}, global_allow: [] };
     const services = Object.values(cfg.services || {});
@@ -2430,10 +2674,10 @@ async function refreshDashboard() {
       const isApi = svc.name && svc.name.startsWith('api:');
       const typeBadge = isWeb
         ? `<span class="tag" style="border-color:var(--cyan);color:var(--cyan)">WEB UI</span>`
-        : (isApi ? `<span class="tag" style="border-color:var(--purple);color:var(--purple)">CONTROL API</span>` : `<span class="tag">${svc.proto}</span>`);
+        : (isApi ? `<span class="tag" style="border-color:var(--purple);color:var(--purple)">CONTROL API</span>` : `<span class="tag">${escapeHtml(svc.proto)}</span>`);
       const allowRules = [...(cfg.global_allow || []), ...(svc.allow || [])];
       const allowTags = allowRules.length
-        ? allowRules.map(a => `<span class="tag">${a}</span>`).join('')
+        ? allowRules.map(a => `<span class="tag">${escapeHtml(a)}</span>`).join('')
         : '<span style="color:var(--muted)">any</span>';
 
       const backends = svc.backends || [];
@@ -2459,17 +2703,17 @@ async function refreshDashboard() {
         }
 
         const actionBtn = (!isLocal && currentScope === 'rw')
-          ? `<button class="btn btn-sm ${rt.drained ? 'btn-success' : 'btn-amber'}" onclick="toggleBackendDrain('${ep}', ${rt.drained})">${rt.drained ? 'Enable' : 'Drain'}</button>`
+          ? `<button class="btn btn-sm ${rt.drained ? 'btn-success' : 'btn-amber'}" data-endpoint="${escapeHtml(ep)}" data-drained="${rt.drained ? 'true' : 'false'}" onclick="toggleBackendDrain(this.dataset.endpoint, this.dataset.drained === 'true')">${rt.drained ? 'Enable' : 'Drain'}</button>`
           : '';
 
         matrixRows += `<tr>
-          <td>${idx === 0 ? `<strong>${svc.key}</strong> ${typeBadge} ${svc.name ? `<span class="tag">${svc.name}</span>` : ''}` : ''}</td>
-          <td>${idx === 0 ? `<span class="tag">${vipStr}</span>` : ''}</td>
+          <td>${idx === 0 ? `<strong>${escapeHtml(svc.key)}</strong> ${typeBadge} ${svc.name ? `<span class="tag">${escapeHtml(svc.name)}</span>` : ''}` : ''}</td>
+          <td>${idx === 0 ? `<span class="tag">${escapeHtml(vipStr)}</span>` : ''}</td>
           <td>${idx === 0 ? allowTags : ''}</td>
-          <td><code>${isLocal ? 'local appliance (' + svc.port + ')' : ep}</code></td>
+          <td><code>${escapeHtml(isLocal ? 'local appliance (' + svc.port + ')' : ep)}</code></td>
           <td>${pill}</td>
           <td>${isRouting ? '<span class="tag" style="color:var(--green);border-color:var(--green)">ROUTING</span>' : '<span class="tag">EXCLUDED</span>'}</td>
-          <td><code>${rt.packets || 0} pkts / ${rt.bytes || 0} B</code></td>
+          <td><code>${escapeHtml(rt.packets || 0)} pkts / ${escapeHtml(rt.bytes || 0)} B</code></td>
           <td>${actionBtn}</td>
         </tr>`;
       });
@@ -2487,13 +2731,13 @@ async function refreshDashboard() {
           ? `<span class="pill pill-up">● UP${lat}</span>`
           : (rt.health === 'DOWN' ? `<span class="pill pill-down">● DOWN</span>` : `<span class="pill pill-unknown">● READY</span>`);
         matrixRows += `<tr>
-          <td>${idx === 0 ? `<strong>gw:${gw.key}</strong> <span class="tag">wg-ecmp</span>` : ''}</td>
-          <td>${idx === 0 ? `<span class="tag">${vipStr}</span>` : ''}</td>
+          <td>${idx === 0 ? `<strong>gw:${escapeHtml(gw.key)}</strong> <span class="tag">wg-ecmp</span>` : ''}</td>
+          <td>${idx === 0 ? `<span class="tag">${escapeHtml(vipStr)}</span>` : ''}</td>
           <td>${idx === 0 ? '<span class="tag">LAN</span>' : ''}</td>
-          <td><code>${ep}</code></td>
+          <td><code>${escapeHtml(ep)}</code></td>
           <td>${pill}</td>
           <td><span class="tag" style="color:var(--cyan)">ECMP TUNNEL</span></td>
-          <td><code>${rt.packets || 0} pkts / ${rt.bytes || 0} B</code></td>
+          <td><code>${escapeHtml(rt.packets || 0)} pkts / ${escapeHtml(rt.bytes || 0)} B</code></td>
           <td></td>
         </tr>`;
       });
@@ -2519,30 +2763,30 @@ async function refreshDashboard() {
         const bStr = (s.backends || []).map(b => b.ip === '127.0.0.1' ? 'local' : (b.host ? `${b.host}:${b.port}` : `${b.ip}:${b.port}`)).join(', ');
         const allowCount = (s.allow || []).length;
         return `<div class="topo-svc-row">
-          <div><strong>${s.name || (':' + s.port)}</strong> <span class="tag">:${s.port}</span></div>
-          <div style="color:var(--muted);font-family:monospace;font-size:0.76rem">→ ${bStr} ${allowCount ? `<span class="tag" style="color:var(--cyan)">allow:${allowCount}</span>` : ''}</div>
+          <div><strong>${escapeHtml(s.name || (':' + s.port))}</strong> <span class="tag">:${escapeHtml(s.port)}</span></div>
+          <div style="color:var(--muted);font-family:monospace;font-size:0.76rem">→ ${escapeHtml(bStr)} ${allowCount ? `<span class="tag" style="color:var(--cyan)">allow:${allowCount}</span>` : ''}</div>
         </div>`;
       }).join('');
       topoHtml += `<div class="topo-vip-card">
         <div class="topo-vip-head">
-          <div><strong style="color:var(--cyan);font-size:0.95rem">VIP ${vipKey}</strong></div>
-          <button class="btn btn-sm" onclick="openAddServiceModal('${vipKey}')">+ Service</button>
+          <div><strong style="color:var(--cyan);font-size:0.95rem">VIP ${escapeHtml(vipKey)}</strong></div>
+          <button class="btn btn-sm" data-vip="${escapeHtml(vipKey)}" onclick="openAddServiceModal(this.dataset.vip)">+ Service</button>
         </div>
         ${svcsList || '<div style="color:var(--muted);font-size:0.8rem">No services attached</div>'}
       </div>`;
     }
     for (const gw of gateways) {
       const tList = (gw.tunnels || []).map(t => `<div class="topo-svc-row">
-        <div><strong>${t.iface}</strong> <span class="tag">${t.name}</span></div>
-        <div style="color:var(--green);font-family:monospace;font-size:0.75rem">ECMP w=${t.weight || 1}</div>
+        <div><strong>${escapeHtml(t.iface)}</strong> <span class="tag">${escapeHtml(t.name)}</span></div>
+        <div style="color:var(--green);font-family:monospace;font-size:0.75rem">ECMP w=${escapeHtml(t.weight || 1)}</div>
       </div>`).join('');
       const fList = (gw.forwards || []).map(f => `<div class="topo-svc-row">
-        <div><strong>fwd :${f.listen_port}</strong></div>
-        <div style="font-family:monospace;font-size:0.75rem">→ ${f.backend.host || f.backend.ip}:${f.backend.port}</div>
+        <div><strong>fwd :${escapeHtml(f.listen_port)}</strong></div>
+        <div style="font-family:monospace;font-size:0.75rem">→ ${escapeHtml(f.backend.host || f.backend.ip)}:${escapeHtml(f.backend.port)}</div>
       </div>`).join('');
       topoHtml += `<div class="topo-vip-card" style="border-color:rgba(139,92,246,0.45)">
         <div class="topo-vip-head">
-          <div><strong style="color:var(--purple);font-size:0.95rem">Gateway ${gw.key}</strong></div>
+          <div><strong style="color:var(--purple);font-size:0.95rem">Gateway ${escapeHtml(gw.key)}</strong></div>
           <span class="tag">${gw.killswitch ? 'killswitch:on' : 'killswitch:off'}</span>
         </div>
         ${fList}${tList}
@@ -2556,28 +2800,28 @@ async function refreshDashboard() {
       const vipSvcs = services.filter(s => s.vip_id === vipKey || s.listen_ip === vipKey);
       const rows = vipSvcs.map(s => {
         const disp = s.name || `${s.port}`;
-        const allowBadges = (s.allow || []).map(a => `<span class="tag">${a} <a href="#" onclick="removeAllowEntry('${s.key}','${a}');return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ');
-        const keysBadges = (s.api_keys || []).map(k => `<span class="tag"><code>${k.key}</code> (${k.scope})</span>`).join(' ');
+        const allowBadges = (s.allow || []).map(a => `<span class="tag">${escapeHtml(a)} <a href="#" data-service="${escapeHtml(s.key)}" data-entry="${escapeHtml(a)}" onclick="removeAllowEntry(this.dataset.service,this.dataset.entry);return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ');
+        const keysBadges = (s.api_keys || []).map(k => `<span class="tag"><code>${escapeHtml(k.key)}</code> (${escapeHtml(k.scope)})</span>`).join(' ');
         const isApiOrWeb = disp.startsWith('api:') || disp.startsWith('web:');
         const keyBtns = (isApiOrWeb && currentScope === 'rw')
-          ? `<button class="btn btn-sm" onclick="generateServiceKey('${vipKey}','${disp}','ro')">+ RO Key</button>
-             <button class="btn btn-sm" onclick="generateServiceKey('${vipKey}','${disp}','rw')">+ RW Key</button>`
+          ? `<button class="btn btn-sm" data-vip="${escapeHtml(vipKey)}" data-service="${escapeHtml(disp)}" onclick="generateServiceKey(this.dataset.vip,this.dataset.service,'ro')">+ RO Key</button>
+             <button class="btn btn-sm" data-vip="${escapeHtml(vipKey)}" data-service="${escapeHtml(disp)}" onclick="generateServiceKey(this.dataset.vip,this.dataset.service,'rw')">+ RW Key</button>`
           : '';
         return `<tr>
-          <td><strong>${disp}</strong> <span class="tag">${s.key}</span></td>
-          <td><code>:${s.port}/${s.proto}</code></td>
-          <td>${(s.backends || []).map(b => `<code>${b.host ? b.host + '(' + b.ip + ')' : b.ip}:${b.port}</code>`).join(', ')}</td>
+          <td><strong>${escapeHtml(disp)}</strong> <span class="tag">${escapeHtml(s.key)}</span></td>
+          <td><code>:${escapeHtml(s.port)}/${escapeHtml(s.proto)}</code></td>
+          <td>${(s.backends || []).map(b => `<code>${escapeHtml(b.host ? b.host + '(' + b.ip + ')' : b.ip)}:${escapeHtml(b.port)}</code>`).join(', ')}</td>
           <td>${allowBadges || '<span style="color:var(--muted)">none</span>'}</td>
           <td>${keysBadges || '<span style="color:var(--muted)">none (allow-list auth)</span>'}</td>
           <td style="display:flex;gap:6px;flex-wrap:wrap">
             ${keyBtns}
-            ${currentScope === 'rw' ? `<button class="btn btn-sm btn-danger" onclick="deleteService('${s.key}')">Delete</button>` : ''}
+            ${currentScope === 'rw' ? `<button class="btn btn-sm btn-danger" data-service="${escapeHtml(s.key)}" onclick="deleteService(this.dataset.service)">Delete</button>` : ''}
           </td>
         </tr>`;
       }).join('');
       vipsDetailHtml += `<div style="padding:14px 18px;border-bottom:1px solid var(--border);background:rgba(6,182,212,0.05);display:flex;justify-content:space-between;align-items:center">
-        <strong>VIP ${vipKey}</strong>
-        <button class="btn btn-sm btn-primary" onclick="openAddServiceModal('${vipKey}')">+ Add Service on ${vipKey}</button>
+        <strong>VIP ${escapeHtml(vipKey)}</strong>
+        <button class="btn btn-sm btn-primary" data-vip="${escapeHtml(vipKey)}" onclick="openAddServiceModal(this.dataset.vip)">+ Add Service on ${escapeHtml(vipKey)}</button>
       </div>
       <table>
         <thead><tr><th>Service</th><th>Listen</th><th>Backends</th><th>Allow-List</th><th>API / Web Keys</th><th>Actions</th></tr></thead>
@@ -2589,21 +2833,21 @@ async function refreshDashboard() {
     // 3. Render Gateways & WireGuard Tab
     let gwHtml = '';
     for (const gw of gateways) {
-      const svcs = (gw.services || []).map(s => `<span class="tag">${s.kind}:${s.port}</span>`).join(' ');
-      const fwds = (gw.forwards || []).map(f => `<span class="tag">:${f.listen_port} → ${f.backend.host || f.backend.ip}:${f.backend.port}</span>`).join(' ');
+      const svcs = (gw.services || []).map(s => `<span class="tag">${escapeHtml(s.kind)}:${escapeHtml(s.port)}</span>`).join(' ');
+      const fwds = (gw.forwards || []).map(f => `<span class="tag">:${escapeHtml(f.listen_port)} → ${escapeHtml(f.backend.host || f.backend.ip)}:${escapeHtml(f.backend.port)}</span>`).join(' ');
       const tRows = (gw.tunnels || []).map(t => {
         const ep = `wg:${t.name}(${t.iface})`;
         const rt = runtime[ep] || {};
         return `<tr>
-          <td><strong>${t.iface}</strong></td>
-          <td><code>${t.name}</code></td>
-          <td><span class="tag">weight ${t.weight || 1}</span></td>
-          <td><span class="pill ${rt.health === 'UP' ? 'pill-up' : 'pill-unknown'}">● ${rt.health || 'READY'} ${rt.latency_ms != null ? '(' + rt.latency_ms.toFixed(1) + 'ms)' : ''}</span></td>
-          <td><code>${rt.packets || 0} pkts / ${rt.bytes || 0} B</code></td>
+          <td><strong>${escapeHtml(t.iface)}</strong></td>
+          <td><code>${escapeHtml(t.name)}</code></td>
+          <td><span class="tag">weight ${escapeHtml(t.weight || 1)}</span></td>
+          <td><span class="pill ${rt.health === 'UP' ? 'pill-up' : 'pill-unknown'}">● ${escapeHtml(rt.health || 'READY')} ${rt.latency_ms != null ? '(' + rt.latency_ms.toFixed(1) + 'ms)' : ''}</span></td>
+          <td><code>${escapeHtml(rt.packets || 0)} pkts / ${escapeHtml(rt.bytes || 0)} B</code></td>
         </tr>`;
       }).join('');
       gwHtml += `<div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
-        <div><strong>Gateway ${gw.key}</strong> ${svcs} ${fwds}</div>
+        <div><strong>Gateway ${escapeHtml(gw.key)}</strong> ${svcs} ${fwds}</div>
         <span class="badge ${gw.killswitch ? 'badge-rw' : 'badge-warn'}">Killswitch: ${gw.killswitch ? 'ON' : 'OFF'}</span>
       </div>
       <table>
@@ -2618,7 +2862,7 @@ async function refreshDashboard() {
       ? `<table><thead><tr><th>Filename</th><th>Interface Address</th><th>Endpoint</th><th>Private Key</th></tr></thead><tbody>${
           wgEntries.map(([name, res]) => {
             const w = res.Ok || {};
-            return `<tr><td><strong>${name}</strong></td><td><code>${w.address || '-'}</code></td><td><code>${w.endpoint || '-'}</code></td><td><code>${w.private_key ? w.private_key.slice(0, 10) + '...' : '<redacted>'}</code></td></tr>`;
+            return `<tr><td><strong>${escapeHtml(name)}</strong></td><td><code>${escapeHtml(w.address || '-')}</code></td><td><code>${escapeHtml(w.endpoint || '-')}</code></td><td><code>${escapeHtml(w.private_key ? w.private_key.slice(0, 10) + '...' : '<redacted>')}</code></td></tr>`;
           }).join('')
         }</tbody></table>`
       : `<div class="empty">No WireGuard .conf files found in /data/wg</div>`;
@@ -2628,18 +2872,17 @@ async function refreshDashboard() {
     if (dns) {
       document.getElementById('dns-settings-wrap').innerHTML = `
         <div style="display:flex;flex-wrap:wrap;gap:10px">
-          <span class="tag">Domain: <strong>${dns.domain || 'lan'}</strong></span>
-          <span class="tag">Cache: <strong>${dns.cache_size}</strong></span>
+          <span class="tag">Domain: <strong>${escapeHtml(dns.domain || 'none')}</strong></span>
+          <span class="tag">Cache: <strong>${escapeHtml(dns.cache_size)}</strong></span>
           <span class="tag">Auto-VIPs: <strong>${dns.auto_vips ? 'on' : 'off'}</strong></span>
           <span class="tag">Auto-Hosts: <strong>${dns.auto_hosts ? 'on' : 'off'}</strong></span>
           <span class="tag">Health-Aware: <strong>${dns.health_aware ? 'on' : 'off'}</strong></span>
-          <span class="tag">Upstreams: <strong>${(dns.upstreams || []).join(', ')}</strong></span>
+          <span class="tag">Upstreams: <strong>${escapeHtml((dns.upstreams || []).join(', '))}</strong></span>
         </div>`;
       const recRows = [
-        ...(dns.records || []).map(r => `<tr><td><span class="tag">RECORD</span></td><td><code>${JSON.stringify(r)}</code></td></tr>`),
-        ...(dns.routes || []).map(r => `<tr><td><span class="tag" style="color:var(--cyan)">NFTSET ROUTE</span></td><td><code>${(r.domains || []).join(', ')} → via ${r.gateway}</code></td></tr>`),
-        ...(dns.bypasses || []).map(b => `<tr><td><span class="tag" style="color:var(--amber)">BYPASS</span></td><td><code>${(b.domains || []).join(', ')} (bypass ${b.gateway})</code></td></tr>`),
-        ...(dns.blocked_domains || []).map(d => `<tr><td><span class="tag" style="color:var(--red)">ADBLOCK</span></td><td><code>${d} → 0.0.0.0</code></td></tr>`)
+        ...(dns.records || []).map(r => `<tr><td><span class="tag">RECORD</span></td><td><code>${escapeHtml(JSON.stringify(r))}</code></td></tr>`),
+        ...(dns.nft_rules || []).map(r => `<tr><td><span class="tag" style="color:var(--cyan)">${r.action === 'bypass' ? 'BYPASS' : 'NFTSET ROUTE'}</span></td><td><code>${escapeHtml((r.domains || []).join(', '))} → ${escapeHtml(r.gateway)}</code></td></tr>`),
+        ...(dns.blocks || []).map(d => `<tr><td><span class="tag" style="color:var(--red)">ADBLOCK</span></td><td><code>${escapeHtml(d)} → 0.0.0.0</code></td></tr>`)
       ].join('');
       document.getElementById('dns-records-wrap').innerHTML = recRows
         ? `<table><thead><tr><th>Type</th><th>Rule / Record</th></tr></thead><tbody>${recRows}</tbody></table>`
@@ -2649,14 +2892,14 @@ async function refreshDashboard() {
     }
 
     // 5. Firewall Allow-List Tab
-    const globalAllow = (cfg.global_allow || []).map(a => `<span class="tag">${a} <a href="#" onclick="removeAllowEntry(null,'${a}');return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ');
+    const globalAllow = (cfg.global_allow || []).map(a => `<span class="tag">${escapeHtml(a)} <a href="#" data-entry="${escapeHtml(a)}" onclick="removeAllowEntry(null,this.dataset.entry);return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ');
     const svcAllowRows = services.filter(s => (s.allow || []).length > 0).map(s => `<tr>
-      <td><strong>${s.key}</strong> ${s.name ? `<span class="tag">${s.name}</span>` : ''}</td>
-      <td>${s.allow.map(a => `<span class="tag">${a} <a href="#" onclick="removeAllowEntry('${s.key}','${a}');return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ')}</td>
+      <td><strong>${escapeHtml(s.key)}</strong> ${s.name ? `<span class="tag">${escapeHtml(s.name)}</span>` : ''}</td>
+      <td>${s.allow.map(a => `<span class="tag">${escapeHtml(a)} <a href="#" data-service="${escapeHtml(s.key)}" data-entry="${escapeHtml(a)}" onclick="removeAllowEntry(this.dataset.service,this.dataset.entry);return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ')}</td>
     </tr>`).join('');
     const hostRows = Object.entries(resolvedHosts).map(([h, ips]) => `<tr>
-      <td><strong>${h}</strong></td>
-      <td><code>${(ips || []).join(', ')}</code></td>
+      <td><strong>${escapeHtml(h)}</strong></td>
+      <td><code>${escapeHtml((ips || []).join(', '))}</code></td>
     </tr>`).join('');
     document.getElementById('allow-table-wrap').innerHTML = `
       <div style="padding:14px 18px;border-bottom:1px solid var(--border)">
@@ -2683,6 +2926,7 @@ async function refreshDashboard() {
     document.getElementById('nft-box').textContent = data.nft_ruleset || '';
     document.getElementById('last-updated').textContent = 'Live • ' + new Date().toLocaleTimeString();
   } catch (e) {
+    setKernelBadge(null);
     document.getElementById('last-updated').textContent = 'Reconnecting...';
   }
 }

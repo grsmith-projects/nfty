@@ -8,8 +8,7 @@ pub use status::{handle_show, print_config_diff, print_status, print_status_tabl
 
 use crate::ast::{DnsConfig, Gateway, GatewayService, GatewayServiceKind, Service};
 use crate::compiler::{
-    apply_vip_commands, generate_vip_commands, reload_kernel_from_state,
-    reload_kernel_from_state_with_logs, validate_config,
+    apply_config, update_host_mapping, validate_config,
 };
 use crate::health::{refresh_allowlist_hosts, run_all_probes_once};
 use crate::parser::{
@@ -17,7 +16,7 @@ use crate::parser::{
     apply_service_directive, create_or_find_vip_service_by_key, parse_backend,
     parse_gateway_service, parse_ip_and_optional_cidr, parse_nftyfile, parse_service_spec,
     parse_vip, parse_vip_header, parse_vlan_id, parse_wg_tunnel, remove_backend_from_service,
-    upsert_gateway_service, validate_allow_entry,
+    upsert_gateway_service, validate_allow_entry, validate_host_mapping_name,
 };
 use crate::state::{HealthState, PendingConfirm, SharedState};
 use crate::tui::run_watch_dashboard;
@@ -154,7 +153,6 @@ pub async fn run_repl(shared: SharedState) -> Result<()> {
             }
         }
     }
-
     Ok(())
 }
 
@@ -163,9 +161,23 @@ pub async fn handle_line(
     level: &Arc<Mutex<ShellLevel>>,
     shared: &SharedState,
 ) -> bool {
+    match handle_line_checked(line, level, shared).await {
+        Ok(quit) => quit,
+        Err(e) => {
+            eprintln!("{} {:#}", "Error:".red().bold(), e);
+            false
+        }
+    }
+}
+
+pub async fn handle_line_checked(
+    line: &str,
+    level: &Arc<Mutex<ShellLevel>>,
+    shared: &SharedState,
+) -> Result<bool> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
-        return false;
+        return Ok(false);
     }
 
     {
@@ -181,20 +193,16 @@ pub async fn handle_line(
     match cmd.as_str() {
         "?" | "help" => {
             print_context_help(&cur_level);
-            return false;
+            return Ok(false);
         }
-        "quit" => return true,
+        "quit" => return Ok(true),
         "bootstrap" => {
-            if let Err(e) = handle_bootstrap(&tokens[1..], shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
-            return false;
+            handle_bootstrap(&tokens[1..], shared)?;
+            return Ok(false);
         }
         "password" | "passwd" => {
-            if let Err(e) = crate::ssh::interactive_change_password(false) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
-            return false;
+            crate::ssh::interactive_change_password(false)?;
+            return Ok(false);
         }
         ".." | "up" => {
             let mut lvl = level.lock().unwrap();
@@ -222,14 +230,14 @@ pub async fn handle_line(
                 ShellLevel::ConfigRoot => ShellLevel::Operational,
                 ShellLevel::Operational => ShellLevel::Operational,
             };
-            return false;
+            return Ok(false);
         }
         "top" => {
             let mut lvl = level.lock().unwrap();
             if *lvl != ShellLevel::Operational {
                 *lvl = ShellLevel::ConfigRoot;
             }
-            return false;
+            return Ok(false);
         }
         "exit" | "end" => {
             let mut lvl = level.lock().unwrap();
@@ -261,9 +269,9 @@ pub async fn handle_line(
                 ShellLevel::ConfigRoot => {
                     *lvl = ShellLevel::Operational;
                 }
-                ShellLevel::Operational => return true,
+                ShellLevel::Operational => return Ok(true),
             }
-            return false;
+            return Ok(false);
         }
         "scan" | "discover" => {
             let filter = tokens.get(1).copied();
@@ -271,23 +279,21 @@ pub async fn handle_line(
                 "{}",
                 "Scanning LXD / LAN neighbors for active services...".cyan()
             );
-            let discovered = crate::features::scan_network_services(filter, shared);
+            let discovered = crate::features::scan_network_services_async(filter, shared).await?;
             crate::features::print_scan_table(&discovered, shared);
-            return false;
+            return Ok(false);
         }
         "adopt" => {
-            if let Err(e) = handle_adopt(&tokens[1..], level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
-            return false;
+            handle_adopt(&tokens[1..], level, shared).await?;
+            return Ok(false);
         }
         "status" => {
             print_status_table(shared);
-            return false;
+            return Ok(false);
         }
         "flows" | "conntrack" => {
             crate::features::print_flows_table(shared);
-            return false;
+            return Ok(false);
         }
         "wg" | "wireguard" => {
             match crate::features::handle_wg_cli_command(&tokens[1..]) {
@@ -297,26 +303,24 @@ pub async fn handle_line(
                     {
                         let mut st = shared.write().unwrap();
                         if let Some(gw) = st.candidate.gateways.get_mut(gw_key) {
-                            let next_idx = gw.tunnels.len();
-                            if let Ok(t) = parse_wg_tunnel(&[saved_filename.as_str()], next_idx) {
-                                if !gw.tunnels.iter().any(|x| x.name == t.name) {
-                                    gw.tunnels.push(t);
-                                    println!(
-                                        "  {} Added tunnel {} to gateway {}",
-                                        "✔".green().bold(),
-                                        saved_filename.bold(),
-                                        gw_key.cyan()
-                                    );
-                                }
+                            let t = parse_wg_tunnel(&[saved_filename.as_str()], &gw.key)?;
+                            if !gw.tunnels.iter().any(|x| x.name == t.name) {
+                                gw.tunnels.push(t);
+                                println!(
+                                    "  {} Added tunnel {} to gateway {}",
+                                    "✔".green().bold(),
+                                    saved_filename.bold(),
+                                    gw_key.cyan()
+                                );
                             }
                         }
                         st.sync_runtime_entries();
                     }
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("{} {}", "Error:".red().bold(), e),
+                Err(e) => return Err(e),
             }
-            return false;
+            return Ok(false);
         }
         "cf" | "cloudflare"
             if tokens.len() == 1
@@ -338,10 +342,8 @@ pub async fn handle_line(
                 )
                 || matches!(cur_level, ShellLevel::Operational | ShellLevel::ConfigRoot) =>
         {
-            if let Err(e) = crate::features::handle_cf_cli_command(&tokens[1..], shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
-            return false;
+            crate::features::handle_cf_cli_command(&tokens[1..], shared)?;
+            return Ok(false);
         }
         "dns"
             if (cur_level == ShellLevel::Operational && tokens.len() == 1)
@@ -351,16 +353,12 @@ pub async fn handle_line(
                         "status" | "test" | "lookup" | "query" | "config" | "reload" | "flush"
                     )) =>
         {
-            if let Err(e) = crate::features::handle_dns_cli_command(&tokens[1..], shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
-            return false;
+            crate::features::handle_dns_cli_command(&tokens[1..], shared)?;
+            return Ok(false);
         }
         "watch" => {
-            if let Err(e) = run_watch_dashboard(shared.clone()).await {
-                eprintln!("{} {}", "Error in watch TUI:".red().bold(), e);
-            }
-            return false;
+            run_watch_dashboard(shared.clone()).await?;
+            return Ok(false);
         }
         "probe" => {
             println!("Running active health checks across all backends...");
@@ -392,61 +390,59 @@ pub async fn handle_line(
                     }
                 }
             }
-            return false;
+            return Ok(false);
         }
         "host" => {
-            if let Err(e) = handle_host_mapping(&tokens[1..], shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
-            return false;
+            handle_host_mapping(&tokens[1..], shared)?;
+            return Ok(false);
         }
         "drain" => {
             if tokens.len() < 2 {
-                eprintln!("Usage: drain <ip:port>");
-            } else {
-                set_drain_state(shared, tokens[1], true);
+                bail!("Usage: drain <ip:port>");
             }
-            return false;
+            set_drain_state(shared, tokens[1], true)?;
+            return Ok(false);
         }
         "enable" => {
             if tokens.len() < 2 {
-                eprintln!("Usage: enable <ip:port>");
-            } else {
-                set_drain_state(shared, tokens[1], false);
+                bail!("Usage: enable <ip:port>");
             }
-            return false;
+            set_drain_state(shared, tokens[1], false)?;
+            return Ok(false);
         }
         "show" => {
             handle_show(&tokens[1..], &cur_level, shared);
-            return false;
+            return Ok(false);
         }
         "diff" | "compare" => {
             print_config_diff(shared);
-            return false;
+            return Ok(false);
         }
         "test" | "validate" | "check-config" => {
-            handle_validate(shared);
-            return false;
+            if !handle_validate(shared) {
+                bail!("Configuration validation failed");
+            }
+            return Ok(false);
         }
         "apply" | "commit" => {
-            handle_apply(&tokens[1..], shared).await;
-            return false;
+            handle_apply(&tokens[1..], shared).await?;
+            return Ok(false);
         }
         "confirm" | "keep" => {
-            handle_confirm(shared);
-            return false;
+            handle_confirm(shared)?;
+            return Ok(false);
         }
         "rollback" => {
-            handle_rollback(&tokens[1..], shared);
-            return false;
+            handle_rollback(&tokens[1..], shared)?;
+            return Ok(false);
         }
         "save" => {
-            handle_save(&tokens[1..], shared);
-            return false;
+            handle_save(&tokens[1..], shared)?;
+            return Ok(false);
         }
         "load" => {
-            handle_load(&tokens[1..], shared);
-            return false;
+            handle_load(&tokens[1..], shared)?;
+            return Ok(false);
         }
         _ => {}
     }
@@ -458,14 +454,11 @@ pub async fn handle_line(
             }
             "vip" | "service" | "gateway" | "allow" | "dns" => {
                 *level.lock().unwrap() = ShellLevel::ConfigRoot;
-                if let Err(e) = handle_config_root_command(trimmed, level, shared) {
-                    eprintln!("{} {}", "Error:".red().bold(), e);
-                }
+                handle_config_root_command(trimmed, level, shared)?;
             }
             _ => {
-                eprintln!(
-                    "{} Unknown command '{}'. Type {} to enter configuration mode or {} for help.",
-                    "Error:".red().bold(),
+                bail!(
+                    "Unknown command '{}'. Type {} to enter configuration mode or {} for help.",
                     cmd,
                     "configure".yellow(),
                     "?".magenta()
@@ -473,75 +466,51 @@ pub async fn handle_line(
             }
         },
         ShellLevel::ConfigRoot => {
-            if let Err(e) = handle_config_root_command(trimmed, level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_config_root_command(trimmed, level, shared)?;
         }
         ShellLevel::GlobalAllow => {
-            if let Err(e) = handle_global_allow_command(trimmed, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_global_allow_command(trimmed, shared)?;
         }
         ShellLevel::Dns => {
-            if let Err(e) = handle_dns_level_command(trimmed, level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_dns_level_command(trimmed, level, shared)?;
         }
         ShellLevel::Vip(vip_key) => {
-            if let Err(e) = handle_vip_level_command(&vip_key, trimmed, level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_vip_level_command(&vip_key, trimmed, level, shared)?;
         }
         ShellLevel::VipService(vip_key) => {
-            if let Err(e) = handle_vip_service_command(&vip_key, trimmed, level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_vip_service_command(&vip_key, trimmed, level, shared)?;
         }
         ShellLevel::Service(svc_key) => {
-            if let Err(e) = handle_service_level_command(&svc_key, trimmed, level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_service_level_command(&svc_key, trimmed, level, shared)?;
         }
         ShellLevel::ServiceTo(svc_key) => {
-            if let Err(e) = handle_service_to_command(&svc_key, trimmed, level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_service_to_command(&svc_key, trimmed, level, shared)?;
         }
         ShellLevel::ServiceAllow(svc_key) => {
-            if let Err(e) = handle_service_allow_command(&svc_key, trimmed, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_service_allow_command(&svc_key, trimmed, shared)?;
         }
         ShellLevel::Gateway(gw_key) => {
-            if let Err(e) = handle_gateway_level_command(&gw_key, trimmed, level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_gateway_level_command(&gw_key, trimmed, level, shared)?;
         }
         ShellLevel::GatewayTunnels(gw_key) => {
-            if let Err(e) = handle_gateway_tunnels_command(&gw_key, trimmed, level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_gateway_tunnels_command(&gw_key, trimmed, level, shared)?;
         }
         ShellLevel::GatewayService(gw_key) => {
-            if let Err(e) = handle_gateway_service_command(&gw_key, trimmed, level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_gateway_service_command(&gw_key, trimmed, level, shared)?;
         }
         ShellLevel::GatewayApi(gw_key, port) => {
-            if let Err(e) = handle_gateway_api_command(&gw_key, port, trimmed, level, shared) {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-            }
+            handle_gateway_api_command(&gw_key, port, trimmed, level, shared)?;
         }
     }
 
-    false
+    Ok(false)
 }
 
 fn handle_host_mapping(args: &[&str], shared: &SharedState) -> Result<()> {
     if args.len() < 2 {
-        bail!("Usage: host <hostname> <ipv4> [ipv4...] (e.g. 'host laptop.office.lan 169.254.1.77')");
+        bail!("Usage: host <hostname> <ipv4> [ipv4...] (e.g. 'host laptop.office.lan 192.168.1.77')");
     }
-    let host = args[0].trim().to_ascii_lowercase();
+    let host = validate_host_mapping_name(args[0])?;
     let mut ips = Vec::new();
     for a in &args[1..] {
         let ip: Ipv4Addr = a
@@ -550,26 +519,12 @@ fn handle_host_mapping(args: &[&str], shared: &SharedState) -> Result<()> {
         ips.push(ip);
     }
     let mut st = shared.write().unwrap();
-    st.resolved_hosts.insert(host.clone(), ips.clone());
-    if let Some(&first_ip) = ips.first() {
-        let st_ref = &mut *st;
-        for svc in st_ref
-            .running
-            .services
-            .values_mut()
-            .chain(st_ref.candidate.services.values_mut())
-        {
-            for b in &mut svc.backends {
-                if b.host.as_deref() == Some(host.as_str()) {
-                    b.ip = first_ip;
-                }
-            }
-        }
-    }
-    st.sync_runtime_entries();
-    if !st.running.services.is_empty() {
-        let _ = reload_kernel_from_state(&mut st);
-    }
+    update_host_mapping(&mut st, &host, &ips)?;
+    crate::unikernel::persist_host_mapping(&host, &ips)
+        .context("Host mapping was updated but could not be persisted")?;
+    drop(st);
+    crate::unikernel::notify_controller_host_mapping(shared, &host, &ips)
+        .context("Host mapping was updated and saved, but controller synchronization failed")?;
     println!(
         "  {} Mapped host {} -> {:?} (and updated wildcard allow-lists)",
         "✔".green().bold(),
@@ -585,7 +540,7 @@ fn handle_host_mapping(args: &[&str], shared: &SharedState) -> Result<()> {
 /// - Applies the VIP and ruleset so you can bootstrap as many IPs as you want
 pub fn handle_bootstrap(args: &[&str], shared: &SharedState) -> Result<()> {
     if args.is_empty() {
-        bail!("Usage: bootstrap <ip[/prefix]> [ip2...] (e.g. 'bootstrap 169.254.4.250')");
+        bail!("Usage: bootstrap <ip[/prefix]> [ip2...] (e.g. 'bootstrap 192.168.4.250')");
     }
 
     let mut iface = "eth0".to_string();
@@ -612,7 +567,7 @@ pub fn handle_bootstrap(args: &[&str], shared: &SharedState) -> Result<()> {
     }
 
     if ip_specs.is_empty() {
-        bail!("Expected at least one IPv4 address to bootstrap (e.g. 'bootstrap 169.254.4.250')");
+        bail!("Expected at least one IPv4 address to bootstrap (e.g. 'bootstrap 192.168.4.250')");
     }
 
     let mut parsed_targets = Vec::new();
@@ -637,7 +592,6 @@ pub fn handle_bootstrap(args: &[&str], shared: &SharedState) -> Result<()> {
     let vip_logs;
     {
         let mut st = shared.write().unwrap();
-        let prev_running = st.running.clone();
 
         for (ip, prefix_len) in &parsed_targets {
             let vip_cfg = crate::ast::VipConfig::new(&iface, *prefix_len);
@@ -675,16 +629,15 @@ pub fn handle_bootstrap(args: &[&str], shared: &SharedState) -> Result<()> {
             );
         }
 
-        let vip_cmds = generate_vip_commands(&prev_running, &st.candidate);
-        vip_logs = apply_vip_commands(&vip_cmds);
-
-        st.history.push(prev_running);
-        st.running = st.candidate.clone();
-        st.sync_runtime_entries();
-        let _ = reload_kernel_from_state(&mut st);
+        let report = validate_config(&st.candidate, Some(&st));
+        if !report.valid {
+            bail!("Configuration is invalid: {}", report.errors.join("; "));
+        }
+        let next = st.candidate.clone();
+        vip_logs = apply_config(&mut st, next)?.logs;
     }
 
-    crate::unikernel::persist_to_storage(shared);
+    crate::unikernel::persist_and_notify_controller(shared)?;
 
     for (ip, prefix_len) in parsed_targets {
         println!(
@@ -764,7 +717,7 @@ fn handle_config_root_command(
         }
         "vip" => {
             if tokens.len() < 2 {
-                bail!("Usage: vip <ipv4[/cidr] | hostname> [dhcp [iface]] [vlan <id>] (e.g. 'vip 169.254.1.4' or 'vip sonarr')");
+                bail!("Usage: vip <ipv4[/cidr] | hostname> [dhcp [iface]] [vlan <id>] (e.g. 'vip 192.168.1.4' or 'vip sonarr')");
             }
             let (key, _ip_opt, parsed_vip) = parse_vip_header(&tokens[1..])?;
             {
@@ -829,7 +782,7 @@ fn handle_config_root_command(
         }
         "gateway" => {
             if tokens.len() < 2 {
-                bail!("Usage: gateway <ipv4[/cidr] | hostname> [dhcp [iface]] [vlan <id>] (e.g. 'gateway 169.254.1.10' or 'gateway mullvad')");
+                bail!("Usage: gateway <ipv4[/cidr] | hostname> [dhcp [iface]] [vlan <id>] (e.g. 'gateway 192.168.1.10' or 'gateway mullvad')");
             }
             let (key, ip_opt, parsed_vip) = parse_vip_header(&tokens[1..])?;
             {
@@ -890,7 +843,7 @@ fn handle_config_root_command(
         }
         "service" => {
             if tokens.len() < 2 {
-                bail!("Usage: service <port | ip:port[/proto]> (e.g. 'service 9000' or 'service 169.254.1.240:443')");
+                bail!("Usage: service <port | ip:port[/proto]> (e.g. 'service 9000' or 'service 192.168.1.240:443')");
             }
             let (key, listen_ip, port, proto) = parse_service_spec(tokens[1])?;
             {
@@ -1609,7 +1562,7 @@ fn handle_vip_service_command(
     Ok(())
 }
 
-pub fn handle_adopt(
+pub async fn handle_adopt(
     args: &[&str],
     level: &Arc<Mutex<ShellLevel>>,
     shared: &SharedState,
@@ -1663,7 +1616,7 @@ pub fn handle_adopt(
         st.discovered_services.is_empty() && !raw_target.contains(':')
     };
     if need_auto_scan {
-        let _ = crate::features::scan_network_services(None, shared);
+        crate::features::scan_network_services_async(None, shared).await?;
     }
 
     let resolved = {
@@ -1885,7 +1838,7 @@ fn handle_service_to_command(
 
     if matches!(first_lower.as_str(), "no" | "delete" | "remove") {
         if tokens.len() < 2 {
-            bail!("Usage: no <ip[:port]> (e.g. 'no 169.254.1.60:9000')");
+            bail!("Usage: no <ip[:port]> (e.g. 'no 192.168.1.60:9000')");
         }
         if remove_backend_from_service(svc, tokens[1])? {
             println!(
@@ -2323,8 +2276,7 @@ fn handle_gateway_tunnels_command(
             .gateways
             .get_mut(gw_key)
             .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
-        let next_idx = gw.tunnels.len();
-        let t = parse_wg_tunnel(&[saved_filename.as_str()], next_idx)?;
+        let t = parse_wg_tunnel(&[saved_filename.as_str()], &gw.key)?;
         let display_str = t.to_string();
         if let Some(existing) = gw.tunnels.iter_mut().find(|x| x.name == t.name) {
             *existing = t;
@@ -2385,9 +2337,8 @@ fn handle_gateway_tunnels_command(
         return Ok(());
     }
 
-    let next_idx = gw.tunnels.len();
     let ref_tokens: Vec<&str> = effective_tokens.iter().map(|s| s.as_str()).collect();
-    let t = parse_wg_tunnel(&ref_tokens, next_idx)?;
+    let t = parse_wg_tunnel(&ref_tokens, &gw.key)?;
     let display_str = t.to_string();
     if let Some(existing) = gw.tunnels.iter_mut().find(|x| x.name == t.name) {
         *existing = t;
@@ -2425,214 +2376,208 @@ fn handle_validate(shared: &SharedState) -> bool {
     report.valid
 }
 
-async fn handle_apply(args: &[&str], shared: &SharedState) {
+async fn handle_apply(args: &[&str], shared: &SharedState) -> Result<()> {
     refresh_allowlist_hosts(shared).await;
 
     if !handle_validate(shared) {
-        eprintln!(
-            "{}",
-            "Apply aborted due to validation errors.".red().bold()
-        );
-        return;
+        bail!("Apply aborted due to validation errors");
     }
 
     let mut confirm_secs: Option<u64> = None;
     if !args.is_empty() {
         if args[0].eq_ignore_ascii_case("confirm") {
-            let secs = args
-                .get(1)
-                .and_then(|s| s.trim_end_matches('s').parse::<u64>().ok())
-                .unwrap_or(60);
+            if args.len() > 2 {
+                bail!("Usage: apply [confirm [seconds]]");
+            }
+            let secs = match args.get(1) {
+                Some(raw) => raw.trim_end_matches('s').parse::<u64>()
+                    .with_context(|| format!("Invalid confirmation timeout '{}'", raw))?,
+                None => 60,
+            };
             confirm_secs = Some(secs.max(5));
-        } else if let Ok(secs) = args[0].trim_end_matches('s').parse::<u64>() {
+        } else {
+            if args.len() > 1 {
+                bail!("Usage: apply [confirm [seconds]]");
+            }
+            let secs = args[0].trim_end_matches('s').parse::<u64>()
+                .with_context(|| format!("Invalid confirmation timeout '{}'", args[0]))?;
             confirm_secs = Some(secs.max(5));
         }
     }
 
-    let vip_logs;
-    let dhcp_logs;
-    let apply_res;
-    {
+    let (result, delegated_to_controller) = {
         let mut st = shared.write().unwrap();
+        if st.pending_confirm.is_some() {
+            bail!("Confirm or roll back the pending trial before applying another configuration");
+        }
+        if confirm_secs.is_some() && !st.controller_is_authoritative {
+            bail!("Confirmed apply requires a long-running appliance or daemon controller");
+        }
         let prev_running = st.running.clone();
         let next_running = st.candidate.clone();
-
-        let vip_cmds = generate_vip_commands(&prev_running, &next_running);
-        vip_logs = apply_vip_commands(&vip_cmds);
-
-        st.history.push(prev_running.clone());
-        st.running = next_running;
-        st.sync_runtime_entries();
-
-        if let Some(secs) = confirm_secs {
-            st.pending_confirm = Some(PendingConfirm {
-                revert_to: prev_running,
-                deadline: Instant::now() + Duration::from_secs(secs),
-            });
+        if !st.controller_is_authoritative && crate::unikernel::pid1_is_nfty() {
+            st.running = next_running;
+            st.sync_runtime_entries();
+            (
+                crate::compiler::ApplyResult {
+                    message: "Applied configuration via appliance controller".to_string(),
+                    logs: Vec::new(),
+                },
+                Some(prev_running),
+            )
         } else {
-            st.pending_confirm = None;
-        }
-
-        let (res, logs) = reload_kernel_from_state_with_logs(&mut st);
-        apply_res = res;
-        dhcp_logs = logs;
-    }
-
-    for log in dhcp_logs {
-        println!("  {} {}", "→".cyan(), log);
-    }
-    for log in vip_logs {
-        println!("  {} {}", "→".cyan(), log);
-    }
-
-    match apply_res {
-        Ok(msg) => {
-            crate::unikernel::persist_to_storage(shared);
-            println!("  {} {}", "✔".green().bold(), msg.green());
+            let result = apply_config(&mut st, next_running)?;
             if let Some(secs) = confirm_secs {
-                println!(
-                    "  {} Safety rollback timer active for {}s! Type {} to keep changes.",
-                    "🔒".yellow(),
-                    secs,
-                    "confirm".bold().yellow()
-                );
+                st.pending_confirm = Some(PendingConfirm {
+                    revert_to: prev_running,
+                    deadline: Instant::now() + Duration::from_secs(secs),
+                });
             }
-            let _ = run_all_probes_once(shared).await;
+            (result, None)
         }
-        Err(e) => {
-            eprintln!("  {} {}", "✖ Apply failed:".red().bold(), e);
-        }
+    };
+    for log in result.logs {
+        println!("  {} {}", "→".cyan(), log);
     }
-}
-
-fn handle_confirm(shared: &SharedState) {
-    let mut st = shared.write().unwrap();
-    if st.pending_confirm.take().is_some() {
+    if let Err(e) = crate::unikernel::persist_and_notify_controller(shared) {
+        if let Some(prev_running) = delegated_to_controller {
+            let mut st = shared.write().unwrap();
+            st.running = prev_running;
+            st.sync_runtime_entries();
+        }
+        return Err(e);
+    }
+    if let Some(prev_running) = delegated_to_controller {
+        let mut st = shared.write().unwrap();
+        st.history.push(prev_running);
+        st.sync_from_disk_if_changed();
+    }
+    println!("  {} {}", "✔".green().bold(), result.message.green());
+    if let Some(secs) = confirm_secs {
         println!(
-            "  {} Configuration confirmed! Safety rollback timer cancelled.",
-            "✔".green().bold()
+            "  {} Safety rollback timer active for {}s! Type {} to keep changes.",
+            "🔒".yellow(),
+            secs,
+            "confirm".bold().yellow()
         );
-    } else {
-        println!("  (No pending commit-confirm timer is active)");
     }
+    let _ = run_all_probes_once(shared).await;
+    Ok(())
 }
 
-fn handle_rollback(args: &[&str], shared: &SharedState) {
-    let steps: usize = args
-        .first()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1);
+fn handle_confirm(shared: &SharedState) -> Result<()> {
+    let mut st = shared.write().unwrap();
+    let Some(pending) = st.pending_confirm.take() else {
+        bail!("No pending commit-confirm timer is active");
+    };
+    if let Err(e) = crate::unikernel::persist_state(&mut st) {
+        st.pending_confirm = Some(pending);
+        return Err(e.context("Confirmation was not persisted"));
+    }
+    println!(
+        "  {} Configuration confirmed! Safety rollback timer cancelled.",
+        "✔".green().bold()
+    );
+    Ok(())
+}
+
+fn handle_rollback(args: &[&str], shared: &SharedState) -> Result<()> {
+    let steps = match args.first() {
+        Some(raw) => raw.parse::<usize>().context("Invalid rollback revision count")?.max(1),
+        None => 1,
+    };
 
     let mut st = shared.write().unwrap();
     if st.history.is_empty() {
-        eprintln!("  No previous commits in history to rollback to.");
-        return;
+        bail!("No previous commits in history to rollback to");
     }
 
     let target_idx = st.history.len().saturating_sub(steps);
-    st.history.truncate(target_idx + 1);
-    let restored = st.history.pop().unwrap();
-    let old_running = st.running.clone();
-
-    let vip_cmds = generate_vip_commands(&old_running, &restored);
-    let _ = apply_vip_commands(&vip_cmds);
-
-    st.running = restored.clone();
+    let restored = st.history[target_idx].clone();
+    apply_config(&mut st, restored.clone()).context("Rollback failed")?;
+    st.history.truncate(target_idx);
     st.candidate = restored;
     st.pending_confirm = None;
-    let _ = reload_kernel_from_state(&mut st);
+    drop(st);
+    crate::unikernel::persist_and_notify_controller(shared)?;
 
     println!(
         "  {} Rolled back {} revision(s) and re-applied running configuration.",
         "✔".green().bold(),
         steps
     );
+    Ok(())
 }
 
-fn handle_save(args: &[&str], shared: &SharedState) {
+fn handle_save(args: &[&str], shared: &SharedState) -> Result<()> {
     let mut st = shared.write().unwrap();
     let path = args
         .first()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| st.config_path.clone());
     let content = st.candidate.format_nftyfile();
-    match fs::write(&path, &content) {
-        Ok(_) => {
-            st.last_disk_nftyfile = content;
-            println!(
-                "  {} Saved configuration to {}",
-                "✔".green().bold(),
-                path.display()
-            );
-        }
-        Err(e) => eprintln!(
-            "  {} Failed to save to {}: {}",
-            "✖".red().bold(),
-            path.display(),
-            e
-        ),
+    if st.pending_confirm.is_some() && path == st.config_path {
+        bail!("Confirm or roll back the pending trial before saving the active configuration");
     }
+    crate::unikernel::write_atomic(&path, content.as_bytes())?;
+    if path == st.config_path {
+        st.last_disk_nftyfile = content;
+    }
+    println!(
+        "  {} Saved configuration to {}",
+        "✔".green().bold(),
+        path.display()
+    );
+    Ok(())
 }
 
-fn handle_load(args: &[&str], shared: &SharedState) {
+fn handle_load(args: &[&str], shared: &SharedState) -> Result<()> {
     let path = {
         let st = shared.read().unwrap();
         args.first()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| st.config_path.clone())
     };
-    match fs::read_to_string(&path) {
-        Ok(raw) => match parse_nftyfile(&raw) {
-            Ok(cfg) => {
-                let mut st = shared.write().unwrap();
-                st.candidate = cfg;
-                st.sync_runtime_entries();
-                println!(
-                    "  {} Loaded candidate configuration from {}",
-                    "✔".green().bold(),
-                    path.display()
-                );
-            }
-            Err(e) => eprintln!(
-                "  {} Parse error in {}: {}",
-                "✖".red().bold(),
-                path.display(),
-                e
-            ),
-        },
-        Err(e) => eprintln!(
-            "  {} Could not read {}: {}",
-            "✖".red().bold(),
-            path.display(),
-            e
-        ),
-    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("Could not read {}", path.display()))?;
+    let cfg = parse_nftyfile(&raw)
+        .with_context(|| format!("Parse error in {}", path.display()))?;
+    let mut st = shared.write().unwrap();
+    st.candidate = cfg;
+    st.sync_runtime_entries();
+    println!(
+        "  {} Loaded candidate configuration from {}",
+        "✔".green().bold(),
+        path.display()
+    );
+    Ok(())
 }
 
-fn set_drain_state(shared: &SharedState, endpoint: &str, drained: bool) {
-    let mut st = shared.write().unwrap();
-    let mut matched = Vec::new();
-    for svc in st
-        .running
-        .services
-        .values()
-        .chain(st.candidate.services.values())
-    {
-        for b in &svc.backends {
-            if b.endpoint() == endpoint || b.ip.to_string() == endpoint {
-                if !matched.contains(&b.endpoint()) {
-                    matched.push(b.endpoint());
+fn set_drain_state(shared: &SharedState, endpoint: &str, drained: bool) -> Result<()> {
+    let matched = {
+        let st = shared.read().unwrap();
+        let mut matched = Vec::new();
+        for svc in st
+            .running
+            .services
+            .values()
+            .chain(st.candidate.services.values())
+        {
+            for b in &svc.backends {
+                if b.endpoint() == endpoint || b.ip.to_string() == endpoint {
+                    if !matched.contains(&b.endpoint()) {
+                        matched.push(b.endpoint());
+                    }
                 }
             }
         }
-    }
+        matched
+    };
     if matched.is_empty() {
-        matched.push(endpoint.to_string());
+        bail!("Backend '{}' not found", endpoint);
     }
-
+    crate::unikernel::dispatch_backend_drain_state(shared, &matched, drained)?;
     for ep in &matched {
-        st.runtime.entry(ep.clone()).or_default().drained = drained;
         if drained {
             println!(
                 "  {} Drained backend {} (removed from active nftables map)",
@@ -2647,7 +2592,5 @@ fn set_drain_state(shared: &SharedState, endpoint: &str, drained: bool) {
             );
         }
     }
-    if !st.running.services.is_empty() {
-        let _ = reload_kernel_from_state(&mut st);
-    }
+    Ok(())
 }

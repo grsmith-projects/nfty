@@ -5,9 +5,27 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
+
+pub(crate) fn wireguard_iface_index(iface: &str) -> Option<usize> {
+    let suffix = iface.strip_prefix("wg")?;
+    if suffix.is_empty() || iface.len() > 15 || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse::<usize>().ok().filter(|n| *n <= 1_999_999)
+}
+
+pub(crate) fn wireguard_table_id(index: usize) -> usize {
+    if index <= 150 { 101 + index } else { 1_000_000 + index }
+}
+
+pub(crate) fn wireguard_mark(index: usize) -> usize {
+    if index <= 150 { 0x101 + index } else { 0x0100_0000 + index }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedWgConf {
@@ -119,18 +137,72 @@ pub fn resolve_tunnel_config(t: &WgTunnel) -> Result<ParsedWgConf> {
     )
 }
 
-/// Applies all configured WireGuard Virtual Gateways:
-/// - Creates kernel `wgN` interfaces
-/// - Configures private keys, endpoints, and `FwMark = 0x51820`
-/// - Installs policy routing rules (`fwmark 0x101+i lookup 101+i`)
-pub fn apply_wireguard_gateways(cfg: &Config) -> Vec<String> {
-    let mut logs = Vec::new();
-    let _ = fs::create_dir_all("/data/wg");
-    let _ = fs::create_dir_all("/run");
+fn run_ip(args: &[&str]) -> Result<()> {
+    let output = Command::new("ip").env("LC_ALL", "C").args(args).output().context("Failed to invoke ip")?;
+    if !output.status.success() {
+        bail!("ip {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
 
-    // Enable loose rp_filter so policy-routed asymmetric WireGuard return packets aren't dropped
-    let _ = fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", "2\n");
-    let _ = fs::write("/proc/sys/net/ipv4/conf/default/rp_filter", "2\n");
+fn remove_ip_rule_or_route(args: &[&str]) -> Result<()> {
+    let output = Command::new("ip").env("LC_ALL", "C").args(args).output().context("Failed to invoke ip")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success()
+        && !stderr.contains("No such file or directory")
+        && !stderr.contains("FIB table does not exist")
+        && !stderr.contains("No such process")
+    {
+        bail!("ip {} failed: {}", args.join(" "), stderr.trim());
+    }
+    Ok(())
+}
+
+fn read_route_source(path: &str) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(raw) => {
+            let source = raw.trim();
+            source.parse::<std::net::Ipv4Addr>()
+                .with_context(|| format!("Invalid WireGuard route source in {}", path))?;
+            Ok(Some(source.to_string()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("Cannot read {}", path)),
+    }
+}
+
+fn write_runtime_wg_config(path: &str, config: &str) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).with_context(|| format!("Cannot write {}", path))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(config.as_bytes())?;
+    Ok(())
+}
+
+/// Applies configured tunnels and only cleans up interfaces marked as managed by nfty.
+pub fn apply_wireguard_gateways(cfg: &Config) -> Result<Vec<String>> {
+    if unsafe { libc::geteuid() != 0 } {
+        return Ok(Vec::new());
+    }
+    let mut logs = Vec::new();
+    fs::create_dir_all("/run").context("Cannot prepare WireGuard runtime directory")?;
+    if cfg.gateways.values().any(|g| !g.tunnels.is_empty()) {
+        fs::create_dir_all("/data/wg").context("Cannot prepare WireGuard config directory")?;
+        fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", "2\n")
+            .context("Cannot configure WireGuard reverse-path filtering")?;
+        fs::write("/proc/sys/net/ipv4/conf/default/rp_filter", "2\n")
+            .context("Cannot configure default reverse-path filtering")?;
+    }
 
     let mut active_wg_ifaces = std::collections::BTreeSet::new();
     let mut global_idx = 0usize;
@@ -141,19 +213,29 @@ pub fn apply_wireguard_gateways(cfg: &Config) -> Vec<String> {
             } else {
                 t.iface.clone()
             };
-            active_wg_ifaces.insert(iface.clone());
-            let table_id = 101 + global_idx;
-            let fwmark = 0x101 + global_idx;
             global_idx += 1;
+            let index = wireguard_iface_index(&iface)
+                .with_context(|| format!("Invalid WireGuard interface '{}'", iface))?;
+            if !active_wg_ifaces.insert(iface.clone()) {
+                bail!("WireGuard interface '{}' is configured more than once", iface);
+            }
+            let table_str = wireguard_table_id(index).to_string();
+            let mark_hex = format!("0x{:x}", wireguard_mark(index));
+            let prio_str = "1000";
+            let parsed = resolve_tunnel_config(t)?;
+            let src_ip = parsed.address.split('/').next().unwrap_or("").trim();
+            src_ip.parse::<std::net::Ipv4Addr>()
+                .with_context(|| format!("Invalid WireGuard address '{}'", parsed.address))?;
 
-            let parsed = match resolve_tunnel_config(t) {
-                Ok(p) => p,
-                Err(e) => {
-                    logs.push(format!("WARN: {}", e));
-                    continue;
-                }
-            };
-
+            let run_conf_path = format!("/run/nfty-{}.conf", iface);
+            let route_path = format!("/run/nfty-{}.route", iface);
+            let iface_exists = Path::new(&format!("/sys/class/net/{}", iface)).exists();
+            if iface_exists && !Path::new(&run_conf_path).is_file() {
+                bail!("Refusing to modify unmanaged WireGuard interface '{}'", iface);
+            }
+            if !iface_exists {
+                run_ip(&["link", "add", "dev", &iface, "type", "wireguard"])?;
+            }
             let mut wg_conf = format!(
                 "[Interface]\nPrivateKey = {}\nFwMark = 0x51820\n\n[Peer]\nPublicKey = {}\nEndpoint = {}\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = {}\n",
                 parsed.private_key, parsed.peer_pubkey, parsed.endpoint, parsed.keepalive
@@ -161,131 +243,69 @@ pub fn apply_wireguard_gateways(cfg: &Config) -> Vec<String> {
             if let Some(psk) = &parsed.preshared_key {
                 wg_conf.push_str(&format!("PresharedKey = {}\n", psk));
             }
-            let run_conf_path = format!("/run/nfty-{}.conf", iface);
-            let _ = fs::write(&run_conf_path, wg_conf);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&run_conf_path, fs::Permissions::from_mode(0o600));
-            }
-
-            let _ = Command::new("ip")
-                .args(["link", "add", "dev", &iface, "type", "wireguard"])
-                .output();
-            let _ = Command::new("ip")
-                .args(["addr", "flush", "dev", &iface])
-                .output();
-            let _ = Command::new("ip")
-                .args(["addr", "replace", &parsed.address, "dev", &iface])
-                .output();
-            let _ = Command::new("ip")
-                .args(["link", "set", "mtu", "1420", "up", "dev", &iface])
-                .output();
-            let _ = Command::new("ip")
-                .args(["link", "set", "dev", &iface, "up"])
-                .output();
-
-            let wg_res = Command::new("wg")
-                .args(["setconf", &iface, &run_conf_path])
-                .output();
-
-            // Policy routing table for this tunnel (both fwmark and source IP from tunnel)
-            let table_str = table_id.to_string();
-            let mark_hex = format!("0x{:x}", fwmark);
-            let prio_str = (1000 + global_idx).to_string();
-            let src_ip = parsed
-                .address
-                .split('/')
-                .next()
-                .unwrap_or(&parsed.address)
-                .trim()
-                .to_string();
-
-            let _ = Command::new("ip")
-                .args(["route", "replace", "default", "dev", &iface, "table", &table_str])
-                .output();
-            let _ = Command::new("ip")
-                .args(["rule", "del", "fwmark", &mark_hex, "table", &table_str])
-                .output();
-            let _ = Command::new("ip")
-                .args([
-                    "rule",
-                    "add",
-                    "fwmark",
-                    &mark_hex,
-                    "table",
-                    &table_str,
-                    "priority",
-                    &prio_str,
-                ])
-                .output();
-            if !src_ip.is_empty() {
-                let _ = Command::new("ip")
-                    .args(["rule", "del", "from", &src_ip, "table", &table_str])
-                    .output();
-                let _ = Command::new("ip")
-                    .args([
-                        "rule",
-                        "add",
-                        "from",
-                        &src_ip,
-                        "table",
-                        &table_str,
-                        "priority",
-                        &prio_str,
-                    ])
-                    .output();
-            }
-
-            match wg_res {
-                Ok(o) if o.status.success() => {
-                    logs.push(format!(
-                        "WireGuard tunnel {} ({}) -> {} [addr {}, table {}, mark {}] ACTIVE",
-                        t.name, iface, parsed.endpoint, parsed.address, table_id, mark_hex
-                    ));
-                }
-                Ok(o) => {
-                    let err = String::from_utf8_lossy(&o.stderr);
-                    logs.push(format!(
-                        "WARN: wg setconf {} failed: {}",
-                        iface,
-                        err.trim()
-                    ));
-                }
-                Err(e) => {
-                    logs.push(format!("WARN: failed to invoke 'wg' for {}: {}", iface, e));
-                }
-            }
-        }
-    }
-
-    // Clean up any stale wg* interfaces and policy routing rules that are no longer configured
-    if let Ok(entries) = fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("wg") && !active_wg_ifaces.contains(&name) {
-                if let Some(idx_str) = name.strip_prefix("wg") {
-                    if let Ok(idx) = idx_str.parse::<usize>() {
-                        let table_str = (101 + idx).to_string();
-                        let mark_hex = format!("0x{:x}", 0x101 + idx);
-                        let _ = Command::new("ip")
-                            .args(["rule", "del", "fwmark", &mark_hex, "table", &table_str])
-                            .output();
-                        let _ = Command::new("ip")
-                            .args(["route", "flush", "table", &table_str])
-                            .output();
+            if let Err(e) = write_runtime_wg_config(&run_conf_path, &wg_conf) {
+                if !iface_exists {
+                    if let Err(cleanup) = run_ip(&["link", "del", "dev", &iface]) {
+                        bail!("{}; failed to remove new interface '{}': {}", e, iface, cleanup);
                     }
                 }
-                let _ = Command::new("ip")
-                    .args(["link", "del", "dev", &name])
-                    .output();
-                let _ = fs::remove_file(format!("/run/nfty-{}.conf", name));
-                logs.push(format!("Removed stale WireGuard interface {}", name));
+                return Err(e);
             }
+
+            run_ip(&["addr", "flush", "dev", &iface])?;
+            run_ip(&["addr", "replace", &parsed.address, "dev", &iface])?;
+            run_ip(&["link", "set", "mtu", "1420", "up", "dev", &iface])?;
+            let wg_output = Command::new("wg")
+                .args(["setconf", &iface, &run_conf_path])
+                .output()
+                .context("Failed to invoke wg")?;
+            if !wg_output.status.success() {
+                bail!("wg setconf {} failed: {}", iface, String::from_utf8_lossy(&wg_output.stderr).trim());
+            }
+
+            run_ip(&["route", "replace", "default", "dev", &iface, "table", &table_str])?;
+            remove_ip_rule_or_route(&["rule", "del", "fwmark", &mark_hex, "table", &table_str])?;
+            run_ip(&["rule", "add", "fwmark", &mark_hex, "table", &table_str, "priority", prio_str])?;
+            if let Some(old_src) = read_route_source(&route_path)? {
+                remove_ip_rule_or_route(&["rule", "del", "from", &old_src, "table", &table_str])?;
+            }
+            remove_ip_rule_or_route(&["rule", "del", "from", src_ip, "table", &table_str])?;
+            run_ip(&["rule", "add", "from", src_ip, "table", &table_str, "priority", prio_str])?;
+            fs::write(&route_path, src_ip).with_context(|| format!("Cannot write {}", route_path))?;
+            logs.push(format!(
+                "WireGuard tunnel {} ({}) -> {} [addr {}, table {}, mark {}] ACTIVE",
+                t.name, iface, parsed.endpoint, parsed.address, table_str, mark_hex
+            ));
         }
     }
 
-    logs
+    for entry in fs::read_dir("/run").context("Cannot inspect managed WireGuard interfaces")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(iface) = name.strip_prefix("nfty-").and_then(|n| n.strip_suffix(".conf")) else { continue };
+        let Some(index) = wireguard_iface_index(iface) else { continue };
+        if active_wg_ifaces.contains(iface) {
+            continue;
+        }
+        let table_str = wireguard_table_id(index).to_string();
+        let mark_hex = format!("0x{:x}", wireguard_mark(index));
+        let route_path = format!("/run/nfty-{}.route", iface);
+        remove_ip_rule_or_route(&["rule", "del", "fwmark", &mark_hex, "table", &table_str])?;
+        if let Some(src) = read_route_source(&route_path)? {
+            remove_ip_rule_or_route(&["rule", "del", "from", &src, "table", &table_str])?;
+        }
+        remove_ip_rule_or_route(&["route", "flush", "table", &table_str])?;
+        if Path::new(&format!("/sys/class/net/{}", iface)).exists() {
+            run_ip(&["link", "del", "dev", iface])?;
+        }
+        if Path::new(&route_path).exists() {
+            fs::remove_file(&route_path).with_context(|| format!("Cannot remove {}", route_path))?;
+        }
+        fs::remove_file(entry.path()).with_context(|| format!("Cannot remove {}", name))?;
+        logs.push(format!("Removed managed WireGuard interface {}", iface));
+    }
+    Ok(logs)
 }
 
 /// Lists all `.conf` files saved in `/data/wg`.
@@ -326,10 +346,10 @@ pub fn normalize_wg_filename(name: &str) -> Result<String> {
 /// Saves a Mullvad / WireGuard `.conf` file to `/data/wg/<name>`.
 pub fn save_wg_config_file(name: &str, content: &str) -> Result<(String, ParsedWgConf)> {
     let parsed = parse_wg_conf_str(content)?;
-    let _ = fs::create_dir_all("/data/wg");
+    fs::create_dir_all("/data/wg").context("Failed to prepare WireGuard config directory")?;
     let filename = normalize_wg_filename(name)?;
     let full_path = Path::new("/data/wg").join(&filename);
-    fs::write(&full_path, content)
+    crate::unikernel::write_atomic(&full_path, content.as_bytes())
         .with_context(|| format!("Failed to write {}", full_path.display()))?;
     Ok((filename, parsed))
 }
@@ -339,7 +359,7 @@ pub fn edit_wg_config_interactive(
     name: &str,
     preferred_editor: Option<&str>,
 ) -> Result<Option<String>> {
-    let _ = fs::create_dir_all("/data/wg");
+    fs::create_dir_all("/data/wg").context("Failed to prepare WireGuard config directory")?;
     let filename = normalize_wg_filename(name)?;
     let full_path = Path::new("/data/wg").join(&filename);
     let existed_before = full_path.exists();
@@ -349,7 +369,15 @@ pub fn edit_wg_config_interactive(
         filename
     );
     if !existed_before {
-        let _ = fs::write(&full_path, &template);
+        crate::unikernel::write_atomic(&full_path, template.as_bytes())?;
+    } else {
+        let metadata = fs::symlink_metadata(&full_path)
+            .with_context(|| format!("Cannot inspect {}", full_path.display()))?;
+        if !metadata.file_type().is_file() {
+            bail!("WireGuard config '{}' is not a regular file", full_path.display());
+        }
+        fs::set_permissions(&full_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Cannot secure {}", full_path.display()))?;
     }
 
     let editor = match preferred_editor {
@@ -374,11 +402,14 @@ pub fn edit_wg_config_interactive(
         .status()
         .with_context(|| format!("Failed to launch editor '{}'", editor))?;
 
+    fs::set_permissions(&full_path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("Cannot secure {}", full_path.display()))?;
     if !status.success() {
         bail!("Editor '{}' exited with non-zero status", editor);
     }
 
-    let raw = fs::read_to_string(&full_path).unwrap_or_default();
+    let raw = fs::read_to_string(&full_path)
+        .with_context(|| format!("Cannot read {}", full_path.display()))?;
     let non_comment_lines: usize = raw
         .lines()
         .map(|l| l.split('#').next().unwrap_or("").trim())
@@ -387,7 +418,8 @@ pub fn edit_wg_config_interactive(
 
     if non_comment_lines == 0 {
         if !existed_before {
-            let _ = fs::remove_file(&full_path);
+            fs::remove_file(&full_path)
+                .with_context(|| format!("Cannot remove {}", full_path.display()))?;
         }
         println!("  {} Aborted (empty WireGuard config).", "⚠".yellow());
         return Ok(None);

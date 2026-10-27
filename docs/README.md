@@ -21,7 +21,7 @@ It compiles a declarative configuration file (`/data/Nftyfile`), an interactive 
 
 ## Architecture Overview
 
-`nfty` separates control-plane state (Candidate Configuration vs. Running Configuration) from the kernel and userspace dataplanes. Configuration changes are validated via `nft -c -f` dry-run before atomically replacing `table ip nfty` in a single transaction.
+`nfty` separates candidate and running configuration from kernel and userspace dataplanes. `test`/`validate` can dry-run the generated `nftables` rules; applying a configuration spans additional subsystems and is not one atomic transaction.
 
 ```mermaid
 flowchart TD
@@ -32,7 +32,7 @@ flowchart TD
         API["Headless Control API (api:8080)<br/>(Scoped rw / ro Keys + Secret Redaction)"]
     end
 
-    subgraph StateEngine["Transactional State & Persistence Engine"]
+    subgraph StateEngine["Configuration & Persistence Engine"]
         Cand["Candidate Config (In-Memory AST)"]
         Run["Running Config (Active AST + History Stack)"]
         Disk["Atomic /data Persistence<br/>(Nftyfile, auth.json, hosts.json, cloudflare.json, /data/wg/*.conf)"]
@@ -84,13 +84,13 @@ flowchart TD
 
 | Capability | Subsystem | Implementation Details |
 | :--- | :--- | :--- |
-| **Virtual IP (VIP) Management** | `compiler.rs` / `unikernel.rs` | Static IPv4 VIPs (`169.254.10.10/24`), 802.1Q VLAN sub-interfaces (`vlan 20`), and named DHCP `macvlan` VIPs (`vip sonarr { dhcp eth0 }`) with deterministic MAC addresses and `udhcpc` hostname registration. |
+| **Virtual IP (VIP) Management** | `compiler.rs` / `unikernel.rs` | Static IPv4 VIPs (`192.168.10.10/24`), 802.1Q VLAN sub-interfaces (`vlan 20`), and named DHCP `macvlan` VIPs (`vip sonarr { dhcp eth0 }`) with deterministic MAC addresses and `udhcpc` hostname registration. |
 | **Kernel L4 Load Balancing** | `table ip nfty` (`prerouting`) | TCP, UDP, or dual-stack (`both`) port forwarding; weighted `round-robin` (`numgen inc mod N`) or source-IP `sticky` (`ip saddr mod N`) verdict maps; `nat` (masquerade) or `transparent` (preserve client IP) modes; automatic `backup` backend failover. |
 | **Active Health Checking** | `health.rs` | Periodic `tcp`, `http <path>`, and `ping` (ICMP) probes with latency tracking. Unhealthy or manually `drained` backends are removed from active kernel `nftables` maps and DNS responses without dropping existing flows. |
-| **Allow-Lists & Rate Limiting** | `table ip nfty` (`allow_*`, `meter_*`) | Global and per-service/per-gateway ACLs supporting exact IPs, CIDRs (`10.0.0.0/8`), IP wildcards (`169.254.1.*`), hostnames (`admin.office.lan`), and wildcard hostnames (`*.office.lan`). Kernel per-IP or global packet rate limiting (`limit 200/sec burst 100 per-ip`). |
+| **Allow-Lists & Rate Limiting** | `table ip nfty` (`allow_*`, `meter_*`) | Global and per-service/per-gateway ACLs supporting exact IPs, CIDRs (`10.0.0.0/8`), IP wildcards (`192.168.1.*`), hostnames (`admin.office.lan`), and wildcard hostnames (`*.office.lan`). Per-IP or global rate guards apply to first packets in the NAT chain, not every packet in an established flow. |
 | **L7 Host/SNI Proxy & mDNS** | `features/vhost_mdns.rs` | Multiplexes ports `80` and `443` across multiple backend services on the same VIP by inspecting HTTP `Host` headers and TLS ClientHello `SNI` extensions. Includes an embedded multicast mDNS responder (`224.0.0.251:5353`). |
-| **Internet NAT & WireGuard Gateways** | `features/wireguard.rs` / `gateway_proxy.rs` | Virtual Gateway IPs (`gateway 169.254.10.20`) usable as a LAN default gateway. Operates in Direct Internet NAT mode or WireGuard Multi-Tunnel ECMP mode with per-tunnel `fwmark` routing tables, `ct mark` connection pinning, WAN leak `killswitch`, inbound port forwarding (`forward <port> to <ip:port>`), and built-in `privoxy:8118` and `socks5:1080` proxies. |
+| **Internet NAT & WireGuard Gateways** | `features/wireguard.rs` / `gateway_proxy.rs` | Virtual Gateway IPs (`gateway 192.168.10.20`) usable as a LAN default gateway. Operates in Direct Internet NAT mode or WireGuard Multi-Tunnel ECMP mode with per-tunnel `fwmark` routing tables, `ct mark` connection pinning, WAN leak `killswitch`, inbound port forwarding (`forward <port> to <ip:port>`), and built-in `privoxy:8118` and `socks5:1080` proxies. |
 | **Programmable DNS (`dnsmasq` + `nftset`)** | `features/dns.rs` | `dnsmasq` supervisor with automatic VIP/host `A` and `PTR` synthesis, health-aware record filtering, authoritative `a`/`aaaa`/`address`/`cname`/`txt`/`srv`/`mx`/`ptr` records, conditional split-horizon `forward` zones (optionally pinned `via <gateway>`), domain blocklists, and `nftset` domain routing (`route <domain> via <gw>`, `bypass <domain> from <gw>`). |
-| **Cloudflare Tunnels** | `features/cloudflare.rs` | `cloudflare-dns <fqdn>` provisions remotely-managed Cloudflare Tunnels, ingress rules, and proxied CNAME records. Supports Cloudflare Access email/domain policies (`cloudflare-auth *@example.com`) and HTTP Basic Auth (`auth <user:pass\|nfty>`). |
+| **Cloudflare Tunnels** | `features/cloudflare.rs` | `cloudflare-dns <fqdn>` provisions Cloudflare Tunnels, ingress rules, and proxied CNAME records. `cloudflare-auth` supports Access email/domain policies; local service `auth` is currently rejected on apply. |
 | **Web Console & Control API** | `api.rs` | `web:<port>` serves the embedded 8-tab Web Console (`GET /`) with IP allow-list authentication; `api:<port>` serves the headless JSON API (`/api/v1/*`) with `rw` and `ro` scoped API keys and automatic secret redaction (`<redacted-rw-key>`). |
 | **PID-1 Unikernel & Container Runtime** | `unikernel.rs` / `ssh.rs` | Boots as `/sbin/init`, mounts `/proc`, `/sys`, `/dev`, and persistent `/data`, runs an embedded SSH2 server (`russh`) with first-login password rotation, and provides a `ratatui` terminal dashboard (`watch`). |

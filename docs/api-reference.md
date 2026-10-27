@@ -66,22 +66,22 @@ You can generate cryptographically random `rw` or `ro` keys directly inside `con
 
 ```text
 nfty> configure
-nfty(config)# vip 169.254.1.4
-nfty(config-vip:169.254.1.4)# api:9090
-nfty(config-vip:169.254.1.4-api:9090)# key new rw
-Generated new rw API key on vip 169.254.1.4 api:9090:
+nfty(config)# vip 192.168.1.4
+nfty(config-vip:192.168.1.4)# api:9090
+nfty(config-vip:192.168.1.4-api:9090)# key new rw
+Generated new rw API key on vip 192.168.1.4 api:9090:
   nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b
-nfty(config-vip:169.254.1.4-api:9090)# key new ro
-Generated new ro API key on vip 169.254.1.4-api:9090:
+nfty(config-vip:192.168.1.4-api:9090)# key new ro
+Generated new ro API key on vip 192.168.1.4-api:9090:
   nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a
-nfty(config-vip:169.254.1.4-api:9090)# apply
+nfty(config-vip:192.168.1.4-api:9090)# apply
 ```
 
 ### Kernel `nftables` Input Chain Protection
 
 When one or more `api:<port>` blocks are configured on VIPs or Gateways, the `nfty` compiler automatically emits strict kernel `nftables` rules in `table ip nfty -> chain input`:
 - Traffic to `tcp dport <port>` is **accepted** only when the destination IP (`ip daddr`) matches the specific VIP or Gateway IP where `api:<port>` is declared (and passes the global `allow` set if configured).
-- Traffic to `tcp dport <port>` destined for any other IP on the host is **dropped** at the kernel firewall layer (`ip daddr != { 169.254.1.4 } tcp dport 9090 drop`).
+- Traffic to `tcp dport <port>` destined for any other IP on the host is **dropped** at the kernel firewall layer (`ip daddr != { 192.168.1.4 } tcp dport 9090 drop`).
 
 ---
 
@@ -103,19 +103,19 @@ Clients can present their API key using any of the following four standard mecha
    *(Also accepts `X-Nfty-Key: <key>`)*
 3. **HTTP Basic Auth**:
    ```bash
-   curl -u admin:nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b http://169.254.1.4:9090/api/v1/status
+   curl -u admin:nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b http://192.168.1.4:9090/api/v1/status
    ```
    *(Any username is accepted; the password field is verified as the API key)*
 4. **URL Query Parameter** (Convenient for browser bookmarks and Prometheus/Grafana scrapers):
    ```text
-   http://169.254.1.4:9090/api/v1/status?key=nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a
+   http://192.168.1.4:9090/api/v1/status?key=nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a
    ```
    *(Also accepts `?api_key=<key>` or `?token=<key>`)*
 
 > [!NOTE]
 > **Loopback & Unconfigured Key Behavior**
-> - Requests originating from non-loopback addresses **always** require a valid API key (`401 Unauthorized` if no keys are configured or if the key is missing/invalid).
-> - Once any API key is configured on any VIP or Gateway, external and loopback HTTP requests alike must supply a valid key (local CLI IPC over loopback uses an internal loopback-restricted header).
+> - Remote clients must pass the receiving listener's IP allow-list. A listener with no configured keys grants allow-listed clients read-write access; a keyed listener requires a matching key or appliance credential.
+> - On a shared port, a key must be accepted by every keyed listener on that port and receives the least privilege granted by them. Loopback CLI IPC uses an internal header that grants read-write access without a key. Any local process able to reach the listener can send that header, so local processes must be trusted.
 
 ### Permission Scopes & Secret Redaction (`rw` vs `ro`)
 
@@ -173,14 +173,14 @@ Navigating to `http://192.168.1.4:8000/` (or `/dashboard`, `/ui`, `/index.html`)
 | `POST` | `/api/v1/auth/login` | Public | Exchanges an API key or appliance username/password (`nfty`) for a session token and scope. |
 | `GET` | `/api/v1/status` (or `/status`) | `ro` | Full appliance snapshot: config, backend health/RTT, active backends, flows, WireGuard profiles, and compiled `nftables` ruleset. |
 | `GET` | `/api/v1/config` | `ro` | Returns structured JSON and formatted `Nftyfile` text for both `running` and `candidate` configs. |
-| `PUT` | `/api/v1/config` | `rw` | Parses a raw `Nftyfile` payload, reconciles VIPs/VLANs, and atomically applies it to the running configuration and kernel. |
+| `PUT` | `/api/v1/config` | `rw` | Parses and applies an `Nftyfile` with checked operations and best-effort restoration; the overall apply is not atomic. |
 | `GET` | `/api/v1/nft` | `ro` | Returns the compiled kernel `nftables` script (`table ip nfty` and `table netdev nfty_ingress`). |
 | `GET` | `/api/v1/flows` | `ro` | Returns active NAT connections parsed from `/proc/net/nf_conntrack`. |
-| `GET`, `POST` | `/api/v1/scan` | `rw` | Runs an asynchronous TCP service & ARP/rDNS discovery scan across local subnets or a specified target CIDR/host. |
+| `GET`, `POST` | `/api/v1/scan` | `rw` | Scans known local targets or a specified host or `/24`–`/32` CIDR for TCP services, with neighbor/rDNS discovery. |
 | `GET` | `/api/v1/wg` | `ro` | Lists saved WireGuard `.conf` profiles in `/data/wg/` (`PrivateKey` redacted for `ro`). |
 | `POST` | `/api/v1/wg` | `rw` | Uploads and validates a WireGuard `.conf` profile into `/data/wg/<name>.conf`. |
 | `GET` | `/api/v1/cloudflare` (or `/api/v1/cf`) | `ro` | Returns `cloudflared` daemon status, tunnel metadata, and active `cloudflare-dns` / `cloudflare-auth` routes. |
-| `POST` | `/api/v1/cloudflare` (or `/api/v1/cf`) | `rw` | Updates Cloudflare API/tunnel credentials in `/data/cloudflare.env` and reconciles the tunnel. |
+| `POST` | `/api/v1/cloudflare` (or `/api/v1/cf`) | `rw` | Updates Cloudflare API/tunnel credentials in `/data/cloudflare.json` and reconciles the tunnel. |
 | `GET` | `/api/v1/allow` | `ro` | Returns global allowlists, per-service allowlists, resolved DNS host mappings, and expanded `nftables` IP sets. |
 | `POST`, `PUT` | `/api/v1/allow` | `rw` | Appends (`POST`) or replaces (`PUT`) global or per-service allowlist entries and optionally applies to the kernel. |
 | `DELETE` | `/api/v1/allow` | `rw` | Removes specified entries from the global or per-service allowlist. |
@@ -205,17 +205,17 @@ Returns the complete operational state of the appliance.
 **Request:**
 ```bash
 curl -s -H "Authorization: Bearer nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
-  http://169.254.1.4:9090/api/v1/status
+  http://192.168.1.4:9090/api/v1/status
 ```
 
 **Response (`200 OK`):**
 ```json
 {
   "running": {
-    "global_allow": ["169.254.1.0/24"],
+    "global_allow": ["192.168.1.0/24"],
     "vips": {
-      "169.254.1.4": {
-        "ip": "169.254.1.4",
+      "192.168.1.4": {
+        "ip": "192.168.1.4",
         "prefix": 24,
         "interface": "eth0",
         "vlan": null,
@@ -231,23 +231,23 @@ curl -s -H "Authorization: Bearer nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
       }
     },
     "services": {
-      "169.254.1.4:443": {
-        "key": "169.254.1.4:443",
+      "192.168.1.4:443": {
+        "key": "192.168.1.4:443",
         "name": "https",
-        "vip": "169.254.1.4",
+        "vip": "192.168.1.4",
         "listen_port": 443,
         "proto": "tcp",
         "mode": "dnat",
         "balance": { "Sticky": { "timeout_secs": 1800 } },
         "backends": [
-          { "ip": "169.254.1.21", "port": 443, "weight": 2, "backup": false },
-          { "ip": "169.254.1.22", "port": 443, "weight": 1, "backup": false }
+          { "ip": "192.168.1.21", "port": 443, "weight": 2, "backup": false },
+          { "ip": "192.168.1.22", "port": 443, "weight": 1, "backup": false }
         ]
       }
     }
   },
   "runtime": {
-    "169.254.1.21:443": {
+    "192.168.1.21:443": {
       "healthy": true,
       "drained": false,
       "last_rtt_ms": 0.84,
@@ -255,7 +255,7 @@ curl -s -H "Authorization: Bearer nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
       "consecutive_successes": 142,
       "consecutive_failures": 0
     },
-    "169.254.1.22:443": {
+    "192.168.1.22:443": {
       "healthy": true,
       "drained": false,
       "last_rtt_ms": 1.12,
@@ -265,16 +265,16 @@ curl -s -H "Authorization: Bearer nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
     }
   },
   "active_backends": {
-    "169.254.1.4:443": ["169.254.1.21:443", "169.254.1.22:443"]
+    "192.168.1.4:443": ["192.168.1.21:443", "192.168.1.22:443"]
   },
   "resolved_hosts": {},
   "flows": [
     {
       "proto": "tcp",
       "state": "ESTABLISHED",
-      "src": "169.254.1.105:54322",
-      "dst": "169.254.1.4:443",
-      "backend": "169.254.1.21:443",
+      "src": "192.168.1.105:54322",
+      "dst": "192.168.1.4:443",
+      "backend": "192.168.1.21:443",
       "packets": 48,
       "bytes": 19420
     }
@@ -290,14 +290,14 @@ curl -s -H "Authorization: Bearer nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
 ### `GET /api/v1/config` & `PUT /api/v1/config`
 
 - **`GET /api/v1/config`** (`ro` or `rw`): Retrieves both `running` and `candidate` configurations as structured JSON and canonical `Nftyfile` text.
-- **`PUT /api/v1/config`** (`rw` only): Replaces the entire configuration with a raw `Nftyfile` body, reconciles VIP IP addresses and VLAN interfaces, snapshots the prior running configuration into the rollback history, and atomically applies the new ruleset to the kernel.
+- **`PUT /api/v1/config`** (`rw` only): Applies a raw `Nftyfile`, snapshots the prior running configuration, and persists the configured file. VIPs, tunnels, DNS, Cloudflare and storage are not a single transaction; on failure, restoration is best-effort. A persistence error may be reported after the dataplane changed.
 
 **Example — Replacing the Configuration via `PUT /api/v1/config`:**
 ```bash
 curl -s -X PUT \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
   --data-binary @/data/Nftyfile \
-  http://169.254.1.4:9090/api/v1/config
+  http://192.168.1.4:9090/api/v1/config
 ```
 
 **Response (`200 OK`):**
@@ -316,7 +316,7 @@ Returns the exact `nftables` ruleset compiled from the active configuration and 
 
 ```bash
 curl -s -H "X-API-Key: nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
-  http://169.254.1.4:9090/api/v1/nft
+  http://192.168.1.4:9090/api/v1/nft
 ```
 
 **Response (`200 OK`):**
@@ -334,7 +334,7 @@ Reads `/proc/net/nf_conntrack` and returns all active NAT connections tracked by
 
 ```bash
 curl -s -H "X-API-Key: nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
-  http://169.254.1.4:9090/api/v1/flows
+  http://192.168.1.4:9090/api/v1/flows
 ```
 
 **Response (`200 OK`):**
@@ -345,9 +345,9 @@ curl -s -H "X-API-Key: nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
     {
       "proto": "tcp",
       "state": "ESTABLISHED",
-      "src": "169.254.1.105:54322",
-      "dst": "169.254.1.4:443",
-      "backend": "169.254.1.21:443",
+      "src": "192.168.1.105:54322",
+      "dst": "192.168.1.4:443",
+      "backend": "192.168.1.21:443",
       "packets": 48,
       "bytes": 19420
     }
@@ -365,21 +365,21 @@ Returns the global allowlist, per-service allowlists, dynamically resolved DNS h
 
 ```bash
 curl -s -H "X-API-Key: nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
-  http://169.254.1.4:9090/api/v1/allow
+  http://192.168.1.4:9090/api/v1/allow
 ```
 
 **Response (`200 OK`):**
 ```json
 {
-  "global_allow": ["169.254.1.0/24", "*.office.lan"],
+  "global_allow": ["192.168.1.0/24", "*.office.lan"],
   "service_allow": {
-    "169.254.1.4:443": ["10.20.0.0/16"]
+    "192.168.1.4:443": ["10.20.0.0/16"]
   },
   "resolved_hosts": {
-    "laptop.office.lan": ["169.254.1.150"]
+    "laptop.office.lan": ["192.168.1.150"]
   },
   "expanded_service_sets": {
-    "169.254.1.4:443": ["169.254.1.0/24", "169.254.1.150", "10.20.0.0/16"]
+    "192.168.1.4:443": ["192.168.1.0/24", "192.168.1.150", "10.20.0.0/16"]
   }
 }
 ```
@@ -388,7 +388,7 @@ curl -s -H "X-API-Key: nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
 
 ### `POST /api/v1/allow`, `PUT /api/v1/allow` & `DELETE /api/v1/allow`
 
-Modifies the global allowlist (when `service` is omitted or `null`) or a specific service's allowlist (when `service` is set to e.g. `"169.254.1.4:443"`):
+Modifies the global allowlist (when `service` is omitted or `null`) or a specific service's allowlist (when `service` is set to e.g. `"192.168.1.4:443"`):
 - `POST /api/v1/allow`: Appends new entries without removing existing entries.
 - `PUT /api/v1/allow`: Replaces the target allowlist with the provided `hosts` array.
 - `DELETE /api/v1/allow`: Removes matching entries from the target allowlist.
@@ -407,22 +407,27 @@ Modifies the global allowlist (when `service` is omitted or `null`) or a specifi
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
   -d '{"hosts": ["10.50.0.0/16", "admin-ws.office.lan"], "apply": true}' \
-  http://169.254.1.4:9090/api/v1/allow
+  http://192.168.1.4:9090/api/v1/allow
 ```
 
 ---
 
 ### `POST /api/v1/allow/hosts` & `POST /api/v1/allow/refresh`
 
-- **`POST /api/v1/allow/hosts`** (or `PUT`): Dynamically registers or updates a hostname-to-IPv4 mapping in memory (ideal for DHCP hooks or dynamic client registration matching wildcard allow rules like `*.office.lan`) and immediately reloads the kernel `nftables` allow sets. Passing an empty `ips: []` array removes the host mapping.
+- **`POST /api/v1/allow/hosts`** (or `PUT`): Registers or updates a concrete hostname-to-IPv4 mapping, persists it in `/data/hosts.json`, and reloads the active dataplane. Passing an empty `ips: []` removes the registered mapping. A hostname independently discovered from DNS or `/etc/hosts` may later reappear; persistence errors are reported.
 - **`POST /api/v1/allow/refresh`**: Triggers an immediate DNS resolution pass for all hostnames and wildcard patterns in global and service allowlists.
+
+Registered mappings take precedence over automatically discovered addresses.
+Automatic discoveries are runtime cache entries, not persistent registrations.
+Updating a mapping requires `/data`; it may already be active if persistence
+or controller notification fails.
 
 **Example (`POST /api/v1/allow/hosts`):**
 ```bash
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
-  -d '{"host": "dev-laptop.office.lan", "ips": ["169.254.1.188"]}' \
-  http://169.254.1.4:9090/api/v1/allow/hosts
+  -d '{"host": "dev-laptop.office.lan", "ips": ["192.168.1.188"]}' \
+  http://192.168.1.4:9090/api/v1/allow/hosts
 ```
 
 ---
@@ -440,15 +445,15 @@ Gracefully drains or undrains (re-enables) a backend `<ip:port>` across all serv
 ```bash
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
-  -d '{"backend": "169.254.1.21:443"}' \
-  http://169.254.1.4:9090/api/v1/backends/drain
+  -d '{"backend": "192.168.1.21:443"}' \
+  http://192.168.1.4:9090/api/v1/backends/drain
 ```
 
 **Drain Response (`200 OK`):**
 ```json
 {
   "ok": true,
-  "backend": "169.254.1.21:443",
+  "backend": "192.168.1.21:443",
   "drained": true
 }
 ```
@@ -457,15 +462,15 @@ curl -s -X POST \
 ```bash
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
-  -d '{"backend": "169.254.1.21:443"}' \
-  http://169.254.1.4:9090/api/v1/backends/undrain
+  -d '{"backend": "192.168.1.21:443"}' \
+  http://192.168.1.4:9090/api/v1/backends/undrain
 ```
 
 **Undrain Response (`200 OK`):**
 ```json
 {
   "ok": true,
-  "backend": "169.254.1.21:443",
+  "backend": "192.168.1.21:443",
   "drained": false
 }
 ```
@@ -479,7 +484,7 @@ Forces an immediate out-of-band health check cycle across all configured backend
 ```bash
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
-  http://169.254.1.4:9090/api/v1/probe
+  http://192.168.1.4:9090/api/v1/probe
 ```
 
 **Response (`200 OK`):**
@@ -488,8 +493,8 @@ curl -s -X POST \
   "ok": true,
   "outcomes": [
     {
-      "service": "169.254.1.4:443",
-      "backend": "169.254.1.21:443",
+      "service": "192.168.1.4:443",
+      "backend": "192.168.1.21:443",
       "healthy": true,
       "rtt_ms": 0.79,
       "error": null
@@ -504,13 +509,13 @@ curl -s -X POST \
 
 ### `GET /api/v1/scan` & `POST /api/v1/scan` (`rw` Scope Required)
 
-Scans local `/24` subnets (or a target CIDR/host passed in the request body of `POST /api/v1/scan`) for open TCP services, ARP MAC addresses, and reverse DNS hostnames.
+Scans known local targets (or a `/24`–`/32` CIDR/host in the `POST` body) for open TCP services and reverse DNS hostnames. Discovery does not register host mappings in the allow-list cache.
 
 ```bash
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
-  -d '169.254.1.0/24' \
-  http://169.254.1.4:9090/api/v1/scan
+  -d '192.168.1.0/24' \
+  http://192.168.1.4:9090/api/v1/scan
 ```
 
 **Response (`200 OK`):**
@@ -519,7 +524,7 @@ curl -s -X POST \
   "ok": true,
   "discovered": [
     {
-      "ip": "169.254.1.21",
+      "ip": "192.168.1.21",
       "hostname": "k8s-worker-01.lan",
       "mac": "00:16:3e:a1:b2:c3",
       "interface": "eth0",
@@ -548,7 +553,7 @@ curl -s -X POST \
     "name": "wg-mullvad-us1.conf",
     "config": "[Interface]\nPrivateKey = YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=\nAddress = 10.64.0.2/32\n\n[Peer]\nPublicKey = YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI=\nEndpoint = 198.51.100.10:51820\nAllowedIPs = 0.0.0.0/0\n"
   }' \
-  http://169.254.1.4:9090/api/v1/wg
+  http://192.168.1.4:9090/api/v1/wg
 ```
 
 ---
@@ -566,7 +571,7 @@ curl -s -X POST \
     "account_id": "0123456789abcdef0123456789abcdef",
     "tunnel_name": "nfty-edge-tunnel"
   }' \
-  http://169.254.1.4:9090/api/v1/cloudflare
+  http://192.168.1.4:9090/api/v1/cloudflare
 ```
 
 ---
@@ -581,9 +586,9 @@ Executes any interactive CLI command sequence (separated by `;` or newlines) sta
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
   -d '{
-    "command": "vip 169.254.1.4; service redis:6379; balance sticky 10m; to 169.254.1.41:6379 weight 2; to 169.254.1.42:6379 backup; apply; save"
+    "command": "vip 192.168.1.4; service redis:6379; balance sticky 10m; to 192.168.1.41:6379 weight 2; to 192.168.1.42:6379 backup; apply; save"
   }' \
-  http://169.254.1.4:9090/api/v1/cli
+  http://192.168.1.4:9090/api/v1/cli
 ```
 
 **Response (`200 OK`):**
@@ -592,7 +597,7 @@ curl -s -X POST \
   "ok": true,
   "candidate": { "...": "..." },
   "running": { "...": "..." },
-  "nftyfile": "allow {\n  169.254.1.0/24\n}\n..."
+  "nftyfile": "allow {\n  192.168.1.0/24\n}\n..."
 }
 ```
 
@@ -603,13 +608,13 @@ Validates the current `candidate` configuration via `nft -c -f -` dry-run and co
 ```bash
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
-  http://169.254.1.4:9090/api/v1/apply
+  http://192.168.1.4:9090/api/v1/apply
 ```
 
 ### `GET /api/v1/services` & `/api/v1/services/<key>`
 
 Provides direct RESTful CRUD operations on individual service objects:
 - `GET /api/v1/services`: Lists all services in the configuration.
-- `GET /api/v1/services/169.254.1.4:443`: Returns the JSON representation of service `169.254.1.4:443`.
-- `PUT /api/v1/services/169.254.1.4:443`: Creates or replaces a service object and reloads the kernel ruleset.
-- `DELETE /api/v1/services/169.254.1.4:443`: Deletes the service and reloads the kernel ruleset.
+- `GET /api/v1/services/192.168.1.4:443`: Returns the JSON representation of service `192.168.1.4:443`.
+- `PUT /api/v1/services/192.168.1.4:443`: Creates or replaces a service object and reloads the kernel ruleset.
+- `DELETE /api/v1/services/192.168.1.4:443`: Deletes the service and reloads the kernel ruleset.

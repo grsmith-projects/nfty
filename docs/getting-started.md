@@ -9,7 +9,7 @@ This guide covers building **`nfty`** from source, deploying it across all four 
 ### Host Build Requirements
 
 - **Operating System**: Linux (`x86_64` or `aarch64`), Kernel 5.10+ with `nf_tables` enabled.
-- **Rust Toolchain**: Rust `1.75+` (`cargo`, `rustup`).
+- **Rust Toolchain**: Recent stable Rust and Cargo supporting the checked-in version-4 lockfile. The minimum supported version has not been established.
 - **Static Musl Target** (for LXD appliance containers and bootable unikernel images):
   ```bash
   rustup target add x86_64-unknown-linux-musl
@@ -139,21 +139,21 @@ lxc config device add nfty data disk pool=default source=nfty-data path=/data
 lxc start nfty
 ```
 
-#### Automated Remote Deployment & Zero-Downtime Upgrades (`deploy-lxd.sh`)
+#### Automated Remote Deployment (`deploy-lxd.sh`)
 
 To build the latest LXD container image and roll it out to a remote LXD host while preserving `/data` (`Nftyfile`, `auth.json`, `hosts.json`, `cloudflare.json`, and `/data/wg/*.conf`) and the container's MAC/IP address:
 
 ```bash
 ./packaging/deploy-lxd.sh <lxd-host-ip> [instance-name]
 
-# Example deploying to LXD host 169.254.1.3:
-./packaging/deploy-lxd.sh 169.254.1.3 nfty
+# Example deploying to LXD host 192.168.1.3:
+./packaging/deploy-lxd.sh 192.168.1.3 nfty
 ```
 
 `packaging/deploy-lxd.sh` automatically:
 1. Runs `./packaging/unikernel/build-unikernel.sh`.
 2. Uploads `dist/lxd-container/lxd.tar.gz` and `rootfs.tar.gz` to the LXD host.
-3. Ensures the persistent LXD storage volume (`default/<instance>-data`) exists and migrates any existing `/data` files into it if not already attached.
+3. Ensures the persistent LXD storage volume (`default/<instance>-data`) exists and migrates existing `/data` files only into a newly created volume. An existing unattached volume requires operator inspection.
 4. Executes `lxc rebuild nfty-ct-staging <instance> --force`, replacing the rootfs while keeping `/data` intact.
 
 ---
@@ -238,6 +238,11 @@ When the RK3588S board powers on:
 2. `nfty` boots as PID 1 (`/init`), loads kernel modules (`nf_tables`, `wireguard`, `8021q`, `macvlan`, `r8169`, `stmmac`, `nvme`), and mounts Partition 2 (`LABEL=nfty-data`) at `/data`.
 3. `eth0` automatically acquires an IPv4 lease via `udhcpc`, and the console shell starts on serial UART (`ttyS2` / `ttyFIQ0` at `1500000` baud) and HDMI (`tty0`).
 
+On other PID-1 installations, persistent storage must already contain a single
+ext filesystem labeled `nfty-data`. Unlabeled or ambiguous disks are not
+formatted automatically; without a usable volume, `/data` is ephemeral. An
+existing empty `Nftyfile` is intentional and is not replaced with the seed.
+
 ---
 
 ## 3. First-Boot Default DHCP Gateway & SSH Login
@@ -253,7 +258,7 @@ gateway default {
 }
 ```
 
-When the appliance boots, `nfty` automatically creates the `mv-default` `macvlan` interface on `eth0`, acquires a DHCP lease (advertising hostname `default`), applies the kernel `nftables` ruleset, and exposes SSH on port 22 so you can always connect right away:
+When the appliance boots, `nfty` requests a DHCP lease on the primary interface for `default`, applies the kernel `nftables` ruleset, and exposes SSH on port 22 when networking is available:
 
 ```bash
 ssh nfty@default
@@ -267,21 +272,21 @@ If you prefer a static Virtual IP instead of the default DHCP gateway, the `boot
 From an LXD host:
 
 ```bash
-lxc exec nfty -- nfty -c "bootstrap 169.254.10.10/24 dev eth0"
+lxc exec nfty -- nfty -c "bootstrap 192.168.10.10/24 dev eth0"
 ```
 
 Or from the serial/VM console (`lxc console nfty`):
 
 ```text
-nfty> bootstrap 169.254.10.10/24 dev eth0
-  ✔ Bootstrapped VIP 169.254.10.10/24 on eth0 (created base config 'service 169.254.10.10:22' with SSH enabled)
-  → ip addr replace 169.254.10.10/24 dev eth0
+nfty> bootstrap 192.168.10.10/24 dev eth0
+  ✔ Bootstrapped VIP 192.168.10.10/24 on eth0 (created base config 'service 192.168.10.10:22' with SSH enabled)
+  → ip addr replace 192.168.10.10/24 dev eth0
 ```
 
 This creates `/data/Nftyfile`:
 
 ```hcl
-vip 169.254.10.10/24 {
+vip 192.168.10.10/24 {
     ssh:22 {
         check tcp 5s
         limit 30/min burst 10 per-ip
@@ -296,7 +301,7 @@ vip 169.254.10.10/24 {
 Connect to the bootstrapped VIP using any standard SSH client:
 
 ```bash
-ssh nfty@169.254.10.10
+ssh nfty@192.168.10.10
 ```
 
 - **Default Username**: `nfty`
@@ -334,7 +339,7 @@ Credentials are stored in `/data/auth.json` with `0600` permissions using a salt
 }
 ```
 
-You can rotate the appliance password at any time from the interactive CLI by running `password` (or `passwd`), and you can reuse the `nfty` credential for HTTP Basic Auth on services by specifying `auth nfty`.
+You can rotate the appliance password from the interactive CLI with `password` (or `passwd`). Local service `auth` directives are currently rejected on apply because authentication cannot yet be guaranteed on every dataplane path.
 
 ---
 
@@ -344,25 +349,28 @@ You can rotate the appliance password at any time from the interactive CLI by ru
 
 1. **Automatic Config Path Resolution**:
    When invoked without `--file`, `nfty` automatically locates your configuration file in the following order:
+   - `./Nftyfile` (Current working directory, if it exists)
    - `/data/Nftyfile` (Appliance / Unikernel / LXD persistent volume)
-   - `./Nftyfile` (Current working directory)
    - `/etc/nfty/Nftyfile` (Standalone Linux daemon path)
 2. **Automatic Daemon IPC Sync**:
-   When you run `nfty` from a secondary SSH session or `lxc exec` shell (where `PID != 1`), any configuration changes you apply are atomically written to `/data/Nftyfile` **and** pushed over loopback IPC (`127.0.0.1:9090`) to the running daemon so background health checkers, `dnsmasq`, and proxy supervisors update immediately.
+   A secondary session persists changes to its configured `Nftyfile` and notifies the controller over its configured API bind address (loopback for a wildcard bind). A notification failure is reported as an error after the local apply and save; multi-process updates are not atomic.
 
 ### Common CLI Invocations
 
 | Command | Description |
 | :--- | :--- |
-| `nfty` (or `nfty shell`) | Starts the interactive hierarchical router shell (`nfty>`) and connects to/spawns background health checks and API listeners. |
-| `nfty status` | Refreshes DNS allow-lists, runs an immediate health probe pass across all backends and WireGuard tunnels, and prints the colorized service/gateway status table. |
+| `nfty` (or `nfty shell`) | Starts an interactive shell with process-local state. The long-running controller owns background health checks and API listeners. |
+| `nfty status` | Prints a service/gateway status table from the invocation's local state. |
 | `nfty diff` | Compares the candidate configuration with the active running configuration and prints a colorized unified diff. |
-| `nfty reload` (or `nfty apply`) | Reconciles VIPs/VLANs/DHCP interfaces, compiles `Nftyfile`, applies it atomically to kernel `nftables`, and persists state to `/data`. |
-| `nfty watch` | Opens the live interactive `ratatui` terminal dashboard (TUI) with real-time packet/byte counters, latency, and live `nftables` verdict map inspection. |
+| `nfty apply` | Reconciles VIPs/VLANs/DHCP interfaces, applies the ruleset, and persists the configured file. The broader dataplane changes are not atomic. |
+| `nfty watch` | Opens the TUI with local probes and kernel-counter reads. A secondary dashboard does not share the controller's live health or drain state. |
 | `nfty validate` | Validates `Nftyfile` syntax and runs a kernel `nft -c -f -` dry-run check (exits `0` on success, `1` on error). |
 | `nfty compile` | Compiles `Nftyfile` and prints the complete generated `#!/usr/sbin/nft -f` ruleset (`table ip nfty`) to `stdout`. |
 | `nfty daemon` | Runs headless in the foreground (applies config, runs active health probes, supervises `dnsmasq` / `cloudflared` / proxies, and serves the HTTP API). |
-| `nfty "<commands>"` (or `nfty -c "<commands>"`) | Executes semicolon-separated CLI commands non-interactively and exits. |
+| `nfty -c "<commands>"` | Executes semicolon-separated CLI commands non-interactively and exits. |
+
+For the standalone systemd service, `systemctl reload nfty` sends SIGHUP. Reload
+runs asynchronously; inspect the service log for validation or apply errors.
 
 ### One-Shot Non-Interactive Scripting (`-c` / `--command`)
 

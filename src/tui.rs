@@ -1,4 +1,4 @@
-use crate::compiler::{compile_nft_ruleset, reload_kernel_from_state};
+use crate::compiler::compile_nft_ruleset;
 use crate::health::{poll_kernel_counters, run_all_probes_once};
 use crate::state::{HealthState, SharedState};
 use anyhow::Result;
@@ -233,11 +233,14 @@ pub async fn run_watch_dashboard(shared: SharedState) -> Result<()> {
                             if let Some(sel) = table_state.selected() {
                                 if let Some(row) = rows.get(sel) {
                                     let ep = row.endpoint.clone();
-                                    let mut st = shared.write().unwrap();
-                                    st.runtime.entry(ep.clone()).or_default().drained = true;
-                                    let _ = reload_kernel_from_state(&mut st);
-                                    status_banner =
-                                        format!("Drained backend {} and updated nftables map", ep);
+                                    status_banner = match crate::unikernel::dispatch_backend_drain_state(
+                                        &shared,
+                                        &[ep.clone()],
+                                        true,
+                                    ) {
+                                        Ok(()) => format!("Drained backend {} and updated nftables map", ep),
+                                        Err(e) => format!("Failed to drain {}: {:#}", ep, e),
+                                    };
                                 }
                             }
                         }
@@ -245,11 +248,14 @@ pub async fn run_watch_dashboard(shared: SharedState) -> Result<()> {
                             if let Some(sel) = table_state.selected() {
                                 if let Some(row) = rows.get(sel) {
                                     let ep = row.endpoint.clone();
-                                    let mut st = shared.write().unwrap();
-                                    st.runtime.entry(ep.clone()).or_default().drained = false;
-                                    let _ = reload_kernel_from_state(&mut st);
-                                    status_banner =
-                                        format!("Enabled backend {} and updated nftables map", ep);
+                                    status_banner = match crate::unikernel::dispatch_backend_drain_state(
+                                        &shared,
+                                        &[ep.clone()],
+                                        false,
+                                    ) {
+                                        Ok(()) => format!("Enabled backend {} and updated nftables map", ep),
+                                        Err(e) => format!("Failed to enable {}: {:#}", ep, e),
+                                    };
                                 }
                             }
                         }
