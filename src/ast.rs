@@ -1010,7 +1010,10 @@ impl Gateway {
         if let Some(vip) = &self.vip {
             if vip.dhcp {
                 out.push_str(&format!("    dhcp {}\n", vip.interface));
-            } else if vip.interface != "eth0" || vip.prefix_len != 24 {
+            } else if vip.interface != "eth0"
+                || vip.prefix_len != 24
+                || default_eth0_prefix_len() != 24
+            {
                 if vip.prefix_len == 32 && vip.interface != "eth0" {
                     out.push_str(&format!("    interface {}\n", vip.interface));
                 } else {
@@ -1778,7 +1781,10 @@ impl Config {
         if let Some(v) = vip_cfg {
             if v.dhcp {
                 out.push_str(&format!("    dhcp {}\n", v.interface));
-            } else if v.interface != "eth0" || v.prefix_len != 24 {
+            } else if v.interface != "eth0"
+                || v.prefix_len != 24
+                || default_eth0_prefix_len() != 24
+            {
                 if v.prefix_len == 32 && v.interface != "eth0" {
                     out.push_str(&format!("    interface {}\n", v.interface));
                 } else {
