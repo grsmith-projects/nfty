@@ -1,7 +1,9 @@
 # nfty
 
 [![Build & Tests](https://github.com/grsmith-projects/nfty/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/grsmith-projects/nfty/actions/workflows/rust.yml)
+[![Security Audit](https://github.com/grsmith-projects/nfty/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/grsmith-projects/nfty/actions/workflows/audit.yml)
 [![Latest Release](https://img.shields.io/github/v/release/grsmith-projects/nfty)](https://github.com/grsmith-projects/nfty/releases/latest)
+[![License](https://img.shields.io/github/license/grsmith-projects/nfty)](LICENSE)
 
 `nfty` is a Linux L4/L7 load balancer, virtual IP (VIP) appliance, and policy-routing egress gateway (direct Internet NAT or multi-tunnel WireGuard) written in Rust. It compiles a declarative configuration file (`Nftyfile`) or interactive router-style CLI session into atomic kernel `nftables` rulesets (`table ip nfty`), manages static and DHCP `macvlan` virtual IPs (including 802.1Q VLAN sub-interfaces), runs active backend health checks, and boots directly as PID 1 inside a minimal LXD container, UEFI unikernel VM, or bare-metal ARM64 SBC.
 
