@@ -343,6 +343,7 @@ A `gateway` block provisions a Virtual Gateway IP (either a static IPv4 like `ga
 | `dns:<port>` | `dns:53` (or `dns`) | Disabled | Binds `dnsmasq` to the gateway IP and routes upstream DNS queries through the gateway's healthy WireGuard tunnel (`server=<ip>@wgN`). |
 | `api:<port>` | `api:9090 { key ... }` | Disabled | Enables the HTTP/JSON Control API on the gateway IP with optional scoped `ro`/`rw` keys. |
 | `forward` | `forward <port[/proto]> to <ip_or_host:port>` | None | Forwards inbound traffic arriving on the gateway's `wg*` interfaces on `<port>` (`tcp`, `udp`, or `both`) to a LAN backend, pinning the connection's `ct mark` so reply traffic returns out the exact same WireGuard tunnel. |
+| `wg-in:<port>` | `wg-in:51820 { ... }` (aliases: `wg-server:<port>`, `wireguard:<port>`) | Disabled | Configures a WireGuard Ingress VPN server (`ig0..igN`) on UDP `<port>` (default `51820`) for remote client dial-in or full-tunnel exit chaining. |
 | `allow` | `allow { <entry>... }` | None | Restricts which LAN client IPs/hosts are permitted to route or proxy through this gateway. |
 | `tunnels` | `tunnels { <tunnel>... }` | None | Attaches one or more file-based (`/data/wg/*.conf`) or inline WireGuard tunnels. |
 
@@ -381,6 +382,31 @@ gateway 192.168.10.20/24 {
 
         # 2. Inline WireGuard tunnel definition
         wg2 address 10.64.0.42/32 privkey YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE= peer YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI= endpoint 172.16.200.1:51820 weight 1
+    }
+}
+```
+
+### 5.4 `wg-in:<port> { ... }` WireGuard Ingress Server Sub-Block
+
+Inside a `gateway` block, `wg-in:<port> { ... }` configures an inbound WireGuard server (`ig0`, `ig1`, ...) on the gateway:
+
+| Sub-Directive | Syntax | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `subnet` / `address` | `subnet <ip/prefix>` | `10.99.<idx>.1/24` | Sets the WireGuard server interface address and client IP allocation pool (e.g., `10.99.0.1/24`). |
+| `endpoint` | `endpoint <host_or_ip[:port]>` | `<gateway_ip>:<port>` | Sets the public `Endpoint = <host>:<port>` embedded into generated client `.conf` files and QR codes. |
+| `dns` | `dns <ip\|off>` | Server tunnel IP (`10.99.0.1`) | Sets the `DNS = <ip>` server advertised in generated client `.conf` files (`dns off` omits `DNS =`). |
+| `split-tunnel` | `split-tunnel <full \| lan \| cidr...>` | `full` | Controls `AllowedIPs` in generated client configs (`full` -> `0.0.0.0/0`; `lan` -> tunnel subnet + gateway LAN CIDR; custom CIDRs -> tunnel subnet + listed CIDRs). |
+| `peer` | `peer <name> <ip/32> pubkey <b64> [psk <b64>] [keepalive <secs>]` | None | Registers a remote WireGuard client peer in `Nftyfile` (or use `peer add <name> [pubkey <b64>]` in the CLI to auto-allocate the next IP and generate keys/QR codes). |
+
+```hcl
+gateway 169.254.10.20/24 {
+    dns:53
+    wg-in:51820 {
+        subnet 10.99.0.1/24
+        endpoint vpn.example.com:51820
+        dns 10.99.0.1
+        split-tunnel full
+        peer phone 10.99.0.2/32 pubkey YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI= psk ZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGQ=
     }
 }
 ```

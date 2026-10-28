@@ -616,6 +616,10 @@ pub fn print_context_help(level: &ShellLevel) {
                 "api:9090 (or 'api')".yellow()
             );
             println!(
+                "  {:<32} Enable inbound WireGuard VPN server endpoint & manage peers",
+                "wg-in:51820 (or 'wg-in')".yellow()
+            );
+            println!(
                 "  {:<32} Forward inbound tunnel port (TCP+UDP) to LAN host",
                 "forward <port> to <host:port>".yellow()
             );
@@ -751,6 +755,63 @@ pub fn print_context_help(level: &ShellLevel) {
             println!("  {:<32} Remove a tunnel", "no <name>".yellow());
             println!(
                 "  {:<32} Return to gateway {} prompt",
+                ".. / up / exit".yellow(),
+                k
+            );
+        }
+        ShellLevel::GatewayWgIngress(k, p) => {
+            println!(
+                "{}",
+                format!(
+                    "Gateway '{}' WireGuard Ingress Endpoint Mode (nfty(config-gateway:{}-wg:{})#):",
+                    k, k, p
+                )
+                .bold()
+                .cyan()
+            );
+            println!(
+                "  {:<36} Add client peer (auto-generates keys, .conf & QR code)",
+                "peer add <name> [ip <ip>]".yellow()
+            );
+            println!(
+                "  {:<36} Add client peer with external public key",
+                "peer add <name> pubkey <base64>".yellow()
+            );
+            println!(
+                "  {:<36} Print copy/paste client .conf for peer",
+                "peer show <name>".yellow()
+            );
+            println!(
+                "  {:<36} Render terminal UTF-8 QR code for mobile WireGuard app",
+                "peer qr <name>".yellow()
+            );
+            println!(
+                "  {:<36} List configured peers & server public key",
+                "peer list".yellow()
+            );
+            println!(
+                "  {:<36} Remove a client peer",
+                "peer rm <name> (or 'no peer <name>')".yellow()
+            );
+            println!(
+                "  {:<36} Set tunnel interface IP/subnet (default: 10.99.0.1/24)",
+                "subnet <ip/prefix>".yellow()
+            );
+            println!(
+                "  {:<36} Set public endpoint host:port for client configs",
+                "endpoint <host:port>".yellow()
+            );
+            println!(
+                "  {:<36} Set DNS server IP for client configs",
+                "dns <ipv4>".yellow()
+            );
+            println!(
+                "  {:<36} Set client routing ('full' 0.0.0.0/0, 'lan', or CIDRs)",
+                "split-tunnel <full|lan|cidr...>".yellow()
+            );
+            println!("  {:<36} Show this gateway block", "show".yellow());
+            println!(
+                "  {:<36} Return to gateway {} prompt",
                 ".. / up / exit".yellow(),
                 k
             );

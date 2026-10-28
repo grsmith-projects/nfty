@@ -772,6 +772,172 @@ impl fmt::Display for GatewayPortForward {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WgSplitTunnelMode {
+    #[default]
+    Full,
+    Lan,
+    Custom(Vec<String>),
+}
+
+impl WgSplitTunnelMode {
+    pub fn allowed_ips_for_client(&self, server_addr: Ipv4Addr, prefix_len: u8) -> String {
+        match self {
+            WgSplitTunnelMode::Full => "0.0.0.0/0".to_string(),
+            WgSplitTunnelMode::Lan => {
+                "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16".to_string()
+            }
+            WgSplitTunnelMode::Custom(cidrs) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(prefix_len)).unwrap_or(0);
+                let net_ip = Ipv4Addr::from(u32::from(server_addr) & mask);
+                let subnet_cidr = format!("{}/{}", net_ip, prefix_len);
+                let mut list = Vec::new();
+                list.push(subnet_cidr);
+                for c in cidrs {
+                    if !list.iter().any(|x| x == c) {
+                        list.push(c.clone());
+                    }
+                }
+                list.join(", ")
+            }
+        }
+    }
+}
+
+impl fmt::Display for WgSplitTunnelMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WgSplitTunnelMode::Full => write!(f, "full"),
+            WgSplitTunnelMode::Lan => write!(f, "lan"),
+            WgSplitTunnelMode::Custom(cidrs) => write!(f, "{}", cidrs.join(" ")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WgIngressPeer {
+    pub name: String,
+    pub ip: Ipv4Addr,
+    pub public_key: String,
+    #[serde(default)]
+    pub preshared_key: Option<String>,
+}
+
+impl WgIngressPeer {
+    pub fn valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            && name != "."
+            && name != ".."
+    }
+}
+
+impl fmt::Display for WgIngressPeer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "peer {} {} pubkey {}", self.name, self.ip, self.public_key)?;
+        if let Some(psk) = &self.preshared_key {
+            write!(f, " psk {}", psk)?;
+        }
+        Ok(())
+    }
+}
+
+fn default_wg_in_port() -> u16 {
+    51820
+}
+
+fn default_wg_in_address() -> Ipv4Addr {
+    Ipv4Addr::new(10, 99, 0, 1)
+}
+
+fn default_wg_in_prefix() -> u8 {
+    24
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WgIngressConfig {
+    #[serde(default = "default_wg_in_port")]
+    pub port: u16,
+    #[serde(default = "default_wg_in_address")]
+    pub address: Ipv4Addr,
+    #[serde(default = "default_wg_in_prefix")]
+    pub prefix_len: u8,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub dns: Option<Ipv4Addr>,
+    #[serde(default)]
+    pub split_tunnel: WgSplitTunnelMode,
+    #[serde(default)]
+    pub peers: Vec<WgIngressPeer>,
+}
+
+impl Default for WgIngressConfig {
+    fn default() -> Self {
+        Self::new(51820)
+    }
+}
+
+impl WgIngressConfig {
+    pub fn new(port: u16) -> Self {
+        Self {
+            port,
+            address: default_wg_in_address(),
+            prefix_len: default_wg_in_prefix(),
+            endpoint: None,
+            dns: None,
+            split_tunnel: WgSplitTunnelMode::Full,
+            peers: Vec::new(),
+        }
+    }
+
+    pub fn subnet_cidr(&self) -> String {
+        let mask = u32::MAX
+            .checked_shl(32 - u32::from(self.prefix_len))
+            .unwrap_or(0);
+        let net_ip = Ipv4Addr::from(u32::from(self.address) & mask);
+        format!("{}/{}", net_ip, self.prefix_len)
+    }
+
+    pub fn next_available_ip(&self) -> Option<Ipv4Addr> {
+        let prefix = self.prefix_len.min(30);
+        let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+        let net = u32::from(self.address) & mask;
+        let bcast = net | !mask;
+        let server_u32 = u32::from(self.address);
+        for candidate in (net + 1)..bcast {
+            if candidate == server_u32 {
+                continue;
+            }
+            let ip = Ipv4Addr::from(candidate);
+            if !self.peers.iter().any(|p| p.ip == ip) {
+                return Some(ip);
+            }
+        }
+        None
+    }
+
+    pub fn format_block(&self) -> String {
+        let mut out = format!("    wg-in:{} {{\n", self.port);
+        out.push_str(&format!("        subnet {}/{}\n", self.address, self.prefix_len));
+        if let Some(ep) = &self.endpoint {
+            out.push_str(&format!("        endpoint {}\n", ep));
+        }
+        if let Some(dns_ip) = &self.dns {
+            out.push_str(&format!("        dns {}\n", dns_ip));
+        }
+        out.push_str(&format!("        split-tunnel {}\n", self.split_tunnel));
+        for peer in &self.peers {
+            out.push_str(&format!("        {}\n", peer));
+        }
+        out.push_str("    }\n");
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gateway {
     /// Virtual Gateway IPv4 address (e.g. "192.168.1.5")
@@ -791,6 +957,9 @@ pub struct Gateway {
     /// Inbound port forwards from the gateway's WireGuard tunnel interfaces to LAN backends (e.g. `forward 51413 to 192.168.20.10:51413`)
     #[serde(default)]
     pub forwards: Vec<GatewayPortForward>,
+    /// Optional inbound WireGuard server endpoint (`wg-in:51820 { ... }`)
+    #[serde(default)]
+    pub wg_ingress: Option<WgIngressConfig>,
     pub tunnels: Vec<WgTunnel>,
 }
 
@@ -810,6 +979,7 @@ impl Gateway {
             allow: Vec::new(),
             services: Vec::new(),
             forwards: Vec::new(),
+            wg_ingress: None,
             tunnels: Vec::new(),
         }
     }
@@ -829,6 +999,7 @@ impl Gateway {
             allow: Vec::new(),
             services: Vec::new(),
             forwards: Vec::new(),
+            wg_ingress: None,
             tunnels: Vec::new(),
         }
     }
@@ -885,6 +1056,9 @@ impl Gateway {
         }
         for fwd in &self.forwards {
             out.push_str(&format!("    {}\n", fwd));
+        }
+        if let Some(wg_in) = &self.wg_ingress {
+            out.push_str(&wg_in.format_block());
         }
         if !self.tunnels.is_empty() {
             out.push_str("    tunnels {\n");
@@ -1569,6 +1743,13 @@ impl Config {
             for tunnel in &mut gw.tunnels {
                 if tunnel.private_key.is_some() {
                     tunnel.private_key = Some("<redacted>".to_string());
+                }
+            }
+            if let Some(wg_in) = &mut gw.wg_ingress {
+                for peer in &mut wg_in.peers {
+                    if peer.preshared_key.is_some() {
+                        peer.preshared_key = Some("<redacted>".to_string());
+                    }
                 }
             }
             for gs in &mut gw.services {

@@ -789,6 +789,8 @@ impl Completer for NftyHelper {
                 list
             }
             (ShellLevel::Gateway(_), 0) => vec![
+                "wg-in:51820",
+                "peer",
                 "privoxy:8118",
                 "socks5:1080",
                 "ssh:22",
@@ -822,6 +824,71 @@ impl Completer for NftyHelper {
             .into_iter()
             .map(String::from)
             .collect(),
+            (ShellLevel::GatewayWgIngress(_, _), 0) => vec![
+                "peer",
+                "subnet",
+                "endpoint",
+                "dns",
+                "split-tunnel",
+                "port",
+                "no",
+                "show",
+                "diff",
+                "test",
+                "apply",
+                "top",
+                "..",
+                "up",
+                "exit",
+                "help",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            (ShellLevel::GatewayWgIngress(_, _), 1) | (ShellLevel::Gateway(_), 1)
+                if cmd0 == "peer" =>
+            {
+                vec![
+                    "add".to_string(),
+                    "show".to_string(),
+                    "qr".to_string(),
+                    "list".to_string(),
+                    "rm".to_string(),
+                ]
+            }
+            (ShellLevel::GatewayWgIngress(gw_k, _), 2) | (ShellLevel::Gateway(gw_k), 2)
+                if cmd0 == "peer" && matches!(cmd1.as_str(), "show" | "qr" | "rm") =>
+            {
+                let st = self.state.read().unwrap();
+                st.candidate
+                    .gateways
+                    .get(gw_k)
+                    .and_then(|g| g.wg_ingress.as_ref())
+                    .map(|w| w.peers.iter().map(|p| p.name.clone()).collect())
+                    .unwrap_or_default()
+            }
+            (ShellLevel::GatewayWgIngress(_, _), 1) if cmd0 == "split-tunnel" => vec![
+                "full".to_string(),
+                "lan".to_string(),
+                "192.168.1.0/24".to_string(),
+            ],
+            (ShellLevel::GatewayWgIngress(gw_k, _), 1) if cmd0 == "no" => {
+                let mut list = vec![
+                    "endpoint".to_string(),
+                    "dns".to_string(),
+                    "split-tunnel".to_string(),
+                    "peer".to_string(),
+                ];
+                let st = self.state.read().unwrap();
+                if let Some(gw) = st.candidate.gateways.get(gw_k) {
+                    if let Some(wg_in) = &gw.wg_ingress {
+                        for p in &wg_in.peers {
+                            list.push(p.name.clone());
+                        }
+                    }
+                }
+                list
+            }
             (ShellLevel::Gateway(_), 1) if cmd0 == "key" => vec![
                 "new ro".to_string(),
                 "new rw".to_string(),

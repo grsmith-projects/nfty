@@ -124,7 +124,8 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
         ShellLevel::Gateway(k)
         | ShellLevel::GatewayTunnels(k)
         | ShellLevel::GatewayService(k)
-        | ShellLevel::GatewayApi(k, _) => {
+        | ShellLevel::GatewayApi(k, _)
+        | ShellLevel::GatewayWgIngress(k, _) => {
             if let Some(gw) = st.candidate.gateways.get(k) {
                 print!("{}", gw.format_block());
                 if st.candidate.services.len() + st.candidate.gateways.len() > 1 {
@@ -331,6 +332,9 @@ pub fn print_status_table(shared: &SharedState) {
         };
         let gw_title = format!("gw:{}", gw.key);
         let mut gw_badges: Vec<String> = gw.services.iter().map(|s| s.to_string()).collect();
+        if let Some(wg_in) = &gw.wg_ingress {
+            gw_badges.push(format!("wg-in:{}(peers={})", wg_in.port, wg_in.peers.len()));
+        }
         for fwd in &gw.forwards {
             gw_badges.push(format!("fwd:{}->{}", fwd.listen_port, fwd.backend));
         }

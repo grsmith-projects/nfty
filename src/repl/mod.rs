@@ -7,17 +7,20 @@ pub use completer::NftyHelper;
 pub use help::print_context_help;
 pub use status::{handle_show, print_config_diff, print_status, print_status_table};
 
-use crate::ast::{DnsConfig, Gateway, GatewayService, GatewayServiceKind, Service};
+use crate::ast::{
+    DnsConfig, Gateway, GatewayService, GatewayServiceKind, Service, WgIngressConfig,
+};
 use crate::compiler::{
     apply_config, update_host_mapping, validate_config,
 };
 use crate::health::{refresh_allowlist_hosts, run_all_probes_once};
 use crate::parser::{
     apply_dns_directive, apply_gateway_directive, apply_gateway_service_directive,
-    apply_service_directive, create_or_find_vip_service_by_key, parse_backend,
-    parse_gateway_service, parse_ip_and_optional_cidr, parse_nftyfile, parse_service_spec,
-    parse_vip, parse_vip_header, parse_vlan_id, parse_wg_tunnel, remove_backend_from_service,
-    upsert_gateway_service, validate_allow_entry, validate_host_mapping_name,
+    apply_service_directive, apply_wg_ingress_directive, create_or_find_vip_service_by_key,
+    parse_backend, parse_gateway_service, parse_ip_and_optional_cidr, parse_nftyfile,
+    parse_service_spec, parse_vip, parse_vip_header, parse_vlan_id, parse_wg_ingress_spec,
+    parse_wg_tunnel, remove_backend_from_service, upsert_gateway_service, validate_allow_entry,
+    validate_host_mapping_name, WgPeerAction,
 };
 use crate::state::{HealthState, PendingConfirm, SharedState};
 use crate::tui::run_watch_dashboard;
@@ -46,6 +49,7 @@ pub enum ShellLevel {
     GatewayTunnels(String),
     GatewayService(String),
     GatewayApi(String, u16),
+    GatewayWgIngress(String, u16),
 }
 
 impl ShellLevel {
@@ -65,6 +69,7 @@ impl ShellLevel {
             ShellLevel::GatewayTunnels(k) => format!("nfty(config-gateway:{}-tunnels)# ", k),
             ShellLevel::GatewayService(k) => format!("nfty(config-gateway:{}-service)# ", k),
             ShellLevel::GatewayApi(k, p) => format!("nfty(config-gateway:{}-api:{})# ", k, p),
+            ShellLevel::GatewayWgIngress(k, p) => format!("nfty(config-gateway:{}-wg:{})# ", k, p),
         }
     }
 }
@@ -148,6 +153,7 @@ pub async fn run_repl(shared: SharedState) -> Result<()> {
                     | ShellLevel::GatewayTunnels(_)
                     | ShellLevel::GatewayService(_)
                     | ShellLevel::GatewayApi(_, _)
+                    | ShellLevel::GatewayWgIngress(_, _)
                     | ShellLevel::GlobalAllow
                     | ShellLevel::Dns => {
                         *lvl = ShellLevel::ConfigRoot;
@@ -239,7 +245,8 @@ pub async fn handle_line_checked(
                 ShellLevel::VipService(k) => ShellLevel::Vip(k.clone()),
                 ShellLevel::GatewayTunnels(k)
                 | ShellLevel::GatewayService(k)
-                | ShellLevel::GatewayApi(k, _) => ShellLevel::Gateway(k.clone()),
+                | ShellLevel::GatewayApi(k, _)
+                | ShellLevel::GatewayWgIngress(k, _) => ShellLevel::Gateway(k.clone()),
                 ShellLevel::Vip(_)
                 | ShellLevel::Gateway(_)
                 | ShellLevel::GlobalAllow
@@ -278,7 +285,8 @@ pub async fn handle_line_checked(
                 }
                 ShellLevel::GatewayTunnels(k)
                 | ShellLevel::GatewayService(k)
-                | ShellLevel::GatewayApi(k, _) => {
+                | ShellLevel::GatewayApi(k, _)
+                | ShellLevel::GatewayWgIngress(k, _) => {
                     *lvl = ShellLevel::Gateway(k.clone());
                 }
                 ShellLevel::Vip(_)
@@ -317,12 +325,29 @@ pub async fn handle_line_checked(
             return Ok(false);
         }
         "wg" | "wireguard"
-            if cur_level != ShellLevel::Debug
+            if (cur_level != ShellLevel::Debug
+                && !(cmd == "wireguard"
+                    && matches!(
+                        cur_level,
+                        ShellLevel::Gateway(_)
+                            | ShellLevel::GatewayService(_)
+                            | ShellLevel::GatewayApi(_, _)
+                            | ShellLevel::GatewayTunnels(_)
+                            | ShellLevel::GatewayWgIngress(_, _)
+                    )
+                    && !matches!(
+                        tokens.get(1).copied(),
+                        Some("add" | "paste" | "edit" | "rm" | "list" | "show" | "vi")
+                    )))
                 || matches!(
                     tokens.get(1).copied(),
                     Some("add" | "paste" | "edit" | "rm" | "list")
                 ) =>
         {
+            if matches!(tokens.get(1).copied(), Some("peer" | "peers" | "qr")) {
+                handle_top_level_peer_command(&tokens[2..], &cur_level, shared)?;
+                return Ok(false);
+            }
             match crate::features::handle_wg_cli_command(&tokens[1..]) {
                 Ok(Some(saved_filename)) => {
                     if let ShellLevel::Gateway(gw_key) | ShellLevel::GatewayTunnels(gw_key) =
@@ -508,6 +533,15 @@ pub async fn handle_line_checked(
             }
             return Ok(false);
         }
+        "peer" | "peers" | "wg-peer"
+            if !matches!(
+                cur_level,
+                ShellLevel::Gateway(_) | ShellLevel::GatewayWgIngress(_, _)
+            ) =>
+        {
+            handle_top_level_peer_command(&tokens[1..], &cur_level, shared)?;
+            return Ok(false);
+        }
         _ => {}
     }
 
@@ -568,6 +602,9 @@ pub async fn handle_line_checked(
         }
         ShellLevel::GatewayApi(gw_key, port) => {
             handle_gateway_api_command(&gw_key, port, trimmed, level, shared)?;
+        }
+        ShellLevel::GatewayWgIngress(gw_key, port) => {
+            handle_gateway_wg_ingress_command(&gw_key, port, trimmed, level, shared)?;
         }
     }
 
@@ -2086,6 +2123,66 @@ fn handle_gateway_level_command(
         "gateway" => {
             return handle_config_root_command(trimmed, level, shared);
         }
+        "peer" | "peers" | "client" => {
+            let port = {
+                let mut st = shared.write().unwrap();
+                let gw = st
+                    .candidate
+                    .gateways
+                    .get_mut(gw_key)
+                    .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
+                gw.wg_ingress
+                    .get_or_insert_with(WgIngressConfig::default)
+                    .port
+            };
+            return handle_gateway_wg_ingress_command(gw_key, port, trimmed, level, shared);
+        }
+        _ if parse_wg_ingress_spec(&first_lower).is_some() => {
+            let port_initial = parse_wg_ingress_spec(&first_lower).unwrap()?;
+            let (port, rest_start) = if !first_lower.contains(':')
+                && tokens.len() >= 2
+                && tokens[1].parse::<u16>().is_ok()
+            {
+                let p: u16 = tokens[1].parse()?;
+                if p == 0 {
+                    bail!("Port cannot be 0");
+                }
+                (p, 2)
+            } else {
+                (port_initial, 1)
+            };
+            let subnet_str = {
+                let mut st = shared.write().unwrap();
+                let gw = st
+                    .candidate
+                    .gateways
+                    .get_mut(gw_key)
+                    .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
+                let wg_in = gw
+                    .wg_ingress
+                    .get_or_insert_with(|| WgIngressConfig::new(port));
+                wg_in.port = port;
+                let sub = format!("{}/{}", wg_in.address, wg_in.prefix_len);
+                st.sync_runtime_entries();
+                sub
+            };
+            let srv_keys = crate::features::ensure_gateway_server_keys(gw_key)?;
+            if tokens.len() <= rest_start {
+                *level.lock().unwrap() = ShellLevel::GatewayWgIngress(gw_key.to_string(), port);
+                println!(
+                    "  {} [gateway {}] + wg-in:{} (subnet {}, server pubkey {})",
+                    "✔".green().bold(),
+                    gw_key.cyan(),
+                    port.to_string().bold(),
+                    subnet_str.green(),
+                    srv_keys.public_key.yellow()
+                );
+            } else {
+                let rest_cmd = tokens[rest_start..].join(" ");
+                handle_gateway_wg_ingress_command(gw_key, port, &rest_cmd, level, shared)?;
+            }
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -2213,6 +2310,307 @@ fn handle_gateway_api_command(
         );
     }
     Ok(())
+}
+
+fn handle_gateway_wg_ingress_command(
+    gw_key: &str,
+    port: u16,
+    trimmed: &str,
+    level: &Arc<Mutex<ShellLevel>>,
+    shared: &SharedState,
+) -> Result<()> {
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let first_lower = tokens[0].to_ascii_lowercase();
+    if matches!(
+        first_lower.as_str(),
+        "tunnels"
+            | "tunnel"
+            | "vip"
+            | "hostname"
+            | "balance"
+            | "killswitch"
+            | "check"
+            | "allow"
+            | "gateway"
+            | "service"
+            | "services"
+            | "forward"
+            | "privoxy"
+            | "socks5"
+            | "ssh"
+            | "api"
+            | "web"
+    ) || first_lower.starts_with("privoxy:")
+        || first_lower.starts_with("socks5:")
+        || first_lower.starts_with("ssh:")
+        || first_lower.starts_with("api:")
+        || first_lower.starts_with("web:")
+    {
+        *level.lock().unwrap() = ShellLevel::Gateway(gw_key.to_string());
+        return handle_gateway_level_command(gw_key, trimmed, level, shared);
+    }
+
+    // Allow shorthand `add <name>`, `show <name>`, `qr <name>`, `list`, `rm <name>` inside `wg-in:<port>`
+    let effective_stmt = if matches!(first_lower.as_str(), "add" | "new" | "create" | "qr" | "qrcode" | "list" | "ls" | "rm" | "del") {
+        format!("peer {}", trimmed)
+    } else if first_lower == "show" && tokens.len() >= 2 && !matches!(tokens[1].to_ascii_lowercase().as_str(), "all" | "running" | "candidate" | "nft" | "allow" | "vips" | "dns" | "ssh") {
+        format!("peer {}", trimmed)
+    } else {
+        trimmed.to_string()
+    };
+
+    let (action, new_port) = {
+        let mut st = shared.write().unwrap();
+        let gw = st
+            .candidate
+            .gateways
+            .get_mut(gw_key)
+            .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
+        let wg_in = gw
+            .wg_ingress
+            .get_or_insert_with(|| WgIngressConfig::new(port));
+        let act = apply_wg_ingress_directive(wg_in, gw_key, &effective_stmt)?;
+        let np = wg_in.port;
+        st.sync_runtime_entries();
+        (act, np)
+    };
+    if new_port != port {
+        *level.lock().unwrap() = ShellLevel::GatewayWgIngress(gw_key.to_string(), new_port);
+    }
+
+    if let Some(act) = action {
+        let st = shared.read().unwrap();
+        if let Some(gw) = st.candidate.gateways.get(gw_key) {
+            print_wg_peer_action(&st.candidate, gw, &act)?;
+        }
+    } else {
+        println!(
+            "  {} [gateway {} -> wg-in:{}] {}",
+            "✔".green().bold(),
+            gw_key.cyan(),
+            new_port,
+            trimmed
+        );
+    }
+    Ok(())
+}
+
+fn print_wg_peer_action(
+    cfg: &crate::ast::Config,
+    gw: &Gateway,
+    action: &WgPeerAction,
+) -> Result<()> {
+    let Some(wg_in) = &gw.wg_ingress else {
+        bail!("Gateway '{}' does not have a wg-in endpoint configured", gw.key);
+    };
+    match action {
+        WgPeerAction::Added(peer_name) => {
+            let peer = wg_in
+                .peers
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(peer_name))
+                .ok_or_else(|| anyhow::anyhow!("Peer '{}' not found", peer_name))?;
+            println!(
+                "  {} [gateway {} -> wg-in:{}] Peer {} assigned {}/{} (pubkey {})",
+                "✔".green().bold(),
+                gw.key.cyan(),
+                wg_in.port,
+                peer.name.bold().cyan(),
+                peer.ip.to_string().green().bold(),
+                wg_in.prefix_len,
+                peer.public_key.yellow()
+            );
+            let conf = crate::features::build_client_wg_conf(cfg, gw, &peer.name)?;
+            println!(
+                "\n{}",
+                format!(
+                    "--- Copy/Paste WireGuard Client Config ({}.conf) ---",
+                    peer.name
+                )
+                .bold()
+                .cyan()
+            );
+            print!("{}", conf);
+            println!(
+                "{}",
+                "--- Scan QR Code with WireGuard Mobile App ---"
+                    .bold()
+                    .cyan()
+            );
+            let qr = crate::features::render_qr_unicode(&conf)?;
+            print!("{}", qr);
+            println!(
+                "  {}",
+                format!(
+                    "Tip: run 'peer show {}' or 'peer qr {}' anytime to view this config again, and 'apply' to activate.",
+                    peer.name, peer.name
+                )
+                .dimmed()
+            );
+        }
+        WgPeerAction::Show(peer_name) => {
+            let conf = crate::features::build_client_wg_conf(cfg, gw, peer_name)?;
+            println!(
+                "{}",
+                format!(
+                    "--- WireGuard Client Config: {} (gateway {}) ---",
+                    peer_name, gw.key
+                )
+                .bold()
+                .cyan()
+            );
+            print!("{}", conf);
+        }
+        WgPeerAction::Qr(peer_name) => {
+            let conf = crate::features::build_client_wg_conf(cfg, gw, peer_name)?;
+            println!(
+                "{}",
+                format!(
+                    "--- WireGuard QR Code: {} (gateway {}:{}) ---",
+                    peer_name, gw.key, wg_in.port
+                )
+                .bold()
+                .cyan()
+            );
+            let qr = crate::features::render_qr_unicode(&conf)?;
+            print!("{}", qr);
+        }
+        WgPeerAction::List => {
+            let srv_keys = crate::features::ensure_gateway_server_keys(&gw.key)?;
+            println!(
+                "{}",
+                format!(
+                    "WireGuard Ingress Endpoint on gateway {} (wg-in:{})",
+                    gw.key, wg_in.port
+                )
+                .bold()
+                .cyan()
+            );
+            println!(
+                "  Subnet: {}/{} | Split-Tunnel: {} | Server PubKey: {}",
+                wg_in.address.to_string().green(),
+                wg_in.prefix_len,
+                wg_in.split_tunnel.to_string().yellow(),
+                srv_keys.public_key.bold()
+            );
+            if wg_in.peers.is_empty() {
+                println!(
+                    "  {}",
+                    "(No peers configured — run 'peer add <name>' to generate a client config & QR code)".dimmed()
+                );
+            } else {
+                for p in &wg_in.peers {
+                    let has_priv = crate::features::load_stored_client_peer(&gw.key, &p.name)
+                        .and_then(|s| s.private_key)
+                        .is_some();
+                    println!(
+                        "  {} {:<18} {:<16} pubkey {} {}",
+                        "•".green().bold(),
+                        p.name.bold(),
+                        format!("{}/{}", p.ip, wg_in.prefix_len).cyan(),
+                        p.public_key.yellow(),
+                        if has_priv { "[client key saved]".dimmed().to_string() } else { "[external pubkey]".dimmed().to_string() }
+                    );
+                }
+            }
+        }
+        WgPeerAction::Removed(peer_name) => {
+            println!(
+                "  {} [gateway {} -> wg-in:{}] Removed peer {}",
+                "✔".green().bold(),
+                gw.key.cyan(),
+                wg_in.port,
+                peer_name.bold()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_top_level_peer_command(
+    args: &[&str],
+    level: &ShellLevel,
+    shared: &SharedState,
+) -> Result<()> {
+    let st = shared.read().unwrap();
+    let cfg = if matches!(level, ShellLevel::Operational | ShellLevel::Debug) {
+        st.active_config()
+    } else {
+        &st.candidate
+    };
+    let wg_in_gws: Vec<&Gateway> = cfg
+        .gateways
+        .values()
+        .filter(|g| g.wg_ingress.is_some())
+        .collect();
+    if wg_in_gws.is_empty() {
+        bail!("No gateway has a WireGuard ingress endpoint ('wg-in:51820') configured yet.");
+    }
+    if args.is_empty() || args[0].eq_ignore_ascii_case("list") || args[0].eq_ignore_ascii_case("ls") {
+        for gw in wg_in_gws {
+            print_wg_peer_action(cfg, gw, &WgPeerAction::List)?;
+        }
+        return Ok(());
+    }
+    let sub = args[0].to_ascii_lowercase();
+    match sub.as_str() {
+        "show" | "conf" | "config" | "cat" => {
+            if args.len() < 2 {
+                bail!("Usage: peer show <name>");
+            }
+            let name = args[1];
+            let gw = wg_in_gws
+                .iter()
+                .copied()
+                .find(|g| {
+                    g.wg_ingress
+                        .as_ref()
+                        .map(|w| w.peers.iter().any(|p| p.name.eq_ignore_ascii_case(name)))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(wg_in_gws[0]);
+            print_wg_peer_action(cfg, gw, &WgPeerAction::Show(name.to_string()))
+        }
+        "qr" | "qrcode" => {
+            if args.len() < 2 {
+                bail!("Usage: peer qr <name>");
+            }
+            let name = args[1];
+            let gw = wg_in_gws
+                .iter()
+                .copied()
+                .find(|g| {
+                    g.wg_ingress
+                        .as_ref()
+                        .map(|w| w.peers.iter().any(|p| p.name.eq_ignore_ascii_case(name)))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(wg_in_gws[0]);
+            print_wg_peer_action(cfg, gw, &WgPeerAction::Qr(name.to_string()))
+        }
+        _ => {
+            // Treat `peer <name>` at operational/root level as showing that peer's config + QR
+            let name = args[0];
+            if let Some(gw) = wg_in_gws.iter().copied().find(|g| {
+                g.wg_ingress
+                    .as_ref()
+                    .map(|w| w.peers.iter().any(|p| p.name.eq_ignore_ascii_case(name)))
+                    .unwrap_or(false)
+            }) {
+                print_wg_peer_action(cfg, gw, &WgPeerAction::Show(name.to_string()))?;
+                print_wg_peer_action(cfg, gw, &WgPeerAction::Qr(name.to_string()))
+            } else {
+                bail!(
+                    "Peer '{}' not found (enter 'configure -> gateway <gw> -> wg-in:51820 -> peer add {}' to create it)",
+                    name,
+                    name
+                )
+            }
+        }
+    }
 }
 
 fn handle_gateway_service_command(

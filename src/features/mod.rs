@@ -24,9 +24,12 @@ pub use scanner::{
 };
 pub use vhost_mdns::extract_host_or_sni;
 pub use wireguard::{
-    apply_wireguard_gateways, edit_wg_config_interactive, handle_wg_cli_command,
-    list_saved_wg_configs, normalize_wg_filename, parse_wg_conf_str, paste_wg_config_interactive,
-    probe_wg_tunnel, resolve_tunnel_config, save_wg_config_file, ParsedWgConf,
+    apply_wireguard_gateways, build_client_wg_conf, delete_stored_client_peer,
+    edit_wg_config_interactive, ensure_gateway_server_keys, generate_wg_keypair, generate_wg_psk,
+    handle_wg_cli_command, list_saved_wg_configs, load_stored_client_peer, normalize_wg_filename,
+    parse_wg_conf_str, paste_wg_config_interactive, probe_wg_tunnel, render_qr_unicode,
+    resolve_tunnel_config, save_stored_client_peer, save_wg_config_file, validate_wg_key_base64,
+    ParsedWgConf, StoredWgClientPeer, StoredWgServerKeys,
 };
 
 use crate::state::SharedState;

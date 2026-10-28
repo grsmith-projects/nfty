@@ -11,10 +11,11 @@
 - **Static, VLAN, and DHCP Virtual IPs**:
   - Binds static VIPs (`vip 192.168.10.10/24`) to host interfaces or 802.1Q VLAN sub-interfaces (`vlan 20`).
   - Provisions dedicated `macvlan` interfaces with deterministic MAC addresses and `udhcpc` leases for hostname-based DHCP VIPs (`vip web-frontend { dhcp eth0 }`), registering the hostname directly with upstream router DNS.
-- **Internet NAT and WireGuard Egress Gateways**:
-  - Binds static or DHCP virtual gateway IPs (`gateway 192.168.10.20` or `gateway lan-exit dhcp eth0`) that LAN machines or containers can use as their default IPv4 gateway (`ip route replace default via ...`).
+- **Internet NAT, WireGuard Egress, and WireGuard Ingress Gateways**:
+  - Binds static or DHCP virtual gateway IPs (`gateway 169.254.10.20` or `gateway lan-exit dhcp eth0`) that LAN machines or containers can use as their default IPv4 gateway (`ip route replace default via ...`).
   - **Direct Internet Gateway Mode**: When configured without WireGuard tunnels, `nfty` masquerades forwarded LAN traffic directly out the primary WAN/LAN interface (`eth0`), enforces optional source `allow` ACLs, and exposes built-in `privoxy:<port>` (HTTP/HTTPS `CONNECT`) and `socks5:<port>` proxies.
-  - **WireGuard Multi-Tunnel Mode**: Aggregates one or more WireGuard `.conf` tunnels under the gateway IP using kernel `fwmark` policy routing (`ip rule` + per-tunnel routing tables), `ct mark` connection pinning, `killswitch on`, and inbound tunnel port forwarding (`forward <port> to <host:port>`).
+  - **WireGuard Multi-Tunnel Egress Mode**: Aggregates one or more WireGuard `.conf` tunnels under the gateway IP using kernel `fwmark` policy routing (`ip rule` + per-tunnel routing tables), `ct mark` connection pinning, `killswitch on`, and inbound tunnel port forwarding (`forward <port> to <host:port>`).
+  - **WireGuard Ingress Server Mode (`wg-in:<port>`)**: Turns any gateway into a WireGuard VPN server (`ig0..igN`) supporting both **split-tunnel LAN access** (`split-tunnel lan`) and **full-tunnel exit routing** (`split-tunnel full`, chaining remote clients into direct WAN NAT or the gateway's outbound WireGuard `tunnels` pool). Includes built-in Curve25519 keypair + PSK generation, automatic `/32` client IP allocation, copy/paste client `.conf` output, and scannable terminal UTF-8 half-block QR codes (`peer add <name>`, `peer show <name>`, `peer qr <name>`).
 - **Programmable DNS Endpoint (`dnsmasq` + `nftset`)**:
   - Supervises a native `dnsmasq` endpoint (`dns:53` on VIPs/gateways or global `dns { ... }`) that synthesizes records from configured VIPs, gateways, and registered or resolved hosts, and dynamically removes unhealthy backends from DNS responses (`health-aware on`). Scans do not register hosts.
   - Supports authoritative `a`, `aaaa`, wildcard `address`, `cname`, `txt`, `srv`, `mx`, and `ptr` records, split-horizon conditional zone forwarding (`forward <domain> <server> [via <gateway>]`), and domain sinkholing (`block` / `blocklist`).
@@ -211,14 +212,49 @@ Configuring a gateway from the CLI:
 ```text
 nfty# wg paste wg-exit-01
 nfty# conf
-nfty(config)# gateway 192.168.10.20
-nfty(config-gw:192.168.10.20)# killswitch on
-nfty(config-gw:192.168.10.20)# privoxy:8118
-nfty(config-gw:192.168.10.20)# socks5:1080
-nfty(config-gw:192.168.10.20)# forward 51413 to 192.168.20.15:51413
-nfty(config-gw:192.168.10.20)# tunnels
-nfty(config-gw-tunnels:192.168.10.20)# wg-exit-01.conf
-nfty(config-gw-tunnels:192.168.10.20)# commit
+nfty(config)# gateway 169.254.10.20
+nfty(config-gw:169.254.10.20)# killswitch on
+nfty(config-gw:169.254.10.20)# privoxy:8118
+nfty(config-gw:169.254.10.20)# socks5:1080
+nfty(config-gw:169.254.10.20)# forward 51413 to 169.254.20.15:51413
+nfty(config-gw:169.254.10.20)# tunnels
+nfty(config-gw-tunnels:169.254.10.20)# wg-exit-01.conf
+nfty(config-gw-tunnels:169.254.10.20)# commit
+```
+
+**WireGuard Ingress Server (`wg-in:51820`) with Client `.conf` & Terminal QR Code Generator:**
+
+Any gateway can also act as an inbound WireGuard VPN server (`wg-in:51820`) so laptops and mobile devices can dial into your network (`split-tunnel lan`) or route all internet traffic (`split-tunnel full`) through the gateway's direct WAN NAT or outbound WireGuard `tunnels` pool:
+
+```hcl
+gateway 169.254.10.20 {
+    dns:53
+    wg-in:51820 {
+        subnet 10.99.0.1/24
+        endpoint vpn.example.com:51820
+        dns 10.99.0.1
+        split-tunnel full
+        peer laptop 10.99.0.2/32 pubkey YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI=
+    }
+    tunnels {
+        wg-exit-01.conf
+    }
+}
+```
+
+Adding a client peer from the CLI automatically generates its Curve25519 keypair + PresharedKey (or accepts a user-supplied `pubkey <base64>`), allocates the next available `/32` IP, and prints both the copy/paste `.conf` and a scannable UTF-8 QR code:
+
+```text
+nfty# conf
+nfty(config)# gateway 169.254.10.20
+nfty(config-gateway:169.254.10.20)# wg-in:51820
+nfty(config-gateway:169.254.10.20-wg:51820)# endpoint vpn.example.com:51820
+nfty(config-gateway:169.254.10.20-wg:51820)# split-tunnel full
+nfty(config-gateway:169.254.10.20-wg:51820)# peer add phone
+nfty(config-gateway:169.254.10.20-wg:51820)# peer add workstation pubkey <client-base64-pubkey>
+nfty(config-gateway:169.254.10.20-wg:51820)# commit
+nfty# peer show phone
+nfty# peer qr phone
 ```
 
 ### 5. Cloudflare Tunnel and Zero Trust Email Auth

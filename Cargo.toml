@@ -1,6 +1,6 @@
 [package]
 name = "nfty"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "L4 Service Load Balancer & Port Router shell for nftables"
@@ -8,10 +8,12 @@ description = "L4 Service Load Balancer & Port Router shell for nftables"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 colored = "2.1"
 crossterm = "0.28"
 libc = "0.2"
+qrcode = { version = "0.14", default-features = false }
 rand = "0.8"
 ratatui = "0.29"
 russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
@@ -22,3 +24,4 @@ sha2 = "0.10"
 similar = "2.6"
 tokio = { version = "1.40", features = ["full"] }
 ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }

@@ -1577,4 +1577,63 @@ gateway 192.168.1.10 {
             "Formatted Nftyfile must always preserve non-/24 prefix: {formatted}"
         );
     }
+
+    #[tokio::test]
+    async fn test_wireguard_ingress_endpoint_and_qr_generation() {
+        let state = AppState::new(Config::new(), PathBuf::from("Nftyfile"));
+        let shared: SharedState = Arc::new(RwLock::new(state));
+        let level = Arc::new(Mutex::new(ShellLevel::Operational));
+
+        handle_line("configure", &level, &shared).await;
+        handle_line("gateway 169.254.10.10/24", &level, &shared).await;
+        handle_line("dns:53", &level, &shared).await;
+        handle_line("wg-in:51820", &level, &shared).await;
+        assert_eq!(
+            *level.lock().unwrap(),
+            ShellLevel::GatewayWgIngress("169.254.10.10".to_string(), 51820)
+        );
+        handle_line("subnet 10.99.0.1/24", &level, &shared).await;
+        handle_line("endpoint vpn.example.com:51820", &level, &shared).await;
+        handle_line("split-tunnel full", &level, &shared).await;
+        handle_line("peer add laptop", &level, &shared).await;
+        let (_, ext_pubkey) = crate::features::generate_wg_keypair();
+        handle_line(&format!("peer add phone pubkey {}", ext_pubkey), &level, &shared).await;
+
+        let formatted = {
+            let st = shared.read().unwrap();
+            let gw = &st.candidate.gateways["169.254.10.10"];
+            let wg_in = gw.wg_ingress.as_ref().expect("wg_ingress configured");
+            assert_eq!(wg_in.port, 51820);
+            assert_eq!(wg_in.peers.len(), 2);
+            assert_eq!(wg_in.peers[0].name, "laptop");
+            assert_eq!(wg_in.peers[0].ip, Ipv4Addr::new(10, 99, 0, 2));
+            assert_eq!(wg_in.peers[1].name, "phone");
+            assert_eq!(wg_in.peers[1].ip, Ipv4Addr::new(10, 99, 0, 3));
+            assert_eq!(wg_in.peers[1].public_key, ext_pubkey);
+
+            let client_conf =
+                crate::features::build_client_wg_conf(&st.candidate, gw, "laptop").unwrap();
+            assert!(client_conf.contains("Address = 10.99.0.2/24"));
+            assert!(client_conf.contains("DNS = 10.99.0.1"));
+            assert!(client_conf.contains("Endpoint = vpn.example.com:51820"));
+            assert!(client_conf.contains("AllowedIPs = 0.0.0.0/0"));
+            assert!(!client_conf.contains("<INSERT_CLIENT_PRIVATE_KEY>"));
+
+            let qr = crate::features::render_qr_unicode(&client_conf).unwrap();
+            assert!(qr.contains('█'));
+
+            let nft = compile_nft_ruleset(&st.candidate, None);
+            assert!(nft.contains("iifname \"ig*\" counter accept comment \"nfty:wg-ingress-forward\""));
+            assert!(nft.contains("oifname \"ig*\" ct state established,related counter accept"));
+            assert!(nft.contains("iifname \"ig*\" oifname { \"eth0\", \"mv-*\" } counter masquerade comment \"nfty:wg-ingress-nat\""));
+
+            let (dns_conf, _) = crate::features::compile_dnsmasq_config(&st.candidate, None);
+            assert!(dns_conf.contains("listen-address=10.99.0.1"));
+
+            st.candidate.format_nftyfile()
+        };
+
+        let reparsed = parse_nftyfile(&formatted).expect("round-trip parse");
+        assert_eq!(reparsed.format_nftyfile(), formatted);
+    }
 }

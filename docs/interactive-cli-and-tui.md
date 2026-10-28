@@ -106,8 +106,9 @@ The shell prompt dynamically reflects your exact location in the configuration h
 | `nfty(config-vip:<ip>-service:<key>-to)#` | Service Backends | Adding/removing backend targets (`ip:port [weight W] [backup]`). |
 | `nfty(config-vip:<ip>-service:<key>-allow)#` | Service ACL | Editing per-service source IP/CIDR/hostname allowlists. |
 | `nfty(config-service:<key>)#` | Standalone Service | Editing a top-level service block (not nested inside a VIP). |
-| `nfty(config-gateway:<ip>)#` | WireGuard Gateway | Editing a virtual gateway router (`gateway 192.168.1.10`). |
+| `nfty(config-gateway:<ip>)#` | WireGuard Gateway | Editing a virtual gateway router (`gateway 169.254.1.10`). |
 | `nfty(config-gateway:<ip>-tunnels)#` | Gateway Tunnels | Adding/removing WireGuard `.conf` profile references or inline tunnels. |
+| `nfty(config-gateway:<ip>-wg:<port>)#` | Gateway WireGuard Ingress | Configuring a WireGuard ingress server (`wg-in:51820`), `subnet`, `endpoint`, `split-tunnel`, and `peer add/show/qr/rm`. |
 | `nfty(config-gateway:<ip>-service)#` | Gateway Services | Managing services nested under a WireGuard gateway. |
 | `nfty(config-gateway:<ip>-api:<port>)#` | Gateway API Server | Managing scoped `rw` / `ro` API keys bound to the gateway IP. |
 
@@ -309,6 +310,9 @@ Run 'configure; diff; apply' to activate.
 | `wg vi <name>` / `wg edit <name>` | Opens the built-in terminal editor for `/data/wg/<name>.conf`. |
 | `wg show <name>` | Displays the contents of `/data/wg/<name>.conf` (with private keys visible to authenticated CLI administrators). |
 | `wg rm <name>` | Deletes `/data/wg/<name>.conf` from disk. |
+| `peer list` | Lists all configured WireGuard ingress (`wg-in`) client peers across all gateways. |
+| `peer show <name>` | Renders the copy/paste client `.conf` AND terminal UTF-8 QR code for `<name>`. |
+| `peer qr <name>` | Renders the scannable terminal UTF-8 QR code for `<name>`. |
 
 ### Global SSH Authorized Key Management (`ssh` / `ssh key`)
 

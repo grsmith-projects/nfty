@@ -13,8 +13,9 @@ Beyond Layer 4 load balancing, `nfty` unifies **authoritative & split-horizon DN
 5. [DNS-Driven Kernel `nftset` Policy Routing (`route` & `bypass`)](#5-dns-driven-kernel-nftset-policy-routing-route--bypass)
 6. [Ad, Tracker & Malware Sinkholing (`block` & `blocklist`)](#6-ad-tracker--malware-sinkholing-block--blocklist)
 7. [WireGuard Virtual Gateways (`gateway` Block)](#7-wireguard-virtual-gateways-gateway-block)
-8. [Gateway Proxies (`privoxy` & `socks5`) & Port Forwarding](#8-gateway-proxies-privoxy--socks5--port-forwarding)
-9. [Cloudflare DNS & Zero-Trust Tunnels (`cloudflare-dns` & `cloudflare-auth`)](#9-cloudflare-dns--zero-trust-tunnels-cloudflare-dns--cloudflare-auth)
+8. [WireGuard Ingress Endpoints (`wg-in:<port>`) & Client QR Code Generator](#8-wireguard-ingress-endpoints-wg-inport--client-qr-code-generator)
+9. [Gateway Proxies (`privoxy` & `socks5`) & Port Forwarding](#9-gateway-proxies-privoxy--socks5--port-forwarding)
+10. [Cloudflare DNS & Zero-Trust Tunnels (`cloudflare-dns` & `cloudflare-auth`)](#10-cloudflare-dns--zero-trust-tunnels-cloudflare-dns--cloudflare-auth)
 
 ---
 
@@ -259,7 +260,71 @@ When `nfty` brings up WireGuard tunnels:
 
 ---
 
-## 8. Gateway Proxies (`privoxy` & `socks5`) & Port Forwarding
+## 8. WireGuard Ingress Endpoints (`wg-in:<port>`) & Client QR Code Generator
+
+In addition to outbound egress tunnels (`tunnels { ... }`), any `gateway` block can expose an **inbound WireGuard VPN server** via `wg-in:<port>` (or `wg-server:<port>` / `wireguard:<port>`, default UDP port `51820`).
+
+`nfty` provisions a dedicated kernel WireGuard ingress interface (`ig0`, `ig1`, ...) distinct from outbound `wg*` interfaces, automatically binds `dnsmasq` to the tunnel gateway IP (e.g. `10.99.0.1`), and compiles `nftables` forwarding, NAT, and `fwmark` chaining rules.
+
+### Split-Tunnel LAN Access vs. Full-Tunnel Exit Chaining
+
+1. **Split-Tunnel LAN Mode (`split-tunnel lan` or `split-tunnel <cidr...>`)**:
+   - Client configurations receive `AllowedIPs = 10.99.0.0/24, <gateway-lan-cidr>` (or your custom CIDRs).
+   - Remote laptops and phones reach internal LAN hosts, VIPs, and private DNS through `ig0` (masqueraded onto `eth0` / `mv-*`) while keeping their local internet connection for general web traffic.
+2. **Full-Tunnel Exit Mode (`split-tunnel full`, default)**:
+   - Client configurations receive `AllowedIPs = 0.0.0.0/0`.
+   - If the gateway is a **Direct Internet Gateway** (no `tunnels` block), remote client traffic exits via `nfty`'s WAN interface (`eth0`).
+   - If the gateway has **outbound WireGuard `tunnels { ... }`**, `chain mangle_prerouting` marks non-LAN traffic arriving on `ig0` with the gateway's outbound tunnel `fwmark`, seamlessly chaining remote VPN clients (`ig0`) out through the encrypted upstream WireGuard tunnel pool (`wg0..wgN`) while still allowing direct access to local LAN subnets.
+
+### Declarative `Nftyfile` Example
+
+```hcl
+gateway 169.254.10.20/24 {
+  dns:53
+  killswitch on
+  wg-in:51820 {
+    subnet 10.99.0.1/24
+    endpoint vpn.example.com:51820
+    dns 10.99.0.1
+    split-tunnel full
+    peer phone 10.99.0.2/32 pubkey YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI= psk ZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGQ=
+    peer laptop 10.99.0.3/32 pubkey Y2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2M=
+  }
+  tunnels {
+    wg-exit-01.conf
+  }
+}
+```
+
+### Interactive Client Provisioning & Terminal QR Code Output
+
+`nfty` supports both **appliance-generated client keypairs** (persisted in `/data/wg-peers/<gw>/<name>.json` with `0600` permissions so you can re-display the `.conf` or QR code at any time) and **user-supplied client public keys** (zero-trust mode where the client's private key never touches the appliance):
+
+```text
+nfty> configure
+nfty(config)# gateway 169.254.10.20
+nfty(config-gateway:169.254.10.20)# wg-in:51820
+nfty(config-gateway:169.254.10.20-wg:51820)# subnet 10.99.0.1/24
+nfty(config-gateway:169.254.10.20-wg:51820)# endpoint vpn.example.com:51820
+nfty(config-gateway:169.254.10.20-wg:51820)# split-tunnel full
+nfty(config-gateway:169.254.10.20-wg:51820)# peer add phone
+  ✔ Added WireGuard ingress peer 'phone' (10.99.0.2/32) on gateway 169.254.10.20:51820
+    ( prints copy/paste [Interface]/[Peer] .conf and UTF-8 half-block QR code )
+nfty(config-gateway:169.254.10.20-wg:51820)# peer add laptop pubkey Y2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2M=
+nfty(config-gateway:169.254.10.20-wg:51820)# commit
+```
+
+From operational mode (`nfty>`), you can inspect or re-render any peer's configuration or QR code at any time:
+
+```text
+nfty> peer list
+nfty> peer show phone
+nfty> peer qr phone
+```
+
+---
+
+## 9. Gateway Proxies (`privoxy` & `socks5`) & Port Forwarding
 
 Often you do not want to change a client machine's system-wide default gateway, or you only want specific applications (web browsers, CLI tools, Docker containers, torrent clients) to egress through a WireGuard tunnel.
 
@@ -312,7 +377,7 @@ When `forward 51413 to 192.168.20.15:51413` is configured on a gateway:
 
 ---
 
-## 9. Cloudflare DNS & Zero-Trust Tunnels (`cloudflare-dns` & `cloudflare-auth`)
+## 10. Cloudflare DNS & Zero-Trust Tunnels (`cloudflare-dns` & `cloudflare-auth`)
 
 `nfty` integrates directly with the Cloudflare v4 API and supervises `cloudflared` to expose internal services externally with optional edge authentication:
 

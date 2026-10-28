@@ -2,7 +2,8 @@ use crate::ast::{
     generate_api_key, ApiKey, ApiKeyScope, Backend, BalanceStrategy, Config, DnsBlocklist,
     DnsConfig, DnsForwardZone, DnsNftAction, DnsNftRule, DnsRecord, ForwardMode, Gateway,
     GatewayPortForward, GatewayService, GatewayServiceKind, HealthCheckConfig, HealthCheckKind,
-    Proto, RateLimit, RateUnit, Service, VipConfig, WgTunnel,
+    Proto, RateLimit, RateUnit, Service, VipConfig, WgIngressConfig, WgIngressPeer,
+    WgSplitTunnelMode, WgTunnel,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::net::Ipv4Addr;
@@ -797,6 +798,7 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
         GatewayTunnels(Gateway),
         GatewayService(Gateway),
         GatewayServiceItem(Gateway, GatewayService, bool),
+        GatewayWgIngress(Gateway),
         GatewayAllow(Gateway),
         Dns,
     }
@@ -1179,20 +1181,43 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         } else {
                             without_brace.to_string()
                         };
-                        let parsed = parse_gateway_service(&svc_tok)
-                            .with_context(|| format!("Line {}", line_no))?;
-                        let gs = if let Some(pos) = gw.services.iter().position(|x| x.kind == parsed.kind) {
-                            let mut existing = gw.services.remove(pos);
-                            existing.port = parsed.port;
-                            existing
+                        if let Some(wg_port) = parse_wg_ingress_spec(&svc_tok)
+                            .transpose()
+                            .with_context(|| format!("Line {}", line_no))?
+                        {
+                            gw.wg_ingress
+                                .get_or_insert_with(|| WgIngressConfig::new(wg_port))
+                                .port = wg_port;
+                            ParseContext::GatewayWgIngress(gw)
                         } else {
-                            parsed
-                        };
-                        ParseContext::GatewayServiceItem(gw, gs, false)
+                            let parsed = parse_gateway_service(&svc_tok)
+                                .with_context(|| format!("Line {}", line_no))?;
+                            let gs = if let Some(pos) = gw.services.iter().position(|x| x.kind == parsed.kind) {
+                                let mut existing = gw.services.remove(pos);
+                                existing.port = parsed.port;
+                                existing
+                            } else {
+                                parsed
+                            };
+                            ParseContext::GatewayServiceItem(gw, gs, false)
+                        }
                     } else {
                         apply_gateway_directive(&mut gw, stmt)
                             .with_context(|| format!("Line {}", line_no))?;
                         ParseContext::Gateway(gw)
+                    }
+                }
+                ParseContext::GatewayWgIngress(mut gw) => {
+                    if stmt == "}" {
+                        ParseContext::Gateway(gw)
+                    } else {
+                        let gw_key = gw.key.clone();
+                        let wg_in = gw
+                            .wg_ingress
+                            .get_or_insert_with(WgIngressConfig::default);
+                        let _ = apply_wg_ingress_directive(wg_in, &gw_key, stmt)
+                            .with_context(|| format!("Line {}", line_no))?;
+                        ParseContext::GatewayWgIngress(gw)
                     }
                 }
                 ParseContext::GatewayService(mut gw) => {
@@ -2146,7 +2171,32 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
             apply_gateway_no_directive(gw, &tokens[1..])?;
         }
         other => {
-            if let Ok(mut gs) = parse_gateway_service(other) {
+            if let Some(wg_port_res) = parse_wg_ingress_spec(other) {
+                let wg_port = wg_port_res?;
+                let mut rest_idx = 1;
+                let final_port = if rest_idx < tokens.len()
+                    && !other.contains(':')
+                    && tokens[rest_idx].parse::<u16>().is_ok()
+                {
+                    let p: u16 = tokens[rest_idx].parse()?;
+                    if p == 0 {
+                        bail!("Port cannot be 0");
+                    }
+                    rest_idx += 1;
+                    p
+                } else {
+                    wg_port
+                };
+                let gw_key = gw.key.clone();
+                let wg_in = gw
+                    .wg_ingress
+                    .get_or_insert_with(|| WgIngressConfig::new(final_port));
+                wg_in.port = final_port;
+                if rest_idx < tokens.len() {
+                    let rest_stmt = tokens[rest_idx..].join(" ");
+                    let _ = apply_wg_ingress_directive(wg_in, &gw_key, &rest_stmt)?;
+                }
+            } else if let Ok(mut gs) = parse_gateway_service(other) {
                 if tokens.len() >= 2 && matches!(tokens[1].to_ascii_lowercase().as_str(), "key" | "api-key" | "apikey") {
                     let (api_key, _gen) = parse_api_key_directive(&tokens[2..])?;
                     gs.api_keys.push(api_key);
@@ -2174,7 +2224,7 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                 }
             } else {
                 bail!(
-                    "Unknown gateway directive '{}'. Valid directives: vip, hostname, balance, killswitch, check, forward, privoxy:8118, socks5:1080, ssh:22, dns:53, api:9090, key, tunnel, allow, no",
+                    "Unknown gateway directive '{}'. Valid directives: vip, hostname, balance, killswitch, check, forward, wg-in:51820, privoxy:8118, socks5:1080, ssh:22, dns:53, api:9090, key, tunnel, allow, no",
                     other
                 );
             }
@@ -2410,8 +2460,13 @@ pub fn apply_gateway_no_directive(gw: &mut Gateway, tokens: &[&str]) -> Result<(
                 gw.tunnels.retain(|t| t.name != name && t.iface != name);
             }
         }
+        "wg-in" | "wg-server" | "wireguard" => {
+            gw.wg_ingress = None;
+        }
         other => {
-            if let Ok(gs) = parse_gateway_service(other) {
+            if parse_wg_ingress_spec(other).is_some() {
+                gw.wg_ingress = None;
+            } else if let Ok(gs) = parse_gateway_service(other) {
                 gw.services.retain(|s| s.kind != gs.kind);
             } else {
                 gw.tunnels.retain(|t| t.name != other && t.iface != other);
@@ -2419,6 +2474,389 @@ pub fn apply_gateway_no_directive(gw: &mut Gateway, tokens: &[&str]) -> Result<(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WgPeerAction {
+    Added(String),
+    Show(String),
+    Qr(String),
+    List,
+    Removed(String),
+}
+
+/// Parses `wg-in[:<port>]`, `wg-server[:<port>]`, or `wireguard[:<port>]` (default port 51820).
+/// Returns `None` if `raw` does not refer to a WireGuard ingress endpoint.
+pub fn parse_wg_ingress_spec(raw: &str) -> Option<Result<u16>> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    let (name_part, port_opt) = if let Some((l, r)) = trimmed.split_once(':') {
+        (l, Some(r))
+    } else {
+        (trimmed.as_str(), None)
+    };
+    if !matches!(name_part, "wg-in" | "wg-server" | "wireguard" | "wgin") {
+        return None;
+    }
+    if let Some(p_str) = port_opt {
+        match p_str.parse::<u16>() {
+            Ok(0) => Some(Err(anyhow!("WireGuard listen port cannot be 0"))),
+            Ok(p) => Some(Ok(p)),
+            Err(_) => Some(Err(anyhow!("Invalid WireGuard port '{}' in '{}'", p_str, raw))),
+        }
+    } else {
+        Some(Ok(51820))
+    }
+}
+
+pub fn apply_wg_ingress_directive(
+    wg_in: &mut WgIngressConfig,
+    gw_key: &str,
+    stmt: &str,
+) -> Result<Option<WgPeerAction>> {
+    let tokens: Vec<&str> = stmt.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    match tokens[0].to_ascii_lowercase().as_str() {
+        "port" | "listen" => {
+            if tokens.len() < 2 {
+                bail!("Expected port number (1-65535) after '{}'", tokens[0]);
+            }
+            let p: u16 = tokens[1]
+                .parse()
+                .with_context(|| format!("Invalid port '{}'", tokens[1]))?;
+            if p == 0 {
+                bail!("Port cannot be 0");
+            }
+            wg_in.port = p;
+            Ok(None)
+        }
+        "subnet" | "address" | "network" => {
+            if tokens.len() < 2 {
+                bail!("Expected tunnel address/prefix after '{}' (e.g. 'subnet 10.99.0.1/24')", tokens[0]);
+            }
+            let (ip, cidr_opt) = parse_ip_and_optional_cidr(tokens[1])?;
+            let prefix = cidr_opt.unwrap_or(24);
+            if !(8..=30).contains(&prefix) {
+                bail!("WireGuard ingress subnet prefix length must be between /8 and /30");
+            }
+            wg_in.address = ip;
+            wg_in.prefix_len = prefix;
+            Ok(None)
+        }
+        "endpoint" => {
+            if tokens.len() < 2 {
+                bail!("Expected <host:port> or <ip:port> after 'endpoint' (e.g. 'endpoint vpn.example.com:51820')");
+            }
+            let ep = tokens[1].trim();
+            if ep.eq_ignore_ascii_case("off") || ep.eq_ignore_ascii_case("none") {
+                wg_in.endpoint = None;
+            } else {
+                wg_in.endpoint = Some(ep.to_string());
+            }
+            Ok(None)
+        }
+        "dns" => {
+            if tokens.len() < 2 {
+                bail!("Expected DNS IPv4 address after 'dns' (e.g. 'dns 10.99.0.1')");
+            }
+            let d = tokens[1].trim();
+            if d.eq_ignore_ascii_case("off") || d.eq_ignore_ascii_case("none") {
+                wg_in.dns = None;
+            } else {
+                let ip: Ipv4Addr = d
+                    .parse()
+                    .with_context(|| format!("Invalid DNS IPv4 address '{}'", d))?;
+                wg_in.dns = Some(ip);
+            }
+            Ok(None)
+        }
+        "split-tunnel" | "allowed-ips" | "mode" => {
+            if tokens.len() < 2 {
+                bail!("Expected 'full', 'lan', or CIDR list after '{}' (e.g. 'split-tunnel full' or 'split-tunnel lan')", tokens[0]);
+            }
+            let first = tokens[1].trim().to_ascii_lowercase();
+            if matches!(first.as_str(), "full" | "all" | "0.0.0.0/0" | "off") {
+                wg_in.split_tunnel = WgSplitTunnelMode::Full;
+            } else if matches!(first.as_str(), "lan" | "rfc1918" | "private" | "on") {
+                wg_in.split_tunnel = WgSplitTunnelMode::Lan;
+            } else {
+                let mut cidrs = Vec::new();
+                for raw_tok in &tokens[1..] {
+                    for part in raw_tok.split(',') {
+                        let p = part.trim();
+                        if p.is_empty() {
+                            continue;
+                        }
+                        let (net, pref) = parse_ip_allow_entry(p).ok_or_else(|| {
+                            anyhow!("Invalid split-tunnel CIDR or IP '{}' (expected 'full', 'lan', or IPv4 CIDR)", p)
+                        })?;
+                        let mask = u32::MAX.checked_shl(32 - u32::from(pref)).unwrap_or(0);
+                        let norm_ip = Ipv4Addr::from(u32::from(net) & mask);
+                        let norm = format!("{}/{}", norm_ip, pref);
+                        if !cidrs.contains(&norm) {
+                            cidrs.push(norm);
+                        }
+                    }
+                }
+                if cidrs.is_empty() {
+                    bail!("Expected at least one CIDR for custom split-tunnel");
+                }
+                wg_in.split_tunnel = WgSplitTunnelMode::Custom(cidrs);
+            }
+            Ok(None)
+        }
+        "peer" | "peers" | "client" => {
+            parse_wg_peer_subcommand(wg_in, gw_key, &tokens[1..])
+        }
+        "no" | "delete" | "remove" => {
+            if tokens.len() < 2 {
+                bail!("Expected 'endpoint', 'dns', 'split-tunnel', or 'peer <name>' after 'no'");
+            }
+            match tokens[1].to_ascii_lowercase().as_str() {
+                "endpoint" => {
+                    wg_in.endpoint = None;
+                    Ok(None)
+                }
+                "dns" => {
+                    wg_in.dns = None;
+                    Ok(None)
+                }
+                "split-tunnel" | "allowed-ips" => {
+                    wg_in.split_tunnel = WgSplitTunnelMode::Full;
+                    Ok(None)
+                }
+                "peer" | "peers" | "client" => {
+                    if tokens.len() == 2 {
+                        wg_in.peers.clear();
+                        Ok(None)
+                    } else {
+                        let name = tokens[2].trim();
+                        let before = wg_in.peers.len();
+                        wg_in.peers.retain(|p| !p.name.eq_ignore_ascii_case(name));
+                        if wg_in.peers.len() < before {
+                            crate::features::delete_stored_client_peer(gw_key, name);
+                            Ok(Some(WgPeerAction::Removed(name.to_string())))
+                        } else {
+                            bail!("Peer '{}' not found", name);
+                        }
+                    }
+                }
+                other => {
+                    let before = wg_in.peers.len();
+                    wg_in.peers.retain(|p| !p.name.eq_ignore_ascii_case(other));
+                    if wg_in.peers.len() < before {
+                        crate::features::delete_stored_client_peer(gw_key, other);
+                        Ok(Some(WgPeerAction::Removed(other.to_string())))
+                    } else {
+                        bail!("Unknown 'no {}' inside wg-in block", other)
+                    }
+                }
+            }
+        }
+        other => bail!(
+            "Unknown wg-in directive '{}'. Valid directives: subnet, endpoint, dns, split-tunnel, peer, port, no",
+            other
+        ),
+    }
+}
+
+fn parse_wg_peer_subcommand(
+    wg_in: &mut WgIngressConfig,
+    gw_key: &str,
+    tokens: &[&str],
+) -> Result<Option<WgPeerAction>> {
+    if tokens.is_empty() || tokens[0].eq_ignore_ascii_case("list") || tokens[0].eq_ignore_ascii_case("ls") {
+        return Ok(Some(WgPeerAction::List));
+    }
+    let first_lower = tokens[0].to_ascii_lowercase();
+    match first_lower.as_str() {
+        "show" | "conf" | "config" | "cat" => {
+            if tokens.len() < 2 {
+                bail!("Usage: peer show <name>");
+            }
+            return Ok(Some(WgPeerAction::Show(tokens[1].to_string())));
+        }
+        "qr" | "qrcode" => {
+            if tokens.len() < 2 {
+                bail!("Usage: peer qr <name>");
+            }
+            return Ok(Some(WgPeerAction::Qr(tokens[1].to_string())));
+        }
+        "rm" | "del" | "delete" | "remove" => {
+            if tokens.len() < 2 {
+                bail!("Usage: peer rm <name>");
+            }
+            let name = tokens[1].trim();
+            let before = wg_in.peers.len();
+            wg_in.peers.retain(|p| !p.name.eq_ignore_ascii_case(name));
+            if wg_in.peers.len() < before {
+                crate::features::delete_stored_client_peer(gw_key, name);
+                return Ok(Some(WgPeerAction::Removed(name.to_string())));
+            } else {
+                bail!("Peer '{}' not found", name);
+            }
+        }
+        _ => {}
+    }
+
+    let (name, rest) = if matches!(first_lower.as_str(), "add" | "new" | "create") {
+        if tokens.len() < 2 {
+            bail!("Usage: peer add <name> [ip <ipv4>] [pubkey <base64>]");
+        }
+        (tokens[1].trim(), &tokens[2..])
+    } else {
+        (tokens[0].trim(), &tokens[1..])
+    };
+
+    if !WgIngressPeer::valid_name(name) {
+        bail!(
+            "Invalid peer name '{}' (use letters, digits, '-', '_', or '.')",
+            name
+        );
+    }
+
+    let mut explicit_ip: Option<Ipv4Addr> = None;
+    let mut explicit_pubkey: Option<String> = None;
+    let mut explicit_psk: Option<String> = None;
+
+    let mut idx = 0;
+    while idx < rest.len() {
+        let tok_lower = rest[idx].to_ascii_lowercase();
+        match tok_lower.as_str() {
+            "ip" | "address" | "addr" => {
+                idx += 1;
+                if idx >= rest.len() {
+                    bail!("Expected IPv4 address after 'ip'");
+                }
+                let ip_part = rest[idx].split('/').next().unwrap_or(rest[idx]);
+                explicit_ip = Some(
+                    ip_part
+                        .parse()
+                        .with_context(|| format!("Invalid peer IPv4 '{}'", rest[idx]))?,
+                );
+            }
+            "pubkey" | "public-key" | "publickey" | "key" => {
+                idx += 1;
+                if idx >= rest.len() {
+                    bail!("Expected Base64 public key after 'pubkey'");
+                }
+                explicit_pubkey = Some(crate::features::validate_wg_key_base64(rest[idx])?);
+            }
+            "psk" | "preshared-key" | "presharedkey" => {
+                idx += 1;
+                if idx >= rest.len() {
+                    bail!("Expected Base64 preshared key after 'psk'");
+                }
+                explicit_psk = Some(crate::features::validate_wg_key_base64(rest[idx])?);
+            }
+            _ => {
+                let ip_candidate = rest[idx].split('/').next().unwrap_or(rest[idx]);
+                if explicit_ip.is_none() && ip_candidate.parse::<Ipv4Addr>().is_ok() {
+                    explicit_ip = Some(ip_candidate.parse()?);
+                } else if explicit_pubkey.is_none() {
+                    explicit_pubkey = Some(crate::features::validate_wg_key_base64(rest[idx])?);
+                } else {
+                    bail!("Unexpected token '{}' in peer definition", rest[idx]);
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    let existing_peer = wg_in
+        .peers
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .cloned();
+    let stored_peer = crate::features::load_stored_client_peer(gw_key, name);
+
+    let ip = if let Some(ip) = explicit_ip {
+        ip
+    } else if let Some(ex) = &existing_peer {
+        ex.ip
+    } else if let Some(st) = &stored_peer {
+        if !wg_in.peers.iter().any(|p| p.ip == st.ip) {
+            st.ip
+        } else {
+            wg_in
+                .next_available_ip()
+                .context("No free IPv4 addresses remaining in WireGuard ingress subnet")?
+        }
+    } else {
+        wg_in
+            .next_available_ip()
+            .context("No free IPv4 addresses remaining in WireGuard ingress subnet")?
+    };
+
+    if ip == wg_in.address {
+        bail!(
+            "Peer IP {} conflicts with gateway WireGuard interface address {}",
+            ip,
+            wg_in.address
+        );
+    }
+    if let Some(conflict) = wg_in
+        .peers
+        .iter()
+        .find(|p| p.ip == ip && !p.name.eq_ignore_ascii_case(name))
+    {
+        bail!(
+            "Peer IP {} is already assigned to peer '{}'",
+            ip,
+            conflict.name
+        );
+    }
+
+    let (public_key, preshared_key, client_privkey) = if let Some(pk) = explicit_pubkey {
+        let psk = explicit_psk.or_else(|| existing_peer.as_ref().and_then(|e| e.preshared_key.clone()));
+        let priv_k = stored_peer
+            .as_ref()
+            .filter(|s| s.public_key == pk)
+            .and_then(|s| s.private_key.clone());
+        (pk, psk, priv_k)
+    } else if let Some(st) = stored_peer {
+        (
+            st.public_key,
+            explicit_psk.or(st.preshared_key),
+            st.private_key,
+        )
+    } else if let Some(ex) = existing_peer {
+        (ex.public_key, explicit_psk.or(ex.preshared_key), None)
+    } else {
+        let (priv_k, pub_k) = crate::features::generate_wg_keypair();
+        let psk = explicit_psk.unwrap_or_else(crate::features::generate_wg_psk);
+        (pub_k, Some(psk), Some(priv_k))
+    };
+
+    let _ = crate::features::save_stored_client_peer(
+        gw_key,
+        &crate::features::StoredWgClientPeer {
+            name: name.to_string(),
+            ip,
+            private_key: client_privkey,
+            public_key: public_key.clone(),
+            preshared_key: preshared_key.clone(),
+        },
+    );
+
+    let new_peer = WgIngressPeer {
+        name: name.to_string(),
+        ip,
+        public_key,
+        preshared_key,
+    };
+    if let Some(ex) = wg_in
+        .peers
+        .iter_mut()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+    {
+        *ex = new_peer;
+    } else {
+        wg_in.peers.push(new_peer);
+    }
+
+    Ok(Some(WgPeerAction::Added(name.to_string())))
 }
 
 fn parse_bool_flag(raw: &str) -> Result<bool> {

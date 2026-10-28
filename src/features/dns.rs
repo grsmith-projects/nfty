@@ -122,10 +122,17 @@ pub fn compile_dnsmasq_config(cfg: &Config, st: Option<&AppState>) -> (String, S
         }
     }
     for gw in cfg.gateways.values() {
-        if gw.services.iter().any(|gs| gs.kind == GatewayServiceKind::Dns)
-            && !gw.listen_ip.is_unspecified()
-        {
-            addrs.insert(gw.listen_ip.to_string());
+        if gw.services.iter().any(|gs| gs.kind == GatewayServiceKind::Dns) {
+            if !gw.listen_ip.is_unspecified() {
+                addrs.insert(gw.listen_ip.to_string());
+            }
+            if let Some(wg_in) = &gw.wg_ingress {
+                addrs.insert(wg_in.address.to_string());
+            }
+        } else if let Some(wg_in) = &gw.wg_ingress {
+            if cfg.has_any_dns_enabled() {
+                addrs.insert(wg_in.address.to_string());
+            }
         }
     }
     if !addrs.is_empty() && !wildcard_listen {

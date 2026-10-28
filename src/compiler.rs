@@ -152,6 +152,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
 
     // 1c. If WireGuard Virtual Gateways have tunnels configured, emit per-tunnel mark chains + mangle_prerouting ECMP vmap
     let any_wg_tunnels = config.gateways.values().any(|g| !g.tunnels.is_empty());
+    let any_wg_ingress = config.gateways.values().any(|g| g.wg_ingress.is_some());
     let any_direct_gw = config.gateways.values().any(|g| g.tunnels.is_empty());
     if any_wg_tunnels {
         let mut global_idx = 0usize;
@@ -217,7 +218,15 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             .filter(|g| !g.tunnels.is_empty())
             .count();
         let mut base_idx = 0usize;
+        let mut ig_idx = 0usize;
         for gw in config.gateways.values() {
+            let gw_ig_iface = if gw.wg_ingress.is_some() {
+                let name = format!("ig{}", ig_idx);
+                ig_idx += 1;
+                Some(name)
+            } else {
+                None
+            };
             if gw.tunnels.is_empty() {
                 continue;
             }
@@ -239,7 +248,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             let gw_id = gw.nft_id();
             let has_gw_allow = !gw.allow.is_empty() || !config.global_allow.is_empty();
             let gw_allow_prefix = if has_gw_allow {
-                format!("ip saddr @allow_gw_{} ", gw_id)
+                format!("ip saddr @allow_gw_{} ", gw.nft_id())
             } else {
                 String::new()
             };
@@ -269,6 +278,44 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                 String::new()
             };
             gw_scope_prefix.push_str(&gw_allow_prefix);
+
+            // If this gateway also hosts a WireGuard ingress endpoint (`ig*`) and has a scoped prefix,
+            // ensure traffic from `ig*` is explicitly marked for this gateway's outbound tunnels.
+            if let Some(ig_if) = &gw_ig_iface {
+                if !gw_scope_prefix.is_empty() {
+                    let ig_prefix = format!("iifname \"{}\" ", ig_if);
+                    if active_indices.is_empty() && gw.killswitch {
+                        out.push_str(&format!(
+                            "        {}counter drop comment \"nfty:gateway-no-healthy-tunnel={}\"\n",
+                            ig_prefix, gw_id
+                        ));
+                    } else if active_indices.len() == 1 {
+                        out.push_str(&format!(
+                            "        {}jump mark_wg_{}\n",
+                            ig_prefix, active_indices[0]
+                        ));
+                    } else if active_indices.len() > 1 {
+                        let total = active_indices.len();
+                        let selector = match gw.balance {
+                            BalanceStrategy::RoundRobin => format!("numgen inc mod {}", total),
+                            BalanceStrategy::Sticky => {
+                                format!("jhash ip saddr . ip daddr mod {}", total)
+                            }
+                        };
+                        let vmap_entries: Vec<String> = active_indices
+                            .iter()
+                            .enumerate()
+                            .map(|(slot, idx)| format!("{} : jump mark_wg_{}", slot, idx))
+                            .collect();
+                        out.push_str(&format!(
+                            "        {}{} vmap {{ {} }}\n",
+                            ig_prefix,
+                            selector,
+                            vmap_entries.join(", ")
+                        ));
+                    }
+                }
+            }
 
             if active_indices.is_empty() && gw.killswitch {
                 out.push_str(&format!(
@@ -627,6 +674,10 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
         out.push_str("        oifname \"wg*\" counter accept comment \"nfty:wg-forward\"\n");
         out.push_str("        iifname \"wg*\" ct state established,related counter accept\n");
     }
+    if any_wg_ingress {
+        out.push_str("        iifname \"ig*\" counter accept comment \"nfty:wg-ingress-forward\"\n");
+        out.push_str("        oifname \"ig*\" ct state established,related counter accept\n");
+    }
     if any_direct_gw {
         out.push_str("        oifname \"eth0\" ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter accept comment \"nfty:direct-gw-forward\"\n");
     }
@@ -655,6 +706,11 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
             }
         }
         out.push_str("        oifname \"wg*\" counter masquerade comment \"nfty:wg-nat\"\n");
+    }
+    if any_wg_ingress {
+        out.push_str(
+            "        iifname \"ig*\" oifname { \"eth0\", \"mv-*\" } counter masquerade comment \"nfty:wg-ingress-nat\"\n",
+        );
     }
     if any_direct_gw {
         out.push_str("        oifname \"eth0\" ip saddr != 127.0.0.0/8 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter masquerade comment \"nfty:direct-gw-nat\"\n");
@@ -1551,6 +1607,25 @@ fn configuration_safety_errors(config: &Config) -> Vec<String> {
                     "gateway '{}': invalid WireGuard interface '{}'; expected wg followed by a number up to 1999999",
                     gw.key, iface
                 )),
+            }
+        }
+    }
+    let mut wg_in_ports = BTreeSet::new();
+    for gw in config.gateways.values() {
+        if let Some(wg_in) = &gw.wg_ingress {
+            if !wg_in_ports.insert(wg_in.port) {
+                errors.push(format!(
+                    "gateway '{}': wg-in listen port {} is already used by another gateway",
+                    gw.key, wg_in.port
+                ));
+            }
+            for peer in &wg_in.peers {
+                if let Err(e) = crate::features::validate_wg_key_base64(&peer.public_key) {
+                    errors.push(format!(
+                        "gateway '{}' peer '{}': {}",
+                        gw.key, peer.name, e
+                    ));
+                }
             }
         }
     }

@@ -1,15 +1,20 @@
-use crate::ast::{Config, WgTunnel};
+use crate::ast::{Config, Gateway, GatewayServiceKind, WgIngressPeer, WgTunnel};
 use crate::state::HealthState;
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use colored::Colorize;
+use qrcode::{Color as QrColor, EcLevel, QrCode};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 pub(crate) fn wireguard_iface_index(iface: &str) -> Option<usize> {
     let suffix = iface.strip_prefix("wg")?;
@@ -17,6 +22,246 @@ pub(crate) fn wireguard_iface_index(iface: &str) -> Option<usize> {
         return None;
     }
     suffix.parse::<usize>().ok().filter(|n| *n <= 1_999_999)
+}
+
+pub(crate) fn wg_ingress_iface_index(iface: &str) -> Option<usize> {
+    let suffix = iface.strip_prefix("ig")?;
+    if suffix.is_empty() || iface.len() > 15 || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse::<usize>().ok().filter(|n| *n <= 1_999_999)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredWgServerKeys {
+    pub private_key: String,
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredWgClientPeer {
+    pub name: String,
+    pub ip: Ipv4Addr,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    pub public_key: String,
+    #[serde(default)]
+    pub preshared_key: Option<String>,
+}
+
+/// Generates a fresh Curve25519 WireGuard `(private_key_base64, public_key_base64)` pair.
+pub fn generate_wg_keypair() -> (String, String) {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let secret = StaticSecret::from(bytes);
+    let pubkey = PublicKey::from(&secret);
+    (
+        BASE64.encode(secret.to_bytes()),
+        BASE64.encode(pubkey.as_bytes()),
+    )
+}
+
+/// Generates a fresh 256-bit WireGuard PresharedKey in standard Base64.
+pub fn generate_wg_psk() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    BASE64.encode(bytes)
+}
+
+/// Validates a Base64-encoded 32-byte WireGuard key.
+pub fn validate_wg_key_base64(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let decoded = BASE64
+        .decode(trimmed)
+        .with_context(|| format!("Invalid Base64 WireGuard key '{}'", trimmed))?;
+    if decoded.len() != 32 {
+        bail!(
+            "Invalid WireGuard key length: expected 32 bytes (44 base64 chars), got {} bytes",
+            decoded.len()
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+fn wg_storage_base_dir() -> PathBuf {
+    let data_dir = Path::new("/data");
+    if unsafe { libc::geteuid() == 0 } || (data_dir.exists() && ! cfg!(test)) {
+        data_dir.to_path_buf()
+    } else {
+        std::env::temp_dir().join(format!("nfty-wg-{}", unsafe { libc::getuid() }))
+    }
+}
+
+fn sanitize_storage_id(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Loads or generates the persistent WireGuard server keypair for a gateway (`wg-in:<port>`).
+pub fn ensure_gateway_server_keys(gw_key: &str) -> Result<StoredWgServerKeys> {
+    let dir = wg_storage_base_dir().join("wg-server");
+    fs::create_dir_all(&dir).with_context(|| format!("Cannot create {}", dir.display()))?;
+    let path = dir.join(format!("{}.json", sanitize_storage_id(gw_key)));
+    if path.exists() {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(keys) = serde_json::from_str::<StoredWgServerKeys>(&raw) {
+                if validate_wg_key_base64(&keys.private_key).is_ok()
+                    && validate_wg_key_base64(&keys.public_key).is_ok()
+                {
+                    return Ok(keys);
+                }
+            }
+        }
+    }
+    let (private_key, public_key) = generate_wg_keypair();
+    let keys = StoredWgServerKeys {
+        private_key,
+        public_key,
+    };
+    let json = serde_json::to_string_pretty(&keys)?;
+    write_runtime_wg_config(&path.to_string_lossy(), &json)?;
+    Ok(keys)
+}
+
+/// Saves client peer metadata (including optional generated client private key) to `/data/wg-peers/<gw>/<peer>.json`.
+pub fn save_stored_client_peer(gw_key: &str, peer: &StoredWgClientPeer) -> Result<()> {
+    let dir = wg_storage_base_dir()
+        .join("wg-peers")
+        .join(sanitize_storage_id(gw_key));
+    fs::create_dir_all(&dir).with_context(|| format!("Cannot create {}", dir.display()))?;
+    let path = dir.join(format!("{}.json", sanitize_storage_id(&peer.name)));
+    let json = serde_json::to_string_pretty(peer)?;
+    write_runtime_wg_config(&path.to_string_lossy(), &json)?;
+    Ok(())
+}
+
+/// Loads stored client peer metadata if present.
+pub fn load_stored_client_peer(gw_key: &str, peer_name: &str) -> Option<StoredWgClientPeer> {
+    let path = wg_storage_base_dir()
+        .join("wg-peers")
+        .join(sanitize_storage_id(gw_key))
+        .join(format!("{}.json", sanitize_storage_id(peer_name)));
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Removes stored client peer metadata when a peer is deleted.
+pub fn delete_stored_client_peer(gw_key: &str, peer_name: &str) {
+    let path = wg_storage_base_dir()
+        .join("wg-peers")
+        .join(sanitize_storage_id(gw_key))
+        .join(format!("{}.json", sanitize_storage_id(peer_name)));
+    let _ = fs::remove_file(path);
+}
+
+/// Builds the ready-to-import WireGuard client `.conf` for a peer on `gw`.
+pub fn build_client_wg_conf(cfg: &Config, gw: &Gateway, peer_name: &str) -> Result<String> {
+    let wg_in = gw
+        .wg_ingress
+        .as_ref()
+        .with_context(|| format!("Gateway '{}' does not have a wg-in endpoint configured", gw.key))?;
+    let peer: &WgIngressPeer = wg_in
+        .peers
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(peer_name))
+        .with_context(|| format!("Peer '{}' not found on gateway '{}'", peer_name, gw.key))?;
+
+    let server_keys = ensure_gateway_server_keys(&gw.key)?;
+    let stored = load_stored_client_peer(&gw.key, &peer.name);
+    let priv_key = stored
+        .as_ref()
+        .and_then(|s| s.private_key.as_deref())
+        .unwrap_or("<INSERT_CLIENT_PRIVATE_KEY>");
+
+    let endpoint = if let Some(ep) = &wg_in.endpoint {
+        if ep.contains(':') {
+            ep.clone()
+        } else {
+            format!("{}:{}", ep, wg_in.port)
+        }
+    } else if !gw.listen_ip.is_unspecified() {
+        format!("{}:{}", gw.listen_ip, wg_in.port)
+    } else if let Some(h) = &gw.hostname {
+        format!("{}:{}", h, wg_in.port)
+    } else {
+        format!("{}:{}", gw.key, wg_in.port)
+    };
+
+    let dns_ip = if let Some(d) = wg_in.dns {
+        d
+    } else if gw.services.iter().any(|s| s.kind == GatewayServiceKind::Dns) {
+        wg_in.address
+    } else if cfg.has_any_dns_enabled() && !gw.listen_ip.is_unspecified() {
+        gw.listen_ip
+    } else {
+        Ipv4Addr::new(1, 1, 1, 1)
+    };
+
+    let allowed_ips = wg_in
+        .split_tunnel
+        .allowed_ips_for_client(wg_in.address, wg_in.prefix_len);
+
+    let mut conf = String::new();
+    conf.push_str(&format!(
+        "# nfty WireGuard Client — {} (gateway {})\n",
+        peer.name, gw.key
+    ));
+    conf.push_str("[Interface]\n");
+    conf.push_str(&format!("PrivateKey = {}\n", priv_key));
+    conf.push_str(&format!("Address = {}/{}\n", peer.ip, wg_in.prefix_len));
+    conf.push_str(&format!("DNS = {}\n\n", dns_ip));
+    conf.push_str("[Peer]\n");
+    conf.push_str(&format!("PublicKey = {}\n", server_keys.public_key));
+    if let Some(psk) = &peer.preshared_key {
+        conf.push_str(&format!("PresharedKey = {}\n", psk));
+    }
+    conf.push_str(&format!("Endpoint = {}\n", endpoint));
+    conf.push_str(&format!("AllowedIPs = {}\n", allowed_ips));
+    conf.push_str("PersistentKeepalive = 25\n");
+    Ok(conf)
+}
+
+/// Renders a string (such as a WireGuard client `.conf`) into a compact UTF-8 half-block QR code for terminal scanning.
+pub fn render_qr_unicode(content: &str) -> Result<String> {
+    let code = QrCode::with_error_correction_level(content.as_bytes(), EcLevel::L)
+        .context("Failed to encode QR code")?;
+    let width = code.width();
+    let quiet = 2isize;
+    let total = (width as isize) + quiet * 2;
+
+    let is_dark = |x: isize, y: isize| -> bool {
+        if x < quiet || y < quiet || x >= (width as isize) + quiet || y >= (width as isize) + quiet
+        {
+            false
+        } else {
+            code[((y - quiet) as usize, (x - quiet) as usize)] == QrColor::Dark
+        }
+    };
+
+    let mut out = String::new();
+    let mut y = 0isize;
+    while y < total {
+        out.push_str("  ");
+        for x in 0..total {
+            let top = is_dark(x, y);
+            let bottom = if y + 1 < total {
+                is_dark(x, y + 1)
+            } else {
+                false
+            };
+            let ch = match (top, bottom) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            };
+            out.push(ch);
+        }
+        out.push('\n');
+        y += 2;
+    }
+    Ok(out)
 }
 
 pub(crate) fn wireguard_table_id(index: usize) -> usize {
@@ -196,8 +441,13 @@ pub fn apply_wireguard_gateways(cfg: &Config) -> Result<Vec<String>> {
     }
     let mut logs = Vec::new();
     fs::create_dir_all("/run").context("Cannot prepare WireGuard runtime directory")?;
-    if cfg.gateways.values().any(|g| !g.tunnels.is_empty()) {
+    if cfg
+        .gateways
+        .values()
+        .any(|g| !g.tunnels.is_empty() || g.wg_ingress.is_some())
+    {
         fs::create_dir_all("/data/wg").context("Cannot prepare WireGuard config directory")?;
+        let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1\n");
         fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", "2\n")
             .context("Cannot configure WireGuard reverse-path filtering")?;
         fs::write("/proc/sys/net/ipv4/conf/default/rp_filter", "2\n")
@@ -205,8 +455,67 @@ pub fn apply_wireguard_gateways(cfg: &Config) -> Result<Vec<String>> {
     }
 
     let mut active_wg_ifaces = std::collections::BTreeSet::new();
+    let mut active_ig_ifaces = std::collections::BTreeSet::new();
     let mut global_idx = 0usize;
+    let mut ig_idx = 0usize;
     for gw in cfg.gateways.values() {
+        if let Some(wg_in) = &gw.wg_ingress {
+            let iface = format!("ig{}", ig_idx);
+            ig_idx += 1;
+            active_ig_ifaces.insert(iface.clone());
+            let server_keys = ensure_gateway_server_keys(&gw.key)?;
+            let run_conf_path = format!("/run/nfty-{}.conf", iface);
+            let iface_exists = Path::new(&format!("/sys/class/net/{}", iface)).exists();
+            if iface_exists && !Path::new(&run_conf_path).is_file() {
+                bail!("Refusing to modify unmanaged WireGuard interface '{}'", iface);
+            }
+            if !iface_exists {
+                run_ip(&["link", "add", "dev", &iface, "type", "wireguard"])?;
+            }
+            let mut wg_conf = format!(
+                "[Interface]\nPrivateKey = {}\nListenPort = {}\n",
+                server_keys.private_key, wg_in.port
+            );
+            for peer in &wg_in.peers {
+                wg_conf.push_str(&format!(
+                    "\n[Peer]\nPublicKey = {}\nAllowedIPs = {}/32\n",
+                    peer.public_key, peer.ip
+                ));
+                if let Some(psk) = &peer.preshared_key {
+                    wg_conf.push_str(&format!("PresharedKey = {}\n", psk));
+                }
+            }
+            if let Err(e) = write_runtime_wg_config(&run_conf_path, &wg_conf) {
+                if !iface_exists {
+                    let _ = run_ip(&["link", "del", "dev", &iface]);
+                }
+                return Err(e);
+            }
+            let cidr_addr = format!("{}/{}", wg_in.address, wg_in.prefix_len);
+            run_ip(&["addr", "flush", "dev", &iface])?;
+            run_ip(&["addr", "replace", &cidr_addr, "dev", &iface])?;
+            run_ip(&["link", "set", "mtu", "1420", "up", "dev", &iface])?;
+            let wg_output = Command::new("wg")
+                .args(["setconf", &iface, &run_conf_path])
+                .output()
+                .context("Failed to invoke wg")?;
+            if !wg_output.status.success() {
+                bail!(
+                    "wg setconf {} failed: {}",
+                    iface,
+                    String::from_utf8_lossy(&wg_output.stderr).trim()
+                );
+            }
+            logs.push(format!(
+                "WireGuard ingress endpoint {}:{} ({}) [subnet {}, peers={}] ACTIVE",
+                gw.key,
+                wg_in.port,
+                iface,
+                cidr_addr,
+                wg_in.peers.len()
+            ));
+        }
+
         for t in &gw.tunnels {
             let iface = if t.iface.is_empty() {
                 format!("wg{}", global_idx)
@@ -284,6 +593,17 @@ pub fn apply_wireguard_gateways(cfg: &Config) -> Result<Vec<String>> {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Some(iface) = name.strip_prefix("nfty-").and_then(|n| n.strip_suffix(".conf")) else { continue };
+        if wg_ingress_iface_index(iface).is_some() {
+            if active_ig_ifaces.contains(iface) {
+                continue;
+            }
+            if Path::new(&format!("/sys/class/net/{}", iface)).exists() {
+                run_ip(&["link", "del", "dev", iface])?;
+            }
+            fs::remove_file(entry.path()).with_context(|| format!("Cannot remove {}", name))?;
+            logs.push(format!("Removed managed WireGuard ingress interface {}", iface));
+            continue;
+        }
         let Some(index) = wireguard_iface_index(iface) else { continue };
         if active_wg_ifaces.contains(iface) {
             continue;
