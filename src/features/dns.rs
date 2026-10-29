@@ -712,7 +712,7 @@ pub fn print_dns_status(shared: &SharedState) {
     let state_str = match (enabled, pid) {
         (true, Some(p)) => format!("{} (PID {})", "RUNNING".green().bold(), p),
         (true, None) => "ENABLED (staged / waiting for apply)".yellow().bold().to_string(),
-        (false, _) => "DISABLED (run 'conf; dns; commit' to enable)".dimmed().to_string(),
+        (false, _) => "DISABLED (run 'configure; dns; apply' to enable)".dimmed().to_string(),
     };
     println!("  {:<20} {}", "Daemon Status:".bold(), state_str);
     println!(
@@ -939,21 +939,18 @@ fn query_udp_a_record(server: &str, domain: &str) -> Option<(Vec<Ipv4Addr>, Dura
 }
 
 pub fn handle_dns_cli_command(args: &[&str], shared: &SharedState) -> Result<()> {
-    if args.is_empty()
-        || args[0].eq_ignore_ascii_case("status")
-        || args[0].eq_ignore_ascii_case("show")
-    {
+    if args.is_empty() || args[0].eq_ignore_ascii_case("status") {
         print_dns_status(shared);
         return Ok(());
     }
     match args[0].to_ascii_lowercase().as_str() {
-        "test" | "lookup" | "query" | "dig" => {
+        "test" => {
             if args.len() < 2 {
                 bail!("Usage: dns test <domain>");
             }
             run_dns_lookup_test(args[1], shared);
         }
-        "config" | "conf" | "dnsmasq" => {
+        "config" => {
             let st = shared.read().unwrap();
             let cfg = st.active_config();
             let (conf_txt, hosts_txt) = compile_dnsmasq_config(cfg, Some(&st));
@@ -962,7 +959,7 @@ pub fn handle_dns_cli_command(args: &[&str], shared: &SharedState) -> Result<()>
             println!("\n{}", "# --- /run/nfty-dnsmasq.hosts ---".bold().cyan());
             print!("{}", hosts_txt);
         }
-        "reload" | "flush" | "sync" => {
+        "reload" => {
             let st = shared.read().unwrap();
             let cfg = st.active_config();
             let mut blocklist_changed = false;

@@ -1,4 +1,3 @@
-use super::vhost_mdns::extract_host_or_sni;
 use crate::ast::Config;
 use crate::state::SharedState;
 use anyhow::{bail, Context, Result};
@@ -12,8 +11,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
 
 const CF_CONFIG_PATH: &str = "/data/cloudflare.json";
 const CF_PID_FILE: &str = "/run/cloudflared.pid";
@@ -219,312 +216,27 @@ fn discover_cf_account_and_zones(
     Ok((account_id, zones))
 }
 
-pub const CF_LOCAL_AUTH_PORT: u16 = 18443;
-
-fn base64_decode_simple(input: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buf = 0u32;
-    let mut bits = 0u8;
-    for &b in input.trim().as_bytes() {
-        if b == b'=' {
-            break;
-        }
-        let val = TABLE.iter().position(|&c| c == b)? as u32;
-        buf = (buf << 6) | val;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buf >> bits) & 0xFF) as u8);
-        }
-    }
-    Some(out)
-}
-
-pub fn check_http_basic_auth(req_buf: &[u8], auth_rules: &[String]) -> bool {
-    if auth_rules.is_empty() {
-        return true;
-    }
-    let Some(header_end) = req_buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return false;
-    };
-    let Ok(text) = std::str::from_utf8(&req_buf[..header_end]) else {
-        return false;
-    };
-    let mut provided_user_pass: Option<(String, String)> = None;
-    for line in text.lines().take(48) {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("authorization") {
-                let v_trim = v.trim();
-                if let Some(b64) = v_trim
-                    .strip_prefix("Basic ")
-                    .or_else(|| v_trim.strip_prefix("basic "))
-                {
-                    if let Some(decoded_bytes) = base64_decode_simple(b64) {
-                        if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
-                            if let Some((u, p)) = decoded_str.split_once(':') {
-                                provided_user_pass = Some((u.to_string(), p.to_string()));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let Some((user, pass)) = provided_user_pass else {
-        return false;
-    };
-
-    for rule in auth_rules {
-        if rule.eq_ignore_ascii_case("nfty") {
-            if crate::ssh::verify_login(&user, &pass) {
-                return true;
-            }
-        } else if let Some((ru, rp)) = rule.split_once(':') {
-            if user == ru && pass == rp {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Strips the nfty `Authorization: Basic ...` header before forwarding to the backend app,
-/// and sets `Connection: close` on non-WebSocket HTTP requests so `cloudflared` does not pool
-/// an authenticated TCP connection across different visitors.
-pub fn sanitize_authenticated_http_request(req_buf: &[u8]) -> Vec<u8> {
-    let Some(hdr_end) = req_buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return req_buf.to_vec();
-    };
-    let Ok(hdr_str) = std::str::from_utf8(&req_buf[..hdr_end]) else {
-        return req_buf.to_vec();
-    };
-    let body = &req_buf[hdr_end + 4..];
-    let is_websocket = hdr_str
-        .lines()
-        .any(|l| l.to_ascii_lowercase().contains("websocket"));
-
-    let mut out = String::with_capacity(hdr_str.len() + 32);
-    for (idx, line) in hdr_str.lines().enumerate() {
-        if idx == 0 {
-            out.push_str(line);
-            out.push_str("\r\n");
-            continue;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            let kl = k.trim().to_ascii_lowercase();
-            if kl == "authorization" && v.trim().to_ascii_lowercase().starts_with("basic ") {
-                continue;
-            }
-            if kl == "connection" && !is_websocket {
-                continue;
-            }
-        }
-        out.push_str(line);
-        out.push_str("\r\n");
-    }
-    if !is_websocket {
-        out.push_str("Connection: close\r\n");
-    }
-    out.push_str("\r\n");
-    let mut bytes = out.into_bytes();
-    bytes.extend_from_slice(body);
-    bytes
-}
-
-fn get_original_dst(stream: &TcpStream) -> Option<(std::net::Ipv4Addr, u16)> {
-    use std::os::unix::io::AsRawFd;
-    unsafe {
-        let mut addr: libc::sockaddr_in = std::mem::zeroed();
-        let mut len: libc::socklen_t =
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        let ret = libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_IP,
-            libc::SO_ORIGINAL_DST,
-            &mut addr as *mut _ as *mut libc::c_void,
-            &mut len,
-        );
-        if ret == 0 && addr.sin_family as i32 == libc::AF_INET {
-            let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
-            let port = u16::from_be(addr.sin_port);
-            return Some((ip, port));
-        }
-    }
-    stream.local_addr().ok().and_then(|sa| match sa.ip() {
-        std::net::IpAddr::V4(ip) => Some((ip, sa.port())),
-        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|ip| (ip, sa.port())),
-    })
-}
-
-pub(crate) async fn run_cf_auth_proxy_listener(shared: SharedState) {
-    let bind_addr = format!("0.0.0.0:{}", CF_LOCAL_AUTH_PORT);
-    let listener = loop {
-        match TcpListener::bind(&bind_addr).await {
-            Ok(l) => break l,
-            Err(_) => {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    };
-
-    loop {
-        let Ok((mut client, peer)) = listener.accept().await else {
-            continue;
+/// Tunnel origin for a service. Email-protected hosts fail closed until their Access policy is confirmed.
+fn cloudflare_upstream(svc: &crate::ast::Service, cf_cfg: &CloudflareConfig) -> String {
+    let access_pending = !svc.cloudflare_auth.is_empty()
+        && !svc
+            .cloudflare
+            .as_ref()
+            .is_some_and(|host| cf_cfg.protected_access_hosts.contains(&host.to_ascii_lowercase()));
+    if access_pending {
+        "http_status:403".to_string()
+    } else if let Some(b) = svc.backends.first() {
+        let scheme = match b.port {
+            443 | 8443 => "https",
+            22 => "ssh",
+            _ => "http",
         };
-        let peer_ip = match peer.ip() {
-            std::net::IpAddr::V4(v4) => v4,
-            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                Some(v4) => v4,
-                None => continue,
-            },
-        };
-        let orig_dst = get_original_dst(&client);
-        let shared_conn = shared.clone();
-        tokio::spawn(async move {
-            let Ok(peek_buf) = super::read_http_headers(&mut client, Duration::from_secs(5)).await else {
-                return;
-            };
-            if peek_buf.first() == Some(&0x16) {
-                return;
-            }
-            let host_opt = extract_host_or_sni(&peek_buf);
-
-            let route_match: Option<(String, Vec<String>, String, String)> = {
-                let st = shared_conn.read().unwrap();
-                let cfg = st.active_config();
-                let is_direct_cf_loopback = peer_ip.is_loopback()
-                    && orig_dst.map(|(_, p)| p == CF_LOCAL_AUTH_PORT).unwrap_or(true);
-
-                if is_direct_cf_loopback {
-                    let Some(host) = host_opt.as_deref() else {
-                        return;
-                    };
-                    cfg.services.values().find_map(|svc| {
-                        let cf_host = svc.cloudflare.as_ref()?;
-                        if cf_host.eq_ignore_ascii_case(host) {
-                            let eligible = st.active_backends_for_service(&svc.backends);
-                            let b = eligible.first()?;
-                            let addr = format!("{}:{}", b.ip, b.port);
-                            let mut rules = svc.auth.clone();
-                            for r in &svc.cloudflare_auth {
-                                if !rules.contains(r) {
-                                    rules.push(r.clone());
-                                }
-                            }
-                            Some((addr, rules, b.endpoint(), host.to_string()))
-                        } else {
-                            None
-                        }
-                    })
-                } else if let Some((orig_ip, orig_port)) = orig_dst {
-                    let mut candidates: Vec<&crate::ast::Service> = cfg
-                        .services
-                        .values()
-                        .filter(|svc| {
-                            !svc.auth.is_empty()
-                                && svc.port == orig_port
-                                && matches!(svc.proto, crate::ast::Proto::Tcp | crate::ast::Proto::Both)
-                                && (svc.listen_ip.is_none() || svc.listen_ip == Some(orig_ip))
-                        })
-                        .collect();
-                    if let Some(req_host) = host_opt.as_deref() {
-                        let req_short = req_host.strip_suffix(".local").unwrap_or(req_host);
-                        candidates.sort_by_key(|svc| {
-                            let host_match = svc
-                                .hostname
-                                .as_deref()
-                                .map(|sh| {
-                                    let sh_clean = sh.trim_end_matches('.').to_ascii_lowercase();
-                                    let sh_short = sh_clean.strip_suffix(".local").unwrap_or(&sh_clean);
-                                    req_host == sh_clean || req_short == sh_short
-                                })
-                                .unwrap_or(false)
-                                || svc
-                                    .cloudflare
-                                    .as_deref()
-                                    .map(|cf| cf.eq_ignore_ascii_case(req_host))
-                                    .unwrap_or(false);
-                            let ip_exact = svc.listen_ip == Some(orig_ip);
-                            (!host_match, !ip_exact)
-                        });
-                    }
-                    candidates.first().and_then(|svc| {
-                        if !st.is_ip_allowed(peer_ip, &svc.allow, &cfg.global_allow) {
-                            return None;
-                        }
-                        let eligible = st.active_backends_for_service(&svc.backends);
-                        let b = eligible.first()?;
-                        let addr = format!("{}:{}", b.ip, b.port);
-                        let realm = host_opt
-                            .clone()
-                            .unwrap_or_else(|| svc.display_name());
-                        Some((addr, svc.auth.clone(), b.endpoint(), realm))
-                    })
-                } else {
-                    None
-                }
-            };
-
-            let Some((upstream_addr, auth_rules, ep_key, realm_label)) = route_match else {
-                let _ = client
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 10\r\n\r\nNot Found\n")
-                    .await;
-                return;
-            };
-
-            if !check_http_basic_auth(&peek_buf, &auth_rules) {
-                let resp = format!(
-                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"nfty ({})\"\r\nContent-Type: text/plain\r\nContent-Length: 26\r\nConnection: close\r\n\r\n401 Authentication Needed\n",
-                    realm_label
-                );
-                let _ = client.write_all(resp.as_bytes()).await;
-                return;
-            }
-
-            let sanitized_req = sanitize_authenticated_http_request(&peek_buf);
-            if let Ok(Ok(mut upstream)) =
-                tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(&upstream_addr))
-                    .await
-            {
-                if upstream.write_all(&sanitized_req).await.is_ok() {
-                    if let Ok((up_b, down_b)) =
-                        tokio::io::copy_bidirectional(&mut client, &mut upstream).await
-                    {
-                        if let Ok(mut st) = shared_conn.write() {
-                            let rt = st.runtime.entry(ep_key).or_default();
-                            rt.packets += 2;
-                            rt.bytes += (sanitized_req.len() as u64) + up_b + down_b;
-                        }
-                    }
-                }
-            }
-        });
+        format!("{}://{}:{}", scheme, b.ip, b.port)
+    } else if let Some(lip) = svc.listen_ip {
+        format!("http://{}:{}", lip, svc.port)
+    } else {
+        format!("http://127.0.0.1:{}", svc.port)
     }
-}
-
-pub fn service_uses_local_cf_auth_proxy(
-    svc: &crate::ast::Service,
-    cf_cfg: &CloudflareConfig,
-) -> bool {
-    if !svc.auth.is_empty() {
-        return true;
-    }
-    if svc.cloudflare_auth.is_empty() {
-        return false;
-    }
-    let has_local_rule = svc
-        .cloudflare_auth
-        .iter()
-        .any(|r| r.eq_ignore_ascii_case("nfty") || r.contains(':'));
-    let protected = svc.cloudflare.as_ref()
-        .map(|host| cf_cfg.protected_access_hosts.contains(&host.to_ascii_lowercase()))
-        .unwrap_or(false);
-    has_local_rule || !protected
 }
 
 pub fn collect_cloudflare_routes(config: &Config) -> Result<Vec<(String, String, String)>> {
@@ -532,34 +244,18 @@ pub fn collect_cloudflare_routes(config: &Config) -> Result<Vec<(String, String,
     Ok(collect_cloudflare_routes_with_config(config, &cf_cfg))
 }
 
-fn collect_cloudflare_routes_with_config(
+pub(crate) fn collect_cloudflare_routes_with_config(
     config: &Config,
     cf_cfg: &CloudflareConfig,
 ) -> Vec<(String, String, String)> {
-    let mut routes = Vec::new();
-    for svc in config.services.values() {
-        let Some(cf_host) = &svc.cloudflare else {
-            continue;
-        };
-        let upstream = if service_uses_local_cf_auth_proxy(svc, cf_cfg) {
-            format!("http://127.0.0.1:{}", CF_LOCAL_AUTH_PORT)
-        } else if let Some(b) = svc.backends.first() {
-            let scheme = if b.port == 443 || b.port == 8443 {
-                "https"
-            } else if b.port == 22 {
-                "ssh"
-            } else {
-                "http"
-            };
-            format!("{}://{}:{}", scheme, b.ip, b.port)
-        } else if let Some(lip) = svc.listen_ip {
-            format!("http://{}:{}", lip, svc.port)
-        } else {
-            format!("http://127.0.0.1:{}", svc.port)
-        };
-        routes.push((svc.key.clone(), cf_host.clone(), upstream));
-    }
-    routes
+    config
+        .services
+        .values()
+        .filter_map(|svc| {
+            let cf_host = svc.cloudflare.as_ref()?;
+            Some((svc.key.clone(), cf_host.clone(), cloudflare_upstream(svc, cf_cfg)))
+        })
+        .collect()
 }
 
 pub fn cloudflared_running_pid() -> Option<u32> {
@@ -888,7 +584,7 @@ fn reconcile_cloudflare_locked(config: &Config) -> Result<Vec<String>> {
     let mut cf_cfg = load_cloudflare_config_or_stop()?;
     let routes = collect_cloudflare_routes_with_config(config, &cf_cfg);
     if config.services.values().any(|svc| {
-        svc.cloudflare.is_some() && (!svc.auth.is_empty() || !svc.cloudflare_auth.is_empty())
+        svc.cloudflare.is_some() && !svc.cloudflare_auth.is_empty()
     }) {
         stop_cloudflared_daemon()?;
     }
@@ -1175,31 +871,8 @@ fn reconcile_with_cf_api(
         }
     }
 
-    // Route to the local gate when Access is unavailable so email policies fail closed.
-    let effective_routes: Vec<(String, String, String)> = config
-        .services
-        .values()
-        .filter_map(|svc| {
-            let cf_host = svc.cloudflare.as_ref()?;
-            let upstream = if service_uses_local_cf_auth_proxy(svc, cf_cfg) {
-                format!("http://127.0.0.1:{}", CF_LOCAL_AUTH_PORT)
-            } else if let Some(b) = svc.backends.first() {
-                let scheme = if b.port == 443 || b.port == 8443 {
-                    "https"
-                } else if b.port == 22 {
-                    "ssh"
-                } else {
-                    "http"
-                };
-                format!("{}://{}:{}", scheme, b.ip, b.port)
-            } else if let Some(lip) = svc.listen_ip {
-                format!("http://{}:{}", lip, svc.port)
-            } else {
-                format!("http://127.0.0.1:{}", svc.port)
-            };
-            Some((svc.key.clone(), cf_host.clone(), upstream))
-        })
-        .collect();
+    // Recompute after Access sync so unconfirmed email-protected hosts route to 403.
+    let effective_routes = collect_cloudflare_routes_with_config(config, cf_cfg);
     let routes = &effective_routes[..];
 
     // 1. Ensure Tunnel exists if we have routes
@@ -1390,7 +1063,7 @@ fn reconcile_with_cf_api(
 pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> {
     let sub = args.first().map(|s| s.to_ascii_lowercase());
     match sub.as_deref() {
-        None | Some("status") | Some("list") | Some("show") => {
+        None | Some("status") => {
             let cf_cfg = load_cloudflare_config()?;
             let st = shared.read().unwrap();
             let cfg = st.active_config();
@@ -1445,18 +1118,10 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
                         .services
                         .get(&svc_key)
                         .map(|s| {
-                            let mut policies = Vec::new();
-                            for r in &s.auth {
-                                let masked = r.split(':').next().unwrap_or(r);
-                                policies.push(format!("basic:{}", masked));
-                            }
-                            for r in &s.cloudflare_auth {
-                                policies.push(r.clone());
-                            }
-                            if policies.is_empty() {
+                            if s.cloudflare_auth.is_empty() {
                                 "open (none)".dimmed().to_string()
                             } else {
-                                format!("🔒 {}", policies.join(", "))
+                                format!("🔒 {}", s.cloudflare_auth.join(", "))
                                     .yellow()
                                     .bold()
                                     .to_string()
@@ -1474,7 +1139,7 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
             }
             Ok(())
         }
-        Some("token") | Some("key") | Some("login") => {
+        Some("token") => {
             if args.len() < 2 {
                 bail!("Usage: cf token <CLOUDFLARE_API_TOKEN> [ACCOUNT_ID]");
             }
@@ -1521,7 +1186,7 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
             );
             Ok(())
         }
-        Some("sync") | Some("apply") => {
+        Some("sync") => {
             let st = shared.read().unwrap();
             let logs = reconcile_cloudflare_tunnel(st.active_config())?;
             if logs.is_empty() {
@@ -1533,7 +1198,7 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
             }
             Ok(())
         }
-        Some("logs") | Some("log") => {
+        Some("logs") => {
             let raw = fs::read_to_string(CF_LOG_FILE).unwrap_or_default();
             if raw.is_empty() {
                 println!("  (No cloudflared logs in {} yet)", CF_LOG_FILE);
@@ -1546,7 +1211,7 @@ pub fn handle_cf_cli_command(args: &[&str], shared: &SharedState) -> Result<()> 
             }
             Ok(())
         }
-        Some("stop") | Some("clear") | Some("logout") => {
+        Some("stop") | Some("clear") => {
             let _st = shared.write().unwrap();
             crate::unikernel::write_atomic(Path::new(CF_PAUSED_FILE), b"paused\n")
                 .context("Failed to pause Cloudflare supervision")?;

@@ -151,17 +151,6 @@ pub fn verify_login(user: &str, password: &str) -> bool {
         && verify_password_hash(password, &cfg.password_sha256)
 }
 
-/// Verifies appliance credentials for HTTP / Basic Auth endpoints.
-/// Refuses login while the initial default password (`must_change_password: true`) has not been rotated.
-pub fn verify_http_login(user: &str, password: &str) -> bool {
-    let cfg = load_auth_config();
-    if cfg.must_change_password {
-        return false;
-    }
-    constant_time_eq(cfg.username.as_bytes(), user.as_bytes())
-        && verify_password_hash(password, &cfg.password_sha256)
-}
-
 /// Reads a password from stdin with terminal echo disabled
 pub fn read_password_prompt(prompt: &str) -> Result<String> {
     print!("{}", prompt);
@@ -196,6 +185,7 @@ pub fn read_password_prompt(prompt: &str) -> Result<String> {
 /// Interactive password change flow (enforced on first SSH login when password is still 'nfty',
 /// and also callable any time via the `password` CLI command).
 pub fn interactive_change_password(forced_first_login: bool) -> Result<()> {
+    crate::repl::require_interactive_terminal("Changing the password")?;
     if forced_first_login {
         println!(
             "\n{}",
@@ -461,95 +451,11 @@ pub fn verify_ssh_public_key(offered: &PublicKey) -> Option<String> {
     None
 }
 
-/// Opens `nano` (or `vi`) on `/data/ssh/<name>.pub` so the user can paste/edit an SSH public key.
-pub fn edit_ssh_key_interactive(
-    name: &str,
-    preferred_editor: Option<&str>,
-) -> Result<Option<String>> {
-    if unsafe { libc::isatty(libc::STDIN_FILENO) != 1 } {
-        bail!("Interactive SSH key editor requires a terminal; provide the public key inline: ssh add <name> <pubkey>");
-    }
-    let dir = ssh_keys_dir();
-    let _ = fs::create_dir_all(&dir);
-    let filename = normalize_ssh_key_filename(name)?;
-    let full_path = dir.join(&filename);
-    let existed_before = full_path.exists();
-
-    let template = format!(
-        "# Global SSH Authorized Key: {}\n# Paste your OpenSSH public key line (e.g. 'ssh-ed25519 AAAA... user@host') below,\n# then save (Ctrl+O, Enter, Ctrl+X in nano).\n\n",
-        filename
-    );
-    if !existed_before {
-        let _ = fs::write(&full_path, &template);
-    }
-
-    let editor = match preferred_editor {
-        Some("vi") | Some("vim") => "vi",
-        Some("nano") => "nano",
-        _ => {
-            if Path::new("/bin/nano").exists() || Path::new("/usr/bin/nano").exists() {
-                "nano"
-            } else {
-                "vi"
-            }
-        }
-    };
-
-    let status = Command::new(editor)
-        .arg(&full_path)
-        .env(
-            "TERM",
-            std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
-        )
-        .env("TERMINFO", "/usr/share/terminfo")
-        .status()
-        .with_context(|| format!("Failed to launch editor '{}'", editor))?;
-
-    if !status.success() {
-        bail!("Editor '{}' exited with non-zero status", editor);
-    }
-
-    let raw = fs::read_to_string(&full_path).unwrap_or_default();
-    let non_comment_lines: usize = raw
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        .filter(|l| !l.is_empty())
-        .count();
-
-    if non_comment_lines == 0 {
-        if !existed_before {
-            let _ = fs::remove_file(&full_path);
-        }
-        println!("  {} Aborted (empty SSH public key).", "⚠".yellow());
-        return Ok(None);
-    }
-
-    match save_ssh_pubkey_file(&filename, &raw) {
-        Ok((saved_name, parsed)) => {
-            println!(
-                "  {} Saved & validated {}/{} -> {} {}",
-                "✔".green().bold(),
-                dir.display(),
-                saved_name.bold().cyan(),
-                parsed.algorithm.yellow(),
-                parsed.fingerprint.green()
-            );
-            Ok(Some(saved_name))
-        }
-        Err(e) => {
-            if !existed_before {
-                let _ = fs::remove_file(&full_path);
-            }
-            bail!("Invalid SSH public key in {}: {}", filename, e);
-        }
-    }
-}
-
-/// Interactive paste mode for an OpenSSH public key (`ssh paste <name>` / `ssh key paste <name>`).
+/// Interactive paste mode for an OpenSSH public key (`ssh add <name>` without an inline key).
 pub fn paste_ssh_key_interactive(name: &str) -> Result<Option<String>> {
-    if unsafe { libc::isatty(libc::STDIN_FILENO) != 1 } {
-        bail!("Interactive SSH key paste requires a terminal; provide the public key inline: ssh add <name> <pubkey>");
-    }
+    crate::repl::require_interactive_terminal(
+        "Pasting an SSH key (use 'ssh add <name> <pubkey>' instead)",
+    )?;
     let filename = normalize_ssh_key_filename(name)?;
     let dir = ssh_keys_dir();
     println!(
@@ -606,24 +512,11 @@ pub fn paste_ssh_key_interactive(name: &str) -> Result<Option<String>> {
     Ok(Some(saved_name))
 }
 
-/// Handles `ssh ...` / `ssh key ...` CLI subcommands (`ssh`, `ssh list`, `ssh add <name> [pubkey]`, `ssh paste <name>`, `ssh vi <name>`, `ssh show <name>`, `ssh rm <name>`).
+/// Handles `ssh` key subcommands: `ssh [list]`, `ssh add <name> [pubkey]`, `ssh show <name>`, `ssh rm <name>`.
+/// `ssh add <name>` without an inline key prompts for a pasted key (terminal only).
 pub fn handle_ssh_cli_command(args: &[&str]) -> Result<Option<String>> {
-    // Allow optional leading `key` / `keys` token so `ssh key add ...` and `ssh add ...` work identically
-    let eff_args = if args
-        .first()
-        .map(|s| matches!(s.to_ascii_lowercase().as_str(), "key" | "keys"))
-        .unwrap_or(false)
-    {
-        &args[1..]
-    } else {
-        args
-    };
-
     let dir = ssh_keys_dir();
-    if eff_args.is_empty()
-        || eff_args[0].eq_ignore_ascii_case("list")
-        || eff_args[0].eq_ignore_ascii_case("ls")
-    {
+    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
         let saved = list_saved_ssh_keys();
         println!(
             "{}",
@@ -634,7 +527,7 @@ pub fn handle_ssh_cli_command(args: &[&str]) -> Result<Option<String>> {
         if saved.is_empty() {
             println!(
                 "  {}",
-                "(none — run 'ssh add <name> <ssh-ed25519 AAAA...>', 'ssh paste <name>', or 'ssh add <name>' to open nano)"
+                "(none — run 'ssh add <name> <ssh-ed25519 AAAA...>' or 'ssh add <name>' to paste)"
                     .dimmed()
             );
         } else {
@@ -661,69 +554,35 @@ pub fn handle_ssh_cli_command(args: &[&str]) -> Result<Option<String>> {
         }
         println!(
             "\n  {}",
-            "Tip: 'ssh add <name> [pubkey]', 'ssh paste <name>', 'ssh vi <name>', 'ssh show <name>', 'ssh rm <name>'"
-                .dimmed()
+            "Tip: 'ssh add <name> [pubkey]', 'ssh show <name>', 'ssh rm <name>'".dimmed()
         );
         return Ok(None);
     }
 
-    let sub = eff_args[0].to_ascii_lowercase();
-    match sub.as_str() {
-        "add" | "edit" | "nano" | "new" => {
-            if eff_args.len() < 2 {
-                bail!(
-                    "Usage: ssh {} <name> [ssh-ed25519 AAAA... [comment]] (e.g. 'ssh {} laptop')",
-                    sub,
-                    sub
-                );
+    match args[0].to_ascii_lowercase().as_str() {
+        "add" => {
+            if args.len() < 2 {
+                bail!("Usage: ssh add <name> [ssh-ed25519 AAAA... [comment]] (e.g. 'ssh add laptop')");
             }
-            if eff_args.len() >= 3 {
-                let inline_key = eff_args[2..].join(" ");
-                let (saved_name, parsed) = save_ssh_pubkey_file(eff_args[1], &inline_key)?;
-                println!(
-                    "  {} Saved & validated {}/{} -> {} {}",
-                    "✔".green().bold(),
-                    dir.display(),
-                    saved_name.bold().cyan(),
-                    parsed.algorithm.yellow(),
-                    parsed.fingerprint.green()
-                );
-                Ok(Some(saved_name))
-            } else {
-                edit_ssh_key_interactive(eff_args[1], Some("nano"))
+            if args.len() < 3 {
+                return paste_ssh_key_interactive(args[1]);
             }
+            let (saved_name, parsed) = save_ssh_pubkey_file(args[1], &args[2..].join(" "))?;
+            println!(
+                "  {} Saved & validated {}/{} -> {} {}",
+                "✔".green().bold(),
+                dir.display(),
+                saved_name.bold().cyan(),
+                parsed.algorithm.yellow(),
+                parsed.fingerprint.green()
+            );
+            Ok(Some(saved_name))
         }
-        "vi" | "vim" => {
-            if eff_args.len() < 2 {
-                bail!("Usage: ssh vi <name> (e.g. 'ssh vi laptop')");
-            }
-            edit_ssh_key_interactive(eff_args[1], Some("vi"))
-        }
-        "paste" | "import" => {
-            if eff_args.len() < 2 {
-                bail!("Usage: ssh paste <name> (e.g. 'ssh paste laptop')");
-            }
-            if eff_args.len() >= 3 {
-                let inline_key = eff_args[2..].join(" ");
-                let (saved_name, parsed) = save_ssh_pubkey_file(eff_args[1], &inline_key)?;
-                println!(
-                    "  {} Saved & validated {}/{} -> {} {}",
-                    "✔".green().bold(),
-                    dir.display(),
-                    saved_name.bold().cyan(),
-                    parsed.algorithm.yellow(),
-                    parsed.fingerprint.green()
-                );
-                Ok(Some(saved_name))
-            } else {
-                paste_ssh_key_interactive(eff_args[1])
-            }
-        }
-        "show" | "cat" | "view" => {
-            if eff_args.len() < 2 {
+        "show" => {
+            if args.len() < 2 {
                 bail!("Usage: ssh show <name>");
             }
-            let filename = normalize_ssh_key_filename(eff_args[1])?;
+            let filename = normalize_ssh_key_filename(args[1])?;
             let full_path = dir.join(&filename);
             let raw = fs::read_to_string(&full_path)
                 .with_context(|| format!("{}/{} not found", dir.display(), filename))?;
@@ -746,11 +605,11 @@ pub fn handle_ssh_cli_command(args: &[&str]) -> Result<Option<String>> {
             }
             Ok(None)
         }
-        "rm" | "del" | "delete" | "remove" => {
-            if eff_args.len() < 2 {
+        "rm" => {
+            if args.len() < 2 {
                 bail!("Usage: ssh rm <name>");
             }
-            let filename = delete_ssh_pubkey_file(eff_args[1])?;
+            let filename = delete_ssh_pubkey_file(args[1])?;
             println!(
                 "  {} Deleted {}/{}",
                 "✔".green().bold(),
@@ -759,30 +618,12 @@ pub fn handle_ssh_cli_command(args: &[&str]) -> Result<Option<String>> {
             );
             Ok(None)
         }
-        _ => {
-            if eff_args.len() >= 2
-                && (eff_args[1].starts_with("ssh-")
-                    || eff_args[1].starts_with("ecdsa-")
-                    || eff_args[1].starts_with("rsa-"))
-            {
-                let inline_key = eff_args[1..].join(" ");
-                let (saved_name, parsed) = save_ssh_pubkey_file(eff_args[0], &inline_key)?;
-                println!(
-                    "  {} Saved & validated {}/{} -> {} {}",
-                    "✔".green().bold(),
-                    dir.display(),
-                    saved_name.bold().cyan(),
-                    parsed.algorithm.yellow(),
-                    parsed.fingerprint.green()
-                );
-                Ok(Some(saved_name))
-            } else {
-                edit_ssh_key_interactive(eff_args[0], Some("nano"))
-            }
-        }
+        other => bail!(
+            "Unknown ssh subcommand '{}' (expected: list, add <name> [pubkey], show <name>, rm <name>)",
+            other
+        ),
     }
 }
-
 /// Allocates a Linux pseudo-terminal pair `(master_fd, slave_fd)` using `posix_openpt`
 fn open_pty(cols: u32, rows: u32) -> Result<(RawFd, RawFd)> {
     unsafe {
@@ -835,18 +676,16 @@ struct NftySshServer {
     sessions: Arc<Mutex<HashMap<ChannelId, PtySession>>>,
     pending_dims: Arc<Mutex<HashMap<ChannelId, (u32, u32)>>>,
     config_path: PathBuf,
-    api_bind: Option<String>,
     peer_addr: Option<std::net::SocketAddr>,
     used_publickey: bool,
 }
 
 impl NftySshServer {
-    fn new(config_path: PathBuf, api_bind: Option<String>) -> Self {
+    fn new(config_path: PathBuf) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_dims: Arc::new(Mutex::new(HashMap::new())),
             config_path,
-            api_bind,
             peer_addr: None,
             used_publickey: false,
         }
@@ -913,7 +752,7 @@ impl NftySshServer {
 impl russh::server::Server for NftySshServer {
     type Handler = Self;
     fn new_client(&mut self, peer_addr: Option<std::net::SocketAddr>) -> Self {
-        let mut handler = Self::new(self.config_path.clone(), self.api_bind.clone());
+        let mut handler = Self::new(self.config_path.clone());
         handler.peer_addr = peer_addr;
         handler
     }
@@ -1040,9 +879,6 @@ impl Handler for NftySshServer {
             .arg("--file")
             .arg(&self.config_path)
             .env("TERM", "xterm-256color");
-        if let Some(ref bind) = self.api_bind {
-            cmd.arg("--api-bind").arg(bind);
-        }
         if self.used_publickey {
             cmd.env("NFTY_SSH_AUTH", "publickey");
         }
@@ -1195,7 +1031,7 @@ pub fn load_or_create_ssh_host_key() -> PrivateKey {
     kp
 }
 
-pub fn spawn_ssh_server(bind_addr: String, config_path: PathBuf, api_bind: Option<String>) {
+pub fn spawn_ssh_server(bind_addr: String, config_path: PathBuf) {
     // Ensure default auth config and persistent SSH host key exist on boot
     let _ = load_auth_config();
     let _ = load_or_create_ssh_host_key();
@@ -1213,7 +1049,7 @@ pub fn spawn_ssh_server(bind_addr: String, config_path: PathBuf, api_bind: Optio
             ][..]);
             let config = Arc::new(config);
 
-            let mut server = NftySshServer::new(config_path.clone(), api_bind.clone());
+            let mut server = NftySshServer::new(config_path.clone());
             if let Err(e) = server.run_on_address(config, bind_addr.as_str()).await {
                 eprintln!("[nfty-ssh] SSH listener error on {}: {} (retrying in 1s)", bind_addr, e);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;

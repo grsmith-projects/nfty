@@ -15,13 +15,13 @@ Core properties:
 1. **Declarative `Nftyfile` and CLI Directive (`web:<port>`)**:
    - Declare `web:8000` (or `web`) inside any `vip` or `gateway` block, with `allow`, `limit`, `hostname` (mDNS `.local`), and optional `key` sub-directives. `cloudflare-dns` is disallowed on `web:` and `api:` control listeners because tunnel traffic originates from `127.0.0.1` and would bypass source-IP allow-lists.
    - Kernel `nftables` `prerouting` and `input` chains enforce applicable IP/CIDR allow sets (`@allow_<id>`) and `limit` meters (`@meter_<id>`) before accepting traffic to the local `web:<port>` listener.
-2. **Required IP Allow-List, Same-Origin Protection, and Optional Token/Login Auth**:
-   - **Allow-List Required**: Every `web:<port>` and `api:<port>` listener must be covered by at least one IP, CIDR, or IPv4-wildcard `allow` entry (its own, its gateway's, or the global allow-list). `validate`, `apply`, `bootstrap`, `PUT /api/v1/config`, and allow-list updates with `"apply": true` refuse configs that break this rule. Hostname entries (e.g. `*.office.lan`) are rejected on these listeners because DHCP clients choose their own names. If a config loaded at boot breaks the rule, the dataplane still starts, but remote access to the listener is denied (`403`). Local CLI IPC authenticates over loopback using a root-only per-boot secret token (`/run/nfty-ipc.token`, mode `0600`).
+2. **Required IP Allow-List, Same-Origin Protection, and Optional API Keys**:
+   - **Allow-List Required**: Every `web:<port>` and `api:<port>` listener must be covered by at least one IP, CIDR, or IPv4-wildcard `allow` entry (its own, its gateway's, or the global allow-list). `test`, `apply`, `bootstrap`, `PUT /api/v1/config`, and allow-list updates with `"apply": true` refuse configs that break this rule. Hostname entries (e.g. `*.office.lan`) are rejected on these listeners because DHCP clients choose their own names. If a config loaded at boot breaks the rule, the dataplane still starts, but access to the listener is denied (`403`). Loopback clients are treated like any other client. Local CLI and SSH sessions do not use HTTP; they reach the controller over a root-only Unix socket (`/run/nfty/ctl.sock`, mode `0600`, peer-credential checked).
    - **Anti-CSRF & Anti-DNS-Rebinding Protection**: `web:` and `api:` listeners validate `Host`, `Origin`, and `Sec-Fetch-Site` headers against the appliance's configured VIP/gateway addresses and `.local`/`.lan` hostnames, require `Content-Type: application/json` on browser state-changing requests, and never emit wildcard `Access-Control-Allow-Origin: *` headers.
    - **IP Allow-List Auth**: Clients matching the allow-list of a listener with no API keys receive `rw` access (`authenticate_api_request_with_context`). If the listener has API keys, allow-listed clients must also present a key. Remote clients connecting to a port with no `web:`/`api:` listener are denied.
-   - **Appliance Login & Scoped API Keys**: Operators can also authenticate using the appliance username/password (`nfty` / `/data/auth.json` via `POST /api/v1/auth/login`, once the initial default password has been rotated) to receive an ephemeral in-memory session token, or switch to an `nfty_ro_...` / `nfty_rw_...` API key via the **Switch Key / Login** modal.
+   - **Scoped API Keys**: On keyed listeners, operators enter an `nfty_ro_...` / `nfty_rw_...` API key via the **🔑 Set API Key** modal. There is no username/password login; the appliance password is used only for SSH and the local console.
 3. **Self-Contained Static Assets**:
-   - Compiled directly into the `nfty` binary (`WEB_CONSOLE_HTML` in `src/api.rs`) with no external runtime or CDN dependencies.
+   - Authored in `src/web/index.html` and compiled into the `nfty` binary (`WEB_CONSOLE_HTML` via `include_str!` in `src/api.rs`) with no external runtime or CDN dependencies.
 
 ---
 
@@ -57,7 +57,6 @@ vip 192.168.1.4 {
 gateway 192.168.1.10 {
     balance round-robin
     killswitch on
-    privoxy:8118
     web:8000
     allow {
         192.168.0.0/16
@@ -92,9 +91,9 @@ nfty(config-service:192.168.1.4:8000)# apply
 ```mermaid
 flowchart LR
     subgraph Browser["Browser Client (SPA on web:<port>)"]
-        AuthGate["Auth & Scope Gate\n(Allow-List / API Key / Login)"]
+        AuthGate["Auth & Scope Gate\n(Allow-List / API Key)"]
         Store["State Store\n(3s Poll + Action Dispatch)"]
-        Views["8 Views\n+ Web CLI Drawer + Diff Bar"]
+        Views["7 Views\n+ Web CLI Drawer + Diff Bar"]
     end
 
     subgraph NftyDaemon["nfty Daemon (src/api.rs + Kernel)"]
@@ -102,7 +101,7 @@ flowchart LR
         HttpRouter["HTTP/JSON Router (src/api.rs)\nStatic SPA + /api/v1/*"]
         AuthCheck["Scope Verifier\nAllow-List / ro / rw + Redaction"]
         AppState["SharedState\n(running vs candidate Config)"]
-        Subsystems["Subsystems\nnftables | dnsmasq | wg | cloudflared | scanner"]
+        Subsystems["Subsystems\nnftables | dnsmasq | wg | cloudflared"]
     end
 
     Browser -->|"HTTP GET / or /api/v1/*"| NftInput
@@ -116,18 +115,16 @@ flowchart LR
 
 ## 4. Frontend Structure
 
-- **Implementation**: Vanilla JavaScript (ES2022+) embedded in `WEB_CONSOLE_HTML` in `src/api.rs`.
+- **Implementation**: Vanilla JavaScript (ES2022+) in `src/web/index.html`, embedded as `WEB_CONSOLE_HTML` in `src/api.rs`.
 - **Asset Delivery**:
   - `GET /` (or `/ui`, `/dashboard`, `/index.html`) returns the HTML/CSS/JS bundle when `cfg.is_web_port(local_port)` is true.
   - Supports `?key=<token>` on initial URL load: extracts the key, stores it in `localStorage`, strips `?key=` from the address bar via `history.replaceState`, and attaches `Authorization: Bearer <key>` on subsequent `/api/v1/*` requests.
 
 ### 4.1 Authentication Flow
 1. **Auto-Probe**: On load, the frontend queries `GET /api/v1/auth/whoami` and `GET /api/v1/status`. If the client IP matches the `web:<port>` `allow` list, authentication succeeds immediately with `scope: "rw"` and `mode: "allowlist"`.
-2. **Login Modal (if `401 Unauthorized`)**:
-   - **Tab 1 — API Key**: Enter an `nfty_ro_...` or `nfty_rw_...` token.
-   - **Tab 2 — Appliance Login**: Enter `username` (`nfty`) and `password` (verified against `/data/auth.json` via `POST /api/v1/auth/login`), which issues an `rw` token.
+2. **API Key Modal (if `401 Unauthorized`)**: Enter an `nfty_ro_...` or `nfty_rw_...` key, or clear a saved key to fall back to the IP allow-list.
 3. **Scope Badge (Top Header)**:
-   - `READ-WRITE (ALLOWLIST)` or `READ-WRITE (rw)` — All configuration editors, drain buttons, scanner adoption, and commit controls enabled.
+   - `READ-WRITE (ALLOWLIST)` or `READ-WRITE (rw)` — All configuration editors, drain buttons, and apply controls enabled.
    - `READ-ONLY (ro)` — Read-only monitoring mode with `rw` keys and WireGuard private keys redacted.
 
 ---
@@ -151,12 +148,12 @@ flowchart LR
 ### 5.3 Tab 2: VIPs & Services
 - **Service Table & Creation (`rw` mode)**:
   - Add new services (`+ Add Service` modal supporting VIP, port/proto, backend `ip:port`, `balance`, `check`, `hostname`, `cloudflare-dns`, and `allow`).
-  - Drain or enable individual backends (`POST /api/v1/backends/drain` and `/api/v1/backends/undrain`) or delete services (`DELETE /api/v1/services/<key>`).
+  - Drain or enable individual backends (`POST /api/v1/drain` and `/api/v1/enable`) or delete services (`DELETE /api/v1/services/<key>`).
 - **API & Web Key Manager (`rw` mode)**:
   - Generate new `rw` or `ro` keys (`key new rw`, `key new ro`) or revoke keys on any `api:<port>` or `web:<port>` listener.
 
 ### 5.4 Tab 3: WireGuard Gateways
-- **Gateway Status Cards**: Displays gateway IP/interface, `balance` mode, `killswitch` state, local proxy/service listeners (`privoxy:8118`, `socks5:1080`, `dns:53`, `ssh:22`, `web:8000`), inbound port forwards, and per-tunnel health/latency/traffic counters.
+- **Gateway Status Cards**: Displays gateway IP/interface, `balance` mode, `killswitch` state, local service listeners (`dns:53`, `ssh:22`, `web:8000`), inbound port forwards, and per-tunnel health/latency/traffic counters.
 - **WireGuard `.conf` Uploader (`rw` mode)**: Upload `.conf` files (`POST /api/v1/wg`) into `/data/wg/` and inspect saved profiles (with `PrivateKey` redacted in `ro` mode).
 
 ### 5.5 Tab 4: Programmable DNS
@@ -170,10 +167,7 @@ flowchart LR
 ### 5.7 Tab 6: Conntrack Flows
 - Real-time table of `/proc/net/nf_conntrack` entries (`GET /api/v1/flows`) with instant text filtering by protocol, state, source IP, destination VIP, or backend target.
 
-### 5.8 Tab 7: Network Scanner (`rw` only)
-- Trigger subnet discovery scans (`POST /api/v1/scan`) and use **`+ Adopt into VIP`** to add a discovered service directly into a VIP.
-
-### 5.9 Tab 8: `Nftyfile` & `nftables`
+### 5.8 Tab 7: `Nftyfile` & `nftables`
 - **Left Pane (`Nftyfile` Editor)**: View and edit `/data/Nftyfile` with **`Save & Apply (`PUT /api/v1/config`)`** (`rw` mode).
 - **Right Pane (`nftables` Ruleset)**: Live read-only output of `GET /api/v1/nft` (`table ip nfty`).
 - **Slide-Up Web CLI Drawer (`` ` ``)**: Interactive command runner backed by `POST /api/v1/cli`.

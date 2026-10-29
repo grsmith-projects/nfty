@@ -1,6 +1,6 @@
 # Programmable DNS, WireGuard Gateways & Zero-Trust Tunnels
 
-Beyond Layer 4 load balancing, `nfty` unifies **authoritative & split-horizon DNS (`dnsmasq`)**, **multi-tunnel WireGuard Virtual Gateways**, **DNS-driven kernel `nftset` policy routing**, **gateway-bound HTTP/SOCKS5 proxies**, and **Cloudflare Zero-Trust tunnels (`cloudflared`)** inside a single declarative `Nftyfile`.
+Beyond Layer 4 load balancing, `nfty` unifies **authoritative & split-horizon DNS (`dnsmasq`)**, **multi-tunnel WireGuard Virtual Gateways**, **DNS-driven kernel `nftset` policy routing**, and **Cloudflare Zero-Trust tunnels (`cloudflared`)** inside a single declarative `Nftyfile`.
 
 ---
 
@@ -14,7 +14,7 @@ Beyond Layer 4 load balancing, `nfty` unifies **authoritative & split-horizon DN
 6. [Ad, Tracker & Malware Sinkholing (`block` & `blocklist`)](#6-ad-tracker--malware-sinkholing-block--blocklist)
 7. [WireGuard Virtual Gateways (`gateway` Block)](#7-wireguard-virtual-gateways-gateway-block)
 8. [WireGuard Ingress Endpoints (`wg-in:<port>`) & Client QR Code Generator](#8-wireguard-ingress-endpoints-wg-inport--client-qr-code-generator)
-9. [Gateway Proxies (`privoxy` & `socks5`) & Port Forwarding](#9-gateway-proxies-privoxy--socks5--port-forwarding)
+9. [Inbound Port Forwarding](#9-inbound-port-forwarding)
 10. [Cloudflare DNS & Zero-Trust Tunnels (`cloudflare-dns` & `cloudflare-auth`)](#10-cloudflare-dns--zero-trust-tunnels-cloudflare-dns--cloudflare-auth)
 
 ---
@@ -57,15 +57,12 @@ When a `dns { ... }` block is declared in `/data/Nftyfile`, `nfty` generates `/r
 
 ```hcl
 dns {
-  # Bind addresses and interfaces
-  listen 192.168.1.4:53
-  listen 10.20.0.1:53
-  interface eth0
+  # Bind addresses
+  listen 192.168.1.4 10.20.0.1
 
   # Local authoritative search domain & cache tuning
   domain lan.internal
   cache-size 10000
-  ttl 60
 
   # Default upstream recursive resolvers
   upstream 1.1.1.1 1.0.0.1
@@ -83,7 +80,7 @@ dns {
   ptr 192.168.1.50 nas.lan.internal
   mx lan.internal mail.lan.internal 10
   txt lan.internal "v=spf1 mx -all"
-  srv _ldap._tcp.lan.internal dc1.lan.internal 389 10 100
+  srv _ldap._tcp.lan.internal dc1.lan.internal:389 priority 10 weight 100
 
   # Split-horizon conditional forwarding
   forward corp.internal to 10.100.0.53
@@ -105,13 +102,13 @@ dns {
 
 | Directive | Syntax | Description |
 | :--- | :--- | :--- |
-| `a` / `host` | `a <fqdn> <ipv4>` | Maps `<fqdn>` (and its short hostname if under `domain`) to `<ipv4>`. |
+| `a` | `a <fqdn> <ipv4>` | Maps `<fqdn>` (and its short hostname if under `domain`) to `<ipv4>`. |
 | `aaaa` | `aaaa <fqdn> <ipv6>` | Maps `<fqdn>` to `<ipv6>`. |
 | `cname` | `cname <alias> <target>` | Creates a canonical name alias pointing `<alias>` to `<target>`. |
 | `ptr` | `ptr <ip> <fqdn>` | Creates a reverse DNS `PTR` record for `<ip>`. |
 | `mx` | `mx <domain> <mailhost> [prio]` | Creates an `MX` mail exchange record (default priority `10`). |
 | `txt` | `txt <fqdn> "<text>"` | Publishes an arbitrary `TXT` record. |
-| `srv` | `srv <_service._proto.domain> <target> <port> [prio] [weight]` | Publishes an RFC 2782 `SRV` record for service discovery. |
+| `srv` | `srv <_service._proto.domain> <target:port> [priority P] [weight W]` | Publishes an RFC 2782 `SRV` record for service discovery. |
 
 ---
 
@@ -120,10 +117,10 @@ dns {
 `nfty` eliminates manual DNS bookkeeping by automatically synthesizing DNS records from your configured `vip`, `service`, and `gateway` blocks:
 
 1. **`auto-vips on`** (default: `on`):
-   - Automatically registers `vip-<octets>.<domain>` (e.g., `vip-192-168-1-4.lan.internal`) and `gw-<octets>.<domain>` for every configured VIP and Gateway IP.
+   - Automatically registers named VIPs, service `hostname`s, `cloudflare-dns` names, and gateway `hostname`s.
 2. **`auto-hosts on`** (default: `on`):
-   - For every named service (e.g., `service grafana:3000` inside `vip 192.168.1.4`), `nfty` automatically publishes `grafana.lan.internal -> 192.168.1.4`.
-   - If a service also declares `host grafana.corp.internal`, that FQDN is automatically registered as an `A` record pointing to the parent VIP.
+   - Automatically registers host mappings from `/data/hosts.json` and resolved backend hostnames.
+   - If a service declares `hostname grafana.corp.internal`, that FQDN is automatically registered as an `A` record pointing to the parent VIP.
 3. **`health-aware on`** (default: `on`):
    - Ties DNS resolution directly to `nfty`'s real-time L4/L7 health prober.
    - If **all** primary and backup backends for `service grafana:3000` are `DOWN` (or `DRAINING`), `nfty` dynamically withdraws `grafana.lan.internal` from `/run/nfty-dnsmasq.hosts` and reloads `dnsmasq` so clients immediately fail over or receive `NXDOMAIN` instead of blackholing traffic. As soon as at least one backend passes health checks, the `A` record is restored.
@@ -218,7 +215,7 @@ A `gateway` block configures `nfty` as a policy-routed WireGuard router and load
 
 You can supply WireGuard tunnel configurations in two ways:
 1. **Saved `.conf` Files in `/data/wg/`**:
-   Upload standard WireGuard client configurations (`[Interface]` + `[Peer]`) using the CLI (`wg add <name>`, `wg paste <name>`, `wg vi <name>`) or REST API (`POST /api/v1/wg`), and reference them inside `tunnels { ... }`:
+   Upload standard WireGuard client configurations (`[Interface]` + `[Peer]`) using the CLI (`wg add <name>`, then paste) or REST API (`POST /api/v1/wg`), and reference them inside `tunnels { ... }`:
    ```hcl
    gateway 192.168.1.10/24@eth0 {
      balance round-robin
@@ -262,7 +259,7 @@ When `nfty` brings up WireGuard tunnels:
 
 ## 8. WireGuard Ingress Endpoints (`wg-in:<port>`) & Client QR Code Generator
 
-In addition to outbound egress tunnels (`tunnels { ... }`), any `gateway` block can expose an **inbound WireGuard VPN server** via `wg-in:<port>` (or `wg-server:<port>` / `wireguard:<port>`, default UDP port `51820`).
+In addition to outbound egress tunnels (`tunnels { ... }`), any `gateway` block can expose an **inbound WireGuard VPN server** via `wg-in:<port>` (default UDP port `51820`).
 
 `nfty` provisions a dedicated kernel WireGuard ingress interface (`ig0`, `ig1`, ...) distinct from outbound `wg*` interfaces, automatically binds `dnsmasq` to the tunnel gateway IP (e.g. `10.99.0.1`), and compiles `nftables` forwarding, NAT, and `fwmark` chaining rules.
 
@@ -311,7 +308,7 @@ nfty(config-gateway:169.254.10.20-wg:51820)# peer add phone
   ✔ Added WireGuard ingress peer 'phone' (10.99.0.2/32) on gateway 169.254.10.20:51820
     ( prints copy/paste [Interface]/[Peer] .conf and UTF-8 half-block QR code )
 nfty(config-gateway:169.254.10.20-wg:51820)# peer add laptop pubkey Y2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2M=
-nfty(config-gateway:169.254.10.20-wg:51820)# commit
+nfty(config-gateway:169.254.10.20-wg:51820)# apply
 ```
 
 From operational mode (`nfty>`), you can inspect or re-render any peer's configuration or QR code at any time:
@@ -324,24 +321,15 @@ nfty> peer qr phone
 
 ---
 
-## 9. Gateway Proxies (`privoxy` & `socks5`) & Port Forwarding
+## 9. Inbound Port Forwarding
 
-Often you do not want to change a client machine's system-wide default gateway, or you only want specific applications (web browsers, CLI tools, Docker containers, torrent clients) to egress through a WireGuard tunnel.
-
-`nfty` includes a built-in userspace proxy engine (`src/features/gateway_proxy.rs`) that binds directly to the gateway VIP and routes all proxied connections through the gateway's WireGuard tunnels using kernel socket marks (`SO_MARK`) and device binding (`SO_BINDTODEVICE`):
+Gateways can forward inbound ports from the remote WireGuard VPN exit into a LAN host:
 
 ```hcl
 gateway 192.168.1.10/24@eth0 {
   balance round-robin
   killswitch on
 
-  # Expose an HTTP/HTTPS proxy (HTTP CONNECT + Privoxy-compatible forwarding)
-  privoxy:8118
-
-  # Expose an RFC 1928 SOCKS5 proxy (IPv4 destinations)
-  socks5:1080
-
-  # Inbound port forwarding from the remote WireGuard VPN exit into a LAN host
   forward 51413 to 192.168.20.15:51413
   forward 6881/udp to 192.168.20.15:6881
 
@@ -350,24 +338,6 @@ gateway 192.168.1.10/24@eth0 {
   }
 }
 ```
-
-For tunneled HTTP and SOCKS connections, destinations must be literal IPv4
-addresses or names already present in nfty's resolved-host cache. The proxy
-does not perform an ordinary host DNS lookup before selecting the tunnel;
-unresolved names and IPv6 destinations are rejected. Direct gateways may use
-ordinary host DNS resolution. A cached name may itself have been resolved
-outside the tunnel, so this does not guarantee private DNS resolution.
-
-### Testing Gateway Proxies from any LAN Host
-
-```bash
-# Verify egress IP via the Gateway HTTP/HTTPS Proxy (privoxy:8118)
-curl -x http://192.168.1.10:8118 https://ipinfo.io/json
-
-# Verify egress using a cached hostname through the Gateway SOCKS5 Proxy
-curl --socks5-hostname 192.168.1.10:1080 https://ipinfo.io/json
-```
-
 ### Symmetric Inbound Port Forwarding (`forward <port> to <ip:port>`)
 
 When `forward 51413 to 192.168.20.15:51413` is configured on a gateway:
@@ -384,7 +354,7 @@ When `forward 51413 to 192.168.20.15:51413` is configured on a gateway:
 ```hcl
 vip 192.168.1.4/24@eth0 {
   service grafana:3000 {
-    host grafana.example.com
+    hostname grafana.example.com
 
     # Automatically provision/update a proxied Cloudflare DNS record
     cloudflare-dns grafana.example.com
@@ -413,10 +383,10 @@ nfty> cf status
 
 Email and domain rules in `cloudflare-auth` require a successfully reconciled
 Cloudflare Access policy. If it cannot be verified, the connector is stopped
-instead of substituting an appliance-password policy. Existing unmanaged Access
-applications or extra policies are not modified automatically. Local service
-`auth` directives are currently rejected on apply because local enforcement
-cannot be guaranteed on every path.
+instead of substituting an appliance-password policy. Until the policy is
+verified, the tunnel ingress for that hostname returns `403`. Existing unmanaged
+Access applications or extra policies are not modified automatically. `nfty`
+does not provide local HTTP authentication; restrict local access with `allow`.
 
 Cloudflare reconciliation runs asynchronously. Its lock and generation
 tracking are process-local, so separate sessions can race with the controller;

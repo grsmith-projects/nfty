@@ -1,21 +1,18 @@
 [package]
 name = "nfty"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "L4 Service Load Balancer & Port Router shell for nftables"
 
 [dependencies]
 anyhow = "1.0"
-async-trait = "0.1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 colored = "2.1"
-crossterm = "0.29"
 libc = "0.2"
 qrcode = { version = "0.14", default-features = false }
 rand = "0.8"
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 russh = { version = "0.65", default-features = false, features = ["flate2", "ring"] }
 rustyline = { version = "14.0", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }

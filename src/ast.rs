@@ -318,9 +318,6 @@ pub struct Service {
     /// Optional Cloudflare Tunnel / Access authentication rules (e.g. "user@example.com", "*@example.com")
     #[serde(default)]
     pub cloudflare_auth: Vec<String>,
-    /// Optional HTTP Basic Authentication rules (e.g. "user:pass", "nfty")
-    #[serde(default)]
-    pub auth: Vec<String>,
     /// Optional scoped API keys when this service is a local `api:<port>` control service
     #[serde(default)]
     pub api_keys: Vec<ApiKey>,
@@ -347,7 +344,6 @@ impl Service {
             hostname: None,
             cloudflare: None,
             cloudflare_auth: Vec::new(),
-            auth: Vec::new(),
             api_keys: Vec::new(),
             balance: BalanceStrategy::RoundRobin,
             mode: ForwardMode::Nat,
@@ -523,12 +519,6 @@ impl Service {
                 self.cloudflare_auth.join(" ")
             ));
         }
-        if !self.auth.is_empty() {
-            body.push_str(&format!(
-                "        auth {}\n",
-                self.auth.join(" ")
-            ));
-        }
         for k in &self.api_keys {
             body.push_str(&format!("        key {} {}\n", k.key, k.scope));
         }
@@ -581,12 +571,6 @@ impl Service {
             out.push_str(&format!(
                 "    cloudflare-auth {}\n",
                 self.cloudflare_auth.join(" ")
-            ));
-        }
-        if !self.auth.is_empty() {
-            out.push_str(&format!(
-                "    auth {}\n",
-                self.auth.join(" ")
             ));
         }
         for k in &self.api_keys {
@@ -688,8 +672,6 @@ impl fmt::Display for WgTunnel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GatewayServiceKind {
-    Privoxy,
-    Socks5,
     Ssh,
     Dns,
     Api,
@@ -699,8 +681,6 @@ pub enum GatewayServiceKind {
 impl fmt::Display for GatewayServiceKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GatewayServiceKind::Privoxy => write!(f, "privoxy"),
-            GatewayServiceKind::Socks5 => write!(f, "socks5"),
             GatewayServiceKind::Ssh => write!(f, "ssh"),
             GatewayServiceKind::Dns => write!(f, "dns"),
             GatewayServiceKind::Api => write!(f, "api"),
@@ -951,7 +931,7 @@ pub struct Gateway {
     pub check: Option<HealthCheckConfig>,
     #[serde(default)]
     pub allow: Vec<String>,
-    /// Gateway-attached local services (e.g. `privoxy:8118`, `socks5:1080`, `ssh:22`, `api:9090`)
+    /// Gateway-attached local services (e.g. `ssh:22`, `dns:53`, `api:9090`, `web:8000`)
     #[serde(default)]
     pub services: Vec<GatewayService>,
     /// Inbound port forwards from the gateway's WireGuard tunnel interfaces to LAN backends (e.g. `forward 51413 to 192.168.20.10:51413`)
@@ -1794,9 +1774,6 @@ impl Config {
     pub fn redacted_for_readonly(&self) -> Self {
         let mut c = self.clone();
         for svc in c.services.values_mut() {
-            for rule in &mut svc.auth {
-                *rule = "<redacted>".to_string();
-            }
             for rule in &mut svc.cloudflare_auth {
                 *rule = "<redacted>".to_string();
             }

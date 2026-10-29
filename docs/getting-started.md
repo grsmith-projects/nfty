@@ -276,13 +276,13 @@ If you prefer a static Virtual IP instead of the default DHCP gateway, the `boot
 From an LXD host:
 
 ```bash
-lxc exec nfty -- nfty -c "bootstrap 192.168.10.10/24 dev eth0"
+lxc exec nfty -- nfty -c "bootstrap 192.168.10.10/24 interface eth0"
 ```
 
 Or from the serial/VM console (`lxc console nfty`):
 
 ```text
-nfty> bootstrap 192.168.10.10/24 dev eth0
+nfty> bootstrap 192.168.10.10/24 interface eth0
   ✔ Bootstrapped VIP 192.168.10.10/24 on eth0 (created base config 'service 192.168.10.10:22' with SSH enabled)
   → ip addr replace 192.168.10.10/24 dev eth0
 ```
@@ -326,7 +326,7 @@ Confirm new password: ************
   ✔ Password for 'nfty' updated and saved!
 
 Welcome to nfty — L4 Service Load Balancer & Port Router for nftables
-Type configure to enter config mode, debug for troubleshooting tools, status for live status, watch for live TUI, or ? for help.
+Type configure to enter config mode, debug for troubleshooting tools, status for live status, or ? for help.
 
 nfty>
 ```
@@ -343,11 +343,11 @@ Credentials are stored in `/data/auth.json` with `0600` permissions using a per-
 }
 ```
 
-You can rotate the appliance password from the interactive CLI with `password` (or `passwd`). Local service `auth` directives are currently rejected on apply because authentication cannot yet be guaranteed on every dataplane path.
+You can rotate the appliance password from the interactive CLI with `password`. The appliance password is used only for SSH and the local console; the web console and API use IP allow-lists and optional API keys.
 
 ### Step 3: Passwordless Global SSH Key Authentication (`/data/ssh/*.pub`)
 
-To log into `nfty` without a password across any enabled `ssh:22` listener, add your OpenSSH public keys (`ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, or `ssh-rsa`) to `/data/ssh/` using the `ssh` (or `ssh key`) CLI commands—mirroring how `wg` manages `/data/wg/*.conf`:
+To log into `nfty` without a password across any enabled `ssh:22` listener, add your OpenSSH public keys (`ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, or `ssh-rsa`) to `/data/ssh/` using the `ssh` CLI commands—mirroring how `wg` manages `/data/wg/*.conf`:
 
 ```text
 # 1. Add a key directly inline:
@@ -355,18 +355,14 @@ nfty> ssh add workstation ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... admin@worksta
   ✔ Saved & validated /data/ssh/workstation.pub -> ssh-ed25519 SHA256:xK8...
 
 # 2. Or paste a key interactively in the CLI:
-nfty> ssh paste laptop
+nfty> ssh add laptop
   Paste OpenSSH public key for laptop.pub below (e.g. 'ssh-ed25519 AAAA... user@host').
   Press Enter after pasting (or type EOF / . on a new line, or ABORT to cancel):
 
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@laptop
   ✔ Saved & validated /data/ssh/laptop.pub -> ssh-ed25519 SHA256:9bQ...
 
-# 3. Or open nano / vi to paste and save:
-nfty> ssh add yubikey
-nfty> ssh vi backup-key
-
-# 4. List, inspect, or remove saved SSH public keys:
+# 3. List, inspect, or remove saved SSH public keys:
 nfty> ssh
 Saved SSH Authorized Keys (/data/ssh/):
   ✔ laptop.pub               -> ssh-ed25519         SHA256:9bQ... (user@laptop)
@@ -396,7 +392,7 @@ lxc exec nfty -- nfty -c "ssh add workstation $(cat ~/.ssh/id_ed25519.pub)"
    - `/data/Nftyfile` (Appliance / Unikernel / LXD persistent volume)
    - `/etc/nfty/Nftyfile` (Standalone Linux daemon path)
 2. **Automatic Daemon IPC & Disk Sync**:
-   When you run `nfty` from a secondary SSH session or `lxc exec` shell (where `PID != 1`), any configuration changes you apply are atomically written to `/data/Nftyfile` and pushed to the running PID 1 controller over loopback IPC (when any `api:<port>` or `web:<port>` listener is enabled) or via `SIGHUP`—so background health checkers, `dnsmasq`, and proxy supervisors update immediately.
+   When you run `nfty` from a secondary SSH session or `lxc exec` shell (where `PID != 1`), any configuration changes you apply are atomically written to `/data/Nftyfile` and pushed to the running controller over its root-only Unix socket (`/run/nfty/ctl.sock`, or `$XDG_RUNTIME_DIR/nfty-ctl.sock` for non-root) or, if that is unavailable, via `SIGHUP`—so background health checkers, `dnsmasq`, and `cloudflared` update immediately.
 
 ### Common CLI Invocations
 
@@ -406,10 +402,9 @@ lxc exec nfty -- nfty -c "ssh add workstation $(cat ~/.ssh/id_ed25519.pub)"
 | `nfty status` | Prints a service/gateway status table from the invocation's local state. |
 | `nfty diff` | Compares the candidate configuration with the active running configuration and prints a colorized unified diff. |
 | `nfty apply` | Reconciles VIPs/VLANs/DHCP interfaces, applies the ruleset, and persists the configured file. The broader dataplane changes are not atomic. |
-| `nfty watch` | Opens the TUI with local probes and kernel-counter reads. A secondary dashboard does not share the controller's live health or drain state. |
 | `nfty validate` | Validates `Nftyfile` syntax and runs a kernel `nft -c -f -` dry-run check (exits `0` on success, `1` on error). |
 | `nfty compile` | Compiles `Nftyfile` and prints the complete generated `#!/usr/sbin/nft -f` ruleset (`table ip nfty`) to `stdout`. |
-| `nfty daemon` | Runs headless in the foreground (applies config, runs active health probes, supervises `dnsmasq` / `cloudflared` / proxies, and serves the HTTP API). |
+| `nfty daemon` | Runs headless in the foreground (applies config, runs active health probes, supervises `dnsmasq` / `cloudflared`, and serves the HTTP API). |
 | `nfty -c "<commands>"` | Executes semicolon-separated CLI commands non-interactively and exits. |
 
 For the standalone systemd service, `systemctl reload nfty` sends SIGHUP. Reload
@@ -438,4 +433,4 @@ nfty -c "enable 10.0.1.50:8080"
 ## Next Steps
 
 - Learn the complete `/data/Nftyfile` syntax in the **[`Nftyfile` Configuration Reference](./nftyfile-reference.md)**.
-- Explore the interactive shell, `scan`/`adopt`, and safe rollback timers in the **[Interactive CLI & Live TUI Guide](./interactive-cli-and-tui.md)**.
+- Explore the interactive shell, `debug` mode, and safe rollback timers in the **[Interactive CLI Guide](./interactive-cli-and-tui.md)**.

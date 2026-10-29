@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -668,117 +668,71 @@ pub(crate) fn pid1_is_nfty() -> bool {
             .unwrap_or(false)
 }
 
-fn is_connection_refused(err: &anyhow::Error) -> bool {
+
+/// Root-only Unix socket the authoritative controller listens on for CLI/SSH-session updates.
+pub fn controller_socket_path() -> PathBuf {
+    if unsafe { libc::geteuid() } != 0 {
+        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            return PathBuf::from(xdg).join("nfty-ctl.sock");
+        }
+    }
+    PathBuf::from("/run/nfty/ctl.sock")
+}
+
+fn is_controller_unavailable(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .map(|io_err| io_err.kind() == std::io::ErrorKind::ConnectionRefused)
-            .unwrap_or(false)
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+            matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+        })
     })
 }
 
-fn send_controller_request(bind: &str, method: &str, path: &str, body: &str) -> Result<()> {
+fn send_controller_request(socket: &Path, method: &str, path: &str, body: &str) -> Result<()> {
     use std::io::BufRead;
-    use std::net::ToSocketAddrs;
 
-    let mut addr = bind
-        .to_socket_addrs()
-        .with_context(|| format!("Invalid controller address {}", bind))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No address for controller {}", bind))?;
-    if addr.ip().is_unspecified() {
-        addr.set_ip(match addr.ip() {
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        });
-    }
-    let timeout = Duration::from_secs(5);
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
-        .with_context(|| format!("Failed to connect to controller {}", addr))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let ipc_token = read_or_create_ipc_token();
-    let req = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nX-Nfty-Internal-IPC: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        method, path, addr, ipc_token, body.len(), body
-    );
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .with_context(|| format!("Failed to connect to controller {}", socket.display()))?;
+    let timeout = Some(Duration::from_secs(10));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    let mut req = serde_json::json!({"method": method, "path": path, "body": body}).to_string();
+    req.push('\n');
     stream.write_all(req.as_bytes())?;
-    let mut status_line = String::new();
-    std::io::BufReader::new(stream).read_line(&mut status_line)?;
-    if status_line.split_whitespace().nth(1) != Some("200") {
-        anyhow::bail!("Controller rejected request: {}", status_line.trim());
+    let mut line = String::new();
+    std::io::BufReader::new(stream).read_line(&mut line)?;
+    let resp: serde_json::Value =
+        serde_json::from_str(line.trim()).context("Malformed controller response")?;
+    if resp.get("status").and_then(|s| s.as_u64()) != Some(200) {
+        let error = resp
+            .pointer("/body/error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("request failed");
+        anyhow::bail!("Controller rejected request: {}", error);
     }
     Ok(())
 }
 
-static PROCESS_IPC_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-fn ipc_token_file_path() -> PathBuf {
-    if unsafe { libc::geteuid() == 0 } && Path::new("/run").is_dir() {
-        PathBuf::from("/run/nfty-ipc.token")
-    } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg).join("nfty-ipc.token")
-    } else {
-        let uid = unsafe { libc::geteuid() };
-        PathBuf::from(format!("/tmp/nfty-ipc-{}.token", uid))
-    }
-}
-
-fn generate_random_hex_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let mut out = String::with_capacity(64);
-    for b in bytes {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
-}
-
-pub fn read_or_create_ipc_token() -> String {
-    let path = ipc_token_file_path();
-    if let Ok(raw) = fs::read_to_string(&path) {
-        let tok = raw.trim().to_string();
-        if tok.len() >= 32 {
-            let _ = PROCESS_IPC_TOKEN.set(tok.clone());
-            return tok;
-        }
-    }
-    PROCESS_IPC_TOKEN
-        .get_or_init(|| {
-            let tok = generate_random_hex_token();
-            let _ = write_atomic(&path, format!("{}\n", tok).as_bytes());
-            tok
-        })
-        .clone()
-}
-
-pub fn verify_ipc_token(candidate: &str) -> bool {
-    let trimmed = candidate.trim();
-    if trimmed.len() < 32 {
-        return false;
-    }
-    let expected = read_or_create_ipc_token();
-    crate::ssh::constant_time_eq(trimmed.as_bytes(), expected.as_bytes())
-}
-
 fn notify_controller(shared: &SharedState) -> Result<()> {
-    let (ipc_addr, body, authoritative) = {
+    let (socket, body, authoritative) = {
         let st = shared.read().unwrap();
-        (st.controller_ipc_addr(), st.running.format_nftyfile(), st.controller_is_authoritative)
+        (st.controller_socket.clone(), st.running.format_nftyfile(), st.controller_is_authoritative)
     };
-    if !authoritative {
-        if let Some(bind) = ipc_addr {
-            if let Err(e) = send_controller_request(&bind, "PUT", "/api/v1/config", &body) {
-                if !pid1_is_nfty() && is_connection_refused(&e) {
-                    return Ok(());
-                }
-                return Err(e);
+    if authoritative {
+        return Ok(());
+    }
+    if socket.exists() {
+        if let Err(e) = send_controller_request(&socket, "PUT", "/api/v1/config", &body) {
+            if !pid1_is_nfty() && is_controller_unavailable(&e) {
+                return Ok(());
             }
-        } else if pid1_is_nfty() && std::process::id() != 1 {
-            unsafe {
-                libc::kill(1, libc::SIGHUP);
-            }
+            return Err(e);
+        }
+    } else if pid1_is_nfty() && std::process::id() != 1 {
+        unsafe {
+            libc::kill(1, libc::SIGHUP);
         }
     }
     Ok(())
@@ -789,19 +743,17 @@ pub(crate) fn notify_controller_host_mapping(
     host: &str,
     ips: &[Ipv4Addr],
 ) -> Result<()> {
-    let (ipc_addr, authoritative) = {
+    let (socket, authoritative) = {
         let st = shared.read().unwrap();
-        (st.controller_ipc_addr(), st.controller_is_authoritative)
+        (st.controller_socket.clone(), st.controller_is_authoritative)
     };
-    if !authoritative {
-        if let Some(bind) = ipc_addr {
-            let body = serde_json::json!({"host": host, "ips": ips}).to_string();
-            if let Err(e) = send_controller_request(&bind, "PUT", "/api/v1/allow/hosts", &body) {
-                if !pid1_is_nfty() && is_connection_refused(&e) {
-                    return Ok(());
-                }
-                return Err(e);
+    if !authoritative && socket.exists() {
+        let body = serde_json::json!({"host": host, "ips": ips}).to_string();
+        if let Err(e) = send_controller_request(&socket, "PUT", "/api/v1/allow/hosts", &body) {
+            if !pid1_is_nfty() && is_controller_unavailable(&e) {
+                return Ok(());
             }
+            return Err(e);
         }
     }
     Ok(())
@@ -812,15 +764,12 @@ pub(crate) fn dispatch_backend_drain_state(
     endpoints: &[String],
     drained: bool,
 ) -> Result<()> {
-    let bind = {
+    let socket = {
         let mut st = shared.write().unwrap();
-        if st.controller_is_authoritative
-            || (st.controller_ipc_addr().is_none() && !pid1_is_nfty())
-        {
+        if st.controller_is_authoritative || (!st.controller_socket.exists() && !pid1_is_nfty()) {
             return crate::compiler::set_backend_drain_state(&mut st, endpoints, drained);
         }
-        st.controller_ipc_addr()
-            .ok_or_else(|| anyhow::anyhow!("No controller API listener is active to dispatch backend state update"))?
+        st.controller_socket.clone()
     };
 
     let path = if drained {
@@ -830,7 +779,7 @@ pub(crate) fn dispatch_backend_drain_state(
     };
     for endpoint in endpoints {
         let body = serde_json::json!({"backend": endpoint}).to_string();
-        send_controller_request(&bind, "POST", path, &body).with_context(|| {
+        send_controller_request(&socket, "POST", path, &body).with_context(|| {
             format!(
                 "Controller failed to update backend {}; earlier updates, if any, may already be active",
                 endpoint
@@ -842,7 +791,6 @@ pub(crate) fn dispatch_backend_drain_state(
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod controller_dispatch_tests {
     use super::*;
@@ -851,49 +799,27 @@ mod controller_dispatch_tests {
 
     #[test]
     fn secondary_drain_uses_controller_and_keeps_state_on_rejection() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+        let dir = std::env::temp_dir().join(format!("nfty-ctl-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("ctl.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
-            for (path, status) in [
-                ("/api/v1/drain", "200 OK"),
-                ("/api/v1/enable", "500 Internal Server Error"),
-            ] {
+            for (path, status) in [("/api/v1/drain", 200), ("/api/v1/enable", 500)] {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = std::io::BufReader::new(&mut stream);
                 let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                assert_eq!(line.trim(), format!("POST {} HTTP/1.1", path));
-                let mut content_length = 0;
-                loop {
-                    line.clear();
-                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(value) = line.strip_prefix("Content-Length:") {
-                        content_length = value.trim().parse::<usize>().unwrap();
-                    }
-                }
-                assert!(content_length > 0);
-                let mut body = vec![0; content_length];
-                reader.read_exact(&mut body).unwrap();
-                let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
-                assert_eq!(
-                    body["backend"].as_str(),
-                    Some("192.0.2.21:80")
-                );
-                drop(reader);
-                write!(
-                    stream,
-                    "HTTP/1.1 {}\r\nContent-Length: 0\r\n\r\n",
-                    status
-                )
-                .unwrap();
+                std::io::BufReader::new(&mut stream).read_line(&mut line).unwrap();
+                let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(req["method"], "POST");
+                assert_eq!(req["path"], path);
+                let body: serde_json::Value =
+                    serde_json::from_str(req["body"].as_str().unwrap()).unwrap();
+                assert_eq!(body["backend"].as_str(), Some("192.0.2.21:80"));
+                writeln!(stream, "{}", serde_json::json!({"status": status, "body": {}})).unwrap();
             }
         });
-
         let mut state = AppState::new(crate::ast::Config::new(), PathBuf::from("Nftyfile"));
-        state.api_bind = Some(addr.to_string());
+        state.controller_socket = socket;
         state
             .runtime
             .insert("192.0.2.21:80".to_string(), Default::default());
@@ -907,6 +833,7 @@ mod controller_dispatch_tests {
         assert!(!state.kernel_applied);
         drop(state);
         server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

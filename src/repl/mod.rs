@@ -23,7 +23,6 @@ use crate::parser::{
     validate_host_mapping_name, WgPeerAction,
 };
 use crate::state::{HealthState, PendingConfirm, SharedState};
-use crate::tui::run_watch_dashboard;
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use rustyline::error::ReadlineError;
@@ -74,6 +73,23 @@ impl ShellLevel {
     }
 }
 
+tokio::task_local! {
+    static NON_INTERACTIVE: ();
+}
+
+/// Runs a REPL command with stdin prompts (key paste, password entry) disabled, e.g. for `/api/v1/cli`.
+pub async fn run_non_interactive<F: std::future::Future>(f: F) -> F::Output {
+    NON_INTERACTIVE.scope((), f).await
+}
+
+/// Fails unless the current command came from a terminal session that may prompt on stdin.
+pub fn require_interactive_terminal(what: &str) -> Result<()> {
+    if NON_INTERACTIVE.try_with(|_| ()).is_ok() || unsafe { libc::isatty(libc::STDIN_FILENO) != 1 } {
+        bail!("{} requires an interactive terminal session", what);
+    }
+    Ok(())
+}
+
 pub async fn run_repl(shared: SharedState) -> Result<()> {
     let level = Arc::new(Mutex::new(ShellLevel::Operational));
     let helper = NftyHelper::new(level.clone(), shared.clone());
@@ -81,22 +97,14 @@ pub async fn run_repl(shared: SharedState) -> Result<()> {
     let mut rl = Editor::new()?;
     rl.set_helper(Some(helper));
 
-    let (api_bind, api_ports) = {
-        let st = shared.read().unwrap();
-        (st.api_bind.clone(), st.active_config().api_ports())
-    };
+    let api_ports = shared.read().unwrap().active_config().api_ports();
     println!(
         "{}",
         "Welcome to nfty — L4 Service Load Balancer & Port Router for nftables"
             .bold()
             .cyan()
     );
-    if let Some(bind) = api_bind {
-        println!(
-            "1:1 Control API listening on {} (endpoints: /api/v1/allow, /api/v1/cli, /api/v1/status)",
-            format!("http://{}", bind).green().bold()
-        );
-    } else if !api_ports.is_empty() {
+    if !api_ports.is_empty() {
         let ports_str = api_ports
             .iter()
             .map(|p| format!(":{}", p))
@@ -108,11 +116,10 @@ pub async fn run_repl(shared: SharedState) -> Result<()> {
         );
     }
     println!(
-        "Type {} to enter config mode, {} for troubleshooting tools, {} for live status, {} for live TUI, or {} for help.\n",
+        "Type {} to enter config mode, {} for troubleshooting tools, {} for live status, or {} for help.\n",
         "configure".yellow(),
         "debug".magenta(),
         "status".green(),
-        "watch".cyan(),
         "?".cyan()
     );
     if std::path::Path::new("/run/nfty-ephemeral-storage").exists() {
@@ -225,7 +232,7 @@ pub async fn handle_line_checked(
             handle_bootstrap(&tokens[1..], shared)?;
             return Ok(false);
         }
-        "password" | "passwd" => {
+        "password" => {
             crate::ssh::interactive_change_password(false)?;
             return Ok(false);
         }
@@ -267,7 +274,7 @@ pub async fn handle_line_checked(
             }
             return Ok(false);
         }
-        "exit" | "end" => {
+        "exit" => {
             let mut lvl = level.lock().unwrap();
             match &*lvl {
                 ShellLevel::ServiceTo(k) | ShellLevel::ServiceAllow(k) => {
@@ -302,49 +309,19 @@ pub async fn handle_line_checked(
             }
             return Ok(false);
         }
-        "scan" | "discover" => {
-            let filter = tokens.get(1).copied();
-            println!(
-                "{}",
-                "Scanning LXD / LAN neighbors for active services...".cyan()
-            );
-            let discovered = crate::features::scan_network_services_async(filter, shared).await?;
-            crate::features::print_scan_table(&discovered, shared);
-            return Ok(false);
-        }
-        "adopt" => {
-            handle_adopt(&tokens[1..], level, shared).await?;
-            return Ok(false);
-        }
         "status" => {
             print_status_table(shared);
             return Ok(false);
         }
-        "flows" | "conntrack" => {
+        "flows" => {
             crate::features::print_flows_table(shared);
             return Ok(false);
         }
-        "wg" | "wireguard"
-            if (cur_level != ShellLevel::Debug
-                && !(cmd == "wireguard"
-                    && matches!(
-                        cur_level,
-                        ShellLevel::Gateway(_)
-                            | ShellLevel::GatewayService(_)
-                            | ShellLevel::GatewayApi(_, _)
-                            | ShellLevel::GatewayTunnels(_)
-                            | ShellLevel::GatewayWgIngress(_, _)
-                    )
-                    && !matches!(
-                        tokens.get(1).copied(),
-                        Some("add" | "paste" | "edit" | "rm" | "list" | "show" | "vi")
-                    )))
-                || matches!(
-                    tokens.get(1).copied(),
-                    Some("add" | "paste" | "edit" | "rm" | "list")
-                ) =>
+        "wg"
+            if cur_level != ShellLevel::Debug
+                || matches!(tokens.get(1).copied(), Some("add" | "rm" | "list")) =>
         {
-            if matches!(tokens.get(1).copied(), Some("peer" | "peers" | "qr")) {
+            if matches!(tokens.get(1).copied(), Some("peer" | "qr")) {
                 handle_top_level_peer_command(&tokens[2..], &cur_level, shared)?;
                 return Ok(false);
             }
@@ -374,10 +351,6 @@ pub async fn handle_line_checked(
             }
             return Ok(false);
         }
-        "ssh-key" | "ssh-keys" | "authorized-keys" => {
-            crate::ssh::handle_ssh_cli_command(&tokens[1..])?;
-            return Ok(false);
-        }
         "ssh"
             if matches!(
                 cur_level,
@@ -390,23 +363,11 @@ pub async fn handle_line_checked(
             crate::ssh::handle_ssh_cli_command(&tokens[1..])?;
             return Ok(false);
         }
-        "cf" | "cloudflare"
+        "cf"
             if tokens.len() == 1
                 || matches!(
                     tokens[1].to_ascii_lowercase().as_str(),
-                    "status"
-                        | "token"
-                        | "api-token"
-                        | "key"
-                        | "tunnel-token"
-                        | "connector-token"
-                        | "sync"
-                        | "reconcile"
-                        | "logs"
-                        | "log"
-                        | "stop"
-                        | "clear"
-                        | "off"
+                    "status" | "token" | "tunnel-token" | "sync" | "logs" | "stop" | "clear"
                 )
                 || matches!(cur_level, ShellLevel::Operational | ShellLevel::ConfigRoot) =>
         {
@@ -418,14 +379,10 @@ pub async fn handle_line_checked(
                 || (tokens.len() >= 2
                     && matches!(
                         tokens[1].to_ascii_lowercase().as_str(),
-                        "status" | "test" | "lookup" | "query" | "config" | "reload" | "flush"
+                        "status" | "test" | "config" | "reload"
                     )) =>
         {
             crate::features::handle_dns_cli_command(&tokens[1..], shared)?;
-            return Ok(false);
-        }
-        "watch" => {
-            run_watch_dashboard(shared.clone()).await?;
             return Ok(false);
         }
         "probe" => {
@@ -482,21 +439,21 @@ pub async fn handle_line_checked(
             handle_show(&tokens[1..], &cur_level, shared);
             return Ok(false);
         }
-        "diff" | "compare" => {
+        "diff" => {
             print_config_diff(shared);
             return Ok(false);
         }
-        "test" | "validate" | "check-config" => {
+        "test" => {
             if !handle_validate(shared) {
                 bail!("Configuration validation failed");
             }
             return Ok(false);
         }
-        "apply" | "commit" => {
+        "apply" => {
             handle_apply(&tokens[1..], shared).await?;
             return Ok(false);
         }
-        "confirm" | "keep" => {
+        "confirm" => {
             handle_confirm(shared)?;
             return Ok(false);
         }
@@ -516,7 +473,7 @@ pub async fn handle_line_checked(
             debug::run_ping_command(&tokens[1..])?;
             return Ok(false);
         }
-        "traceroute" | "tracepath" => {
+        "traceroute" => {
             debug::run_traceroute_command(&tokens[1..])?;
             return Ok(false);
         }
@@ -524,7 +481,7 @@ pub async fn handle_line_checked(
             debug::run_arping_command(&tokens[1..])?;
             return Ok(false);
         }
-        "debug" | "troubleshoot" | "diag" => {
+        "debug" => {
             if tokens.len() == 1 {
                 *level.lock().unwrap() = ShellLevel::Debug;
             } else {
@@ -533,7 +490,7 @@ pub async fn handle_line_checked(
             }
             return Ok(false);
         }
-        "peer" | "peers" | "wg-peer"
+        "peer"
             if !matches!(
                 cur_level,
                 ShellLevel::Gateway(_) | ShellLevel::GatewayWgIngress(_, _)
@@ -547,7 +504,7 @@ pub async fn handle_line_checked(
 
     match cur_level {
         ShellLevel::Operational => match cmd.as_str() {
-            "configure" | "conf" | "config" | "edit" => {
+            "configure" => {
                 *level.lock().unwrap() = ShellLevel::ConfigRoot;
             }
             "vip" | "service" | "gateway" | "allow" | "dns" => {
@@ -639,23 +596,23 @@ fn handle_host_mapping(args: &[&str], shared: &SharedState) -> Result<()> {
     Ok(())
 }
 
-/// Bootstraps one or more Virtual IPs (`bootstrap <ip[/prefix]> [ip2...] [dev <iface>]`):
+/// Bootstraps one or more Virtual IPs (`bootstrap <ip[/prefix]> [ip2...] [interface <iface>]`):
 /// - Configures `<ip>` as a VIP on `eth0/24` (or specified prefix/interface)
 /// - Creates a base SSH service block (`service <ip>:22`) allowing SSH to that IP
 /// - Applies the VIP and ruleset so you can bootstrap as many IPs as you want
 pub fn handle_bootstrap(args: &[&str], shared: &SharedState) -> Result<()> {
     if args.is_empty() {
-        bail!("Usage: bootstrap <ip[/prefix]> [ip2...] (e.g. 'bootstrap 192.168.4.250')");
+        bail!("Usage: bootstrap <ip[/prefix]> [ip2...] [interface <iface>] (e.g. 'bootstrap 192.168.4.250')");
     }
 
     let mut iface = "eth0".to_string();
     let mut ip_specs = Vec::new();
     let mut idx = 0;
     while idx < args.len() {
-        if matches!(args[idx].to_ascii_lowercase().as_str(), "dev" | "interface") {
+        if matches!(args[idx].to_ascii_lowercase().as_str(), "interface") {
             idx += 1;
             if idx >= args.len() {
-                bail!("Expected interface name after 'dev'");
+                bail!("Expected interface name after 'interface'");
             }
             iface = args[idx].to_string();
         } else if args[idx]
@@ -664,6 +621,9 @@ pub fn handle_bootstrap(args: &[&str], shared: &SharedState) -> Result<()> {
             .map(|c| c.is_ascii_alphabetic())
             .unwrap_or(false)
         {
+            if matches!(args[idx].to_ascii_lowercase().as_str(), "dev" | "iface") {
+                bail!("Unknown keyword '{}' in bootstrap (use 'interface <iface>')", args[idx]);
+            }
             iface = args[idx].to_string();
         } else {
             ip_specs.push(args[idx]);
@@ -862,7 +822,7 @@ fn handle_config_root_command(
                         if idx < tokens.len()
                             && !matches!(
                                 tokens[idx].to_ascii_lowercase().as_str(),
-                                "vlan" | "service" | "services" | "ssh" | "dns" | "api"
+                                "vlan" | "service" | "ssh" | "dns" | "api"
                             )
                             && !tokens[idx].starts_with("ssh:")
                             && !tokens[idx].starts_with("dns:")
@@ -871,7 +831,7 @@ fn handle_config_root_command(
                             idx += 1;
                         }
                     }
-                    "vlan" | "dev" | "interface" | "vip" => {
+                    "vlan" | "interface" | "vip" => {
                         idx += 2;
                     }
                     _ => break,
@@ -925,14 +885,14 @@ fn handle_config_root_command(
                         if idx < tokens.len()
                             && !matches!(
                                 tokens[idx].to_ascii_lowercase().as_str(),
-                                "vlan" | "service" | "services" | "tunnel" | "tunnels" | "api"
+                                "vlan" | "service" | "tunnel" | "tunnels" | "api"
                             )
                             && !tokens[idx].starts_with("api:")
                         {
                             idx += 1;
                         }
                     }
-                    "vlan" | "dev" | "interface" | "vip" => {
+                    "vlan" | "interface" | "vip" => {
                         idx += 2;
                     }
                     _ => break,
@@ -976,7 +936,7 @@ fn handle_config_root_command(
             }
             Ok(())
         }
-        "no" | "delete" | "remove" => {
+        "no" => {
             if tokens.len() < 2 {
                 bail!("Usage: no <vip|gateway|service|allow|dns> [target]");
             }
@@ -1123,7 +1083,7 @@ fn handle_global_allow_command(trimmed: &str, shared: &SharedState) -> Result<()
     }
     let first_lower = tokens[0].to_ascii_lowercase();
     let mut st = shared.write().unwrap();
-    if matches!(first_lower.as_str(), "no" | "delete" | "remove") {
+    if matches!(first_lower.as_str(), "no") {
         if tokens.len() < 2 {
             bail!("Usage: no <host|wildcard|cidr>");
         }
@@ -1169,7 +1129,7 @@ fn handle_vip_level_command(
     let first_lower = tokens[0].to_ascii_lowercase();
 
     match first_lower.as_str() {
-        "service" | "services" => {
+        "service" => {
             if tokens.len() == 1 {
                 *level.lock().unwrap() = ShellLevel::VipService(vip_key.to_string());
                 return Ok(());
@@ -1258,7 +1218,7 @@ fn handle_vip_level_command(
             );
             return Ok(());
         }
-        "vip" | "interface" | "dev" => {
+        "vip" | "interface" => {
             if tokens.len() < 2 {
                 bail!("Expected interface[/prefix] (e.g. 'vip eth0/21')");
             }
@@ -1292,10 +1252,8 @@ fn handle_vip_level_command(
             );
             return Ok(());
         }
-        "ssh" | "local" => {
-            let spec = if first_lower == "local" {
-                tokens.get(1).copied().unwrap_or("ssh:22")
-            } else if tokens.len() >= 2 && tokens[1].parse::<u16>().is_ok() {
+        "ssh" => {
+            let spec = if tokens.len() >= 2 && tokens[1].parse::<u16>().is_ok() {
                 &format!("ssh:{}", tokens[1])
             } else {
                 "ssh:22"
@@ -1394,17 +1352,10 @@ fn handle_vip_level_command(
         "gateway" => {
             return handle_config_root_command(trimmed, level, shared);
         }
-        "cloudflare-dns"
-        | "cloudflare"
-        | "cf"
-        | "tunnel-dns"
-        | "cloudflare-auth"
-        | "cf-auth"
-        | "tunnel-auth"
-        | "auth" => {
+        "cloudflare-dns" | "cloudflare-auth" => {
             if tokens.len() < 2 {
                 bail!(
-                    "Expected argument after '{}' (e.g. 'cloudflare-dns sonarr.domain.com' or 'cloudflare-auth nfty')",
+                    "Expected argument after '{}' (e.g. 'cloudflare-dns sonarr.domain.com' or 'cloudflare-auth you@example.com')",
                     tokens[0]
                 );
             }
@@ -1437,13 +1388,13 @@ fn handle_vip_level_command(
                 );
             }
         }
-        "no" | "delete" | "remove" => {
+        "no" => {
             if tokens.len() < 2 {
                 bail!("Usage: no <vlan | dhcp | cloudflare-dns | cloudflare-auth | ssh:22 | service <target>>");
             }
             if matches!(
                 tokens[1].to_ascii_lowercase().as_str(),
-                "cloudflare-dns" | "cloudflare" | "cf" | "tunnel-dns"
+                "cloudflare-dns"
             ) {
                 let mut st = shared.write().unwrap();
                 for s in st
@@ -1463,7 +1414,7 @@ fn handle_vip_level_command(
             }
             if matches!(
                 tokens[1].to_ascii_lowercase().as_str(),
-                "cloudflare-auth" | "cf-auth" | "tunnel-auth"
+                "cloudflare-auth"
             ) {
                 let mut st = shared.write().unwrap();
                 for s in st
@@ -1476,26 +1427,6 @@ fn handle_vip_level_command(
                 }
                 println!(
                     "  {} [vip {}] Removed cloudflare-auth",
-                    "✔".green().bold(),
-                    vip_key.cyan()
-                );
-                return Ok(());
-            }
-            if matches!(
-                tokens[1].to_ascii_lowercase().as_str(),
-                "auth" | "basic-auth"
-            ) {
-                let mut st = shared.write().unwrap();
-                for s in st
-                    .candidate
-                    .services
-                    .values_mut()
-                    .filter(|s| s.belongs_to_vip(vip_key))
-                {
-                    s.auth.clear();
-                }
-                println!(
-                    "  {} [vip {}] Removed auth",
                     "✔".green().bold(),
                     vip_key.cyan()
                 );
@@ -1580,13 +1511,13 @@ fn handle_vip_service_command(
 
     if matches!(
         first_lower.as_str(),
-        "vip" | "interface" | "dev" | "dhcp" | "vlan" | "gateway"
+        "vip" | "interface" | "dhcp" | "vlan" | "gateway"
     ) {
         *level.lock().unwrap() = ShellLevel::Vip(vip_key.to_string());
         return handle_vip_level_command(vip_key, trimmed, level, shared);
     }
 
-    if matches!(first_lower.as_str(), "no" | "delete" | "remove") {
+    if matches!(first_lower.as_str(), "no") {
         if tokens.len() < 2 {
             bail!("Usage: no <target> (e.g. 'no plex:32400' or 'no 80')");
         }
@@ -1664,174 +1595,6 @@ fn handle_vip_service_command(
         let rest_cmd = rest_tokens.join(" ");
         handle_service_level_command(&svc_key, &rest_cmd, level, shared)?;
     }
-    Ok(())
-}
-
-pub async fn handle_adopt(
-    args: &[&str],
-    level: &Arc<Mutex<ShellLevel>>,
-    shared: &SharedState,
-) -> Result<()> {
-    if args.is_empty() {
-        bail!(
-            "Usage: adopt <# | service_name | host:port> [vip <vip_name_or_ip>] [port <listen_port>] [vlan <id>]"
-        );
-    }
-
-    let raw_target = args[0].trim().trim_start_matches('#');
-    let mut explicit_vip: Option<String> = None;
-    let mut explicit_port: Option<u16> = None;
-    let mut explicit_vlan: Option<u16> = None;
-
-    let mut idx = 1;
-    while idx < args.len() {
-        match args[idx].to_ascii_lowercase().as_str() {
-            "vip" | "on" => {
-                idx += 1;
-                if idx >= args.len() {
-                    bail!("Expected VIP name or IPv4 address after 'vip'");
-                }
-                explicit_vip = Some(args[idx].to_string());
-            }
-            "port" | "as" => {
-                idx += 1;
-                if idx >= args.len() {
-                    bail!("Expected port number (1-65535) after 'port'");
-                }
-                explicit_port = Some(args[idx].parse()?);
-            }
-            "vlan" => {
-                idx += 1;
-                if idx >= args.len() {
-                    bail!("Expected VLAN ID (1-4094) after 'vlan'");
-                }
-                explicit_vlan = Some(parse_vlan_id(args[idx])?);
-            }
-            other => {
-                if explicit_vip.is_none() {
-                    explicit_vip = Some(other.to_string());
-                }
-            }
-        }
-        idx += 1;
-    }
-
-    let need_auto_scan = {
-        let st = shared.read().unwrap();
-        st.discovered_services.is_empty() && !raw_target.contains(':')
-    };
-    if need_auto_scan {
-        crate::features::scan_network_services_async(None, shared).await?;
-    }
-
-    let resolved = {
-        let st = shared.read().unwrap();
-        if let Ok(num) = raw_target.parse::<usize>() {
-            st.discovered_services
-                .iter()
-                .find(|d| d.index == num)
-                .cloned()
-        } else {
-            st.discovered_services
-                .iter()
-                .find(|d| {
-                    d.service_name.eq_ignore_ascii_case(raw_target)
-                        || d.suggested_vip_name().eq_ignore_ascii_case(raw_target)
-                        || d.target_spec().eq_ignore_ascii_case(raw_target)
-                        || format!("{}:{}", d.ip, d.port).eq_ignore_ascii_case(raw_target)
-                })
-                .cloned()
-        }
-    };
-
-    let (target_spec, service_name, backend_port) = if let Some(d) = resolved {
-        (d.target_spec(), d.suggested_vip_name(), d.port)
-    } else if raw_target.contains(':') {
-        let b = parse_backend(&[raw_target], 80)?;
-        let name = b
-            .host
-            .clone()
-            .unwrap_or_else(|| format!("svc-{}", b.port));
-        (b.to_string(), name, b.port)
-    } else {
-        bail!(
-            "Could not find '{}' in discovered services. Run 'scan' first or specify '<host>:<port>' (e.g. 'adopt app-backend:8989').",
-            args[0]
-        );
-    };
-
-    let cur_lvl = level.lock().unwrap().clone();
-    let vip_key = if let Some(v) = explicit_vip {
-        v
-    } else if let ShellLevel::Vip(cur_v) | ShellLevel::VipService(cur_v) = &cur_lvl {
-        cur_v.clone()
-    } else {
-        service_name.clone()
-    };
-
-    let (vip_key, _ip_opt, mut parsed_vip) = parse_vip_header(&[vip_key.as_str()])?;
-    if let Some(vid) = explicit_vlan {
-        parsed_vip.vlan = Some(vid);
-    }
-
-    let listen_port = if let Some(p) = explicit_port {
-        p
-    } else if parsed_vip.dhcp && backend_port != 22 && backend_port != 443 {
-        80
-    } else {
-        backend_port
-    };
-
-    let svc_spec = if listen_port != backend_port {
-        format!("{} to {}", listen_port, target_spec)
-    } else {
-        target_spec.clone()
-    };
-
-    let svc_key = {
-        let mut st = shared.write().unwrap();
-        let entry = st
-            .candidate
-            .vips
-            .entry(vip_key.clone())
-            .or_insert_with(|| parsed_vip.clone());
-        if parsed_vip.dhcp {
-            entry.dhcp = true;
-        }
-        if let Some(vid) = explicit_vlan {
-            entry.vlan = Some(vid);
-        }
-        let k = create_or_find_vip_service_by_key(&mut st.candidate, &vip_key, &svc_spec)?;
-        if let Some(svc) = st.candidate.services.get_mut(&k) {
-            if svc.check.is_none() {
-                svc.check = Some(crate::ast::HealthCheckConfig {
-                    kind: crate::ast::HealthCheckKind::Tcp,
-                    interval_secs: 5,
-                });
-            }
-            if !parsed_vip.dhcp && svc.hostname.is_none() && !service_name.is_empty() {
-                let h = if service_name.ends_with(".local") {
-                    service_name.clone()
-                } else {
-                    format!("{}.local", service_name)
-                };
-                svc.hostname = Some(h);
-            }
-        }
-        st.sync_runtime_entries();
-        k
-    };
-
-    *level.lock().unwrap() = ShellLevel::Vip(vip_key.clone());
-    println!(
-        "  {} Adopted {} into vip {} -> {} ({}) — run {} to activate!",
-        "✔".green().bold(),
-        target_spec.bold(),
-        vip_key.cyan().bold(),
-        svc_spec.green().bold(),
-        svc_key,
-        "apply".yellow().bold()
-    );
     Ok(())
 }
 
@@ -1941,7 +1704,7 @@ fn handle_service_to_command(
         .get_mut(svc_key)
         .ok_or_else(|| anyhow::anyhow!("Service '{}' no longer exists", svc_key))?;
 
-    if matches!(first_lower.as_str(), "no" | "delete" | "remove") {
+    if matches!(first_lower.as_str(), "no") {
         if tokens.len() < 2 {
             bail!("Usage: no <ip[:port]> (e.g. 'no 192.168.1.60:9000')");
         }
@@ -2019,7 +1782,7 @@ fn handle_service_allow_command(
         .ok_or_else(|| anyhow::anyhow!("Service '{}' no longer exists", svc_key))?;
 
     let first_lower = tokens[0].to_ascii_lowercase();
-    if matches!(first_lower.as_str(), "no" | "delete" | "remove") {
+    if matches!(first_lower.as_str(), "no") {
         if tokens.len() < 2 {
             bail!("Usage: no <host|wildcard|cidr>");
         }
@@ -2070,7 +1833,7 @@ fn handle_gateway_level_command(
             *level.lock().unwrap() = ShellLevel::GatewayTunnels(gw_key.to_string());
             return Ok(());
         }
-        "service" | "services" if tokens.len() == 1 => {
+        "service" if tokens.len() == 1 => {
             *level.lock().unwrap() = ShellLevel::GatewayService(gw_key.to_string());
             return Ok(());
         }
@@ -2123,7 +1886,7 @@ fn handle_gateway_level_command(
         "gateway" => {
             return handle_config_root_command(trimmed, level, shared);
         }
-        "peer" | "peers" | "client" => {
+        "peer" => {
             let port = {
                 let mut st = shared.write().unwrap();
                 let gw = st
@@ -2194,7 +1957,7 @@ fn handle_gateway_level_command(
             .get_mut(gw_key)
             .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
         apply_gateway_directive(gw, trimmed)?;
-        if first_lower == "key" || first_lower == "api-key" || first_lower == "apikey" {
+        if first_lower == "key" {
             gw.services
                 .iter()
                 .find(|s| s.kind == GatewayServiceKind::Api)
@@ -2248,15 +2011,10 @@ fn handle_gateway_api_command(
             | "allow"
             | "gateway"
             | "service"
-            | "services"
             | "forward"
-            | "privoxy"
-            | "socks5"
             | "ssh"
             | "dns"
-    ) || first_lower.starts_with("privoxy:")
-        || first_lower.starts_with("socks5:")
-        || first_lower.starts_with("ssh:")
+    ) || first_lower.starts_with("ssh:")
         || first_lower.starts_with("dns:")
     {
         *level.lock().unwrap() = ShellLevel::Gateway(gw_key.to_string());
@@ -2336,16 +2094,11 @@ fn handle_gateway_wg_ingress_command(
             | "allow"
             | "gateway"
             | "service"
-            | "services"
             | "forward"
-            | "privoxy"
-            | "socks5"
             | "ssh"
             | "api"
             | "web"
-    ) || first_lower.starts_with("privoxy:")
-        || first_lower.starts_with("socks5:")
-        || first_lower.starts_with("ssh:")
+    ) || first_lower.starts_with("ssh:")
         || first_lower.starts_with("api:")
         || first_lower.starts_with("web:")
     {
@@ -2354,7 +2107,7 @@ fn handle_gateway_wg_ingress_command(
     }
 
     // Allow shorthand `add <name>`, `show <name>`, `qr <name>`, `list`, `rm <name>` inside `wg-in:<port>`
-    let effective_stmt = if matches!(first_lower.as_str(), "add" | "new" | "create" | "qr" | "qrcode" | "list" | "ls" | "rm" | "del") {
+    let effective_stmt = if matches!(first_lower.as_str(), "add" | "new" | "create" | "qr" | "list" | "ls" | "rm") {
         format!("peer {}", trimmed)
     } else if first_lower == "show" && tokens.len() >= 2 && !matches!(tokens[1].to_ascii_lowercase().as_str(), "all" | "running" | "candidate" | "nft" | "allow" | "vips" | "dns" | "ssh") {
         format!("peer {}", trimmed)
@@ -2557,7 +2310,7 @@ fn handle_top_level_peer_command(
     }
     let sub = args[0].to_ascii_lowercase();
     match sub.as_str() {
-        "show" | "conf" | "config" | "cat" => {
+        "show" => {
             if args.len() < 2 {
                 bail!("Usage: peer show <name>");
             }
@@ -2574,7 +2327,7 @@ fn handle_top_level_peer_command(
                 .unwrap_or(wg_in_gws[0]);
             print_wg_peer_action(cfg, gw, &WgPeerAction::Show(name.to_string()))
         }
-        "qr" | "qrcode" => {
+        "qr" => {
             if args.len() < 2 {
                 bail!("Usage: peer qr <name>");
             }
@@ -2656,9 +2409,9 @@ fn handle_gateway_service_command(
         .get_mut(gw_key)
         .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
 
-    if matches!(first_lower.as_str(), "no" | "delete" | "remove") {
+    if matches!(first_lower.as_str(), "no") {
         if tokens.len() < 2 {
-            bail!("Usage: no <privoxy|socks5|ssh|dns|api>");
+            bail!("Usage: no <ssh|dns|api|web>");
         }
         let gs = parse_gateway_service(tokens[1])?;
         let before = gw.services.len();
@@ -2715,25 +2468,11 @@ fn handle_gateway_tunnels_command(
         return handle_gateway_level_command(gw_key, trimmed, level, shared);
     }
 
-    if matches!(
-        first_lower.as_str(),
-        "add" | "edit" | "nano" | "vi" | "vim" | "paste"
-    ) {
+    if first_lower == "add" {
         if tokens.len() < 2 {
-            bail!(
-                "Usage: {} <tunnel-name> (e.g. '{} mullvad-us-sea-001')",
-                first_lower,
-                first_lower
-            );
+            bail!("Usage: add <tunnel-name> (e.g. 'add mullvad-us-sea-001')");
         }
-        let saved_opt = if first_lower == "paste" {
-            crate::features::paste_wg_config_interactive(tokens[1])?
-        } else if first_lower == "vi" || first_lower == "vim" {
-            crate::features::edit_wg_config_interactive(tokens[1], Some("vi"))?
-        } else {
-            crate::features::edit_wg_config_interactive(tokens[1], Some("nano"))?
-        };
-        let Some(saved_filename) = saved_opt else {
+        let Some(saved_filename) = crate::features::paste_wg_config_interactive(tokens[1])? else {
             return Ok(());
         };
         let mut st = shared.write().unwrap();
@@ -2764,16 +2503,13 @@ fn handle_gateway_tunnels_command(
         let filename = crate::features::normalize_wg_filename(tokens[0])?;
         let full_path = std::path::Path::new("/data/wg").join(&filename);
         if !full_path.exists() {
-            if let Some(saved_name) =
-                crate::features::edit_wg_config_interactive(&filename, Some("nano"))?
-            {
-                effective_tokens[0] = saved_name;
-            } else {
-                return Ok(());
-            }
-        } else {
-            effective_tokens[0] = filename;
+            bail!(
+                "{} not found; run 'add {}' to paste the WireGuard config first",
+                full_path.display(),
+                tokens[0]
+            );
         }
+        effective_tokens[0] = filename;
     }
 
     let mut st = shared.write().unwrap();
@@ -2783,7 +2519,7 @@ fn handle_gateway_tunnels_command(
         .get_mut(gw_key)
         .ok_or_else(|| anyhow::anyhow!("Gateway '{}' no longer exists", gw_key))?;
 
-    if matches!(first_lower.as_str(), "no" | "delete" | "remove") {
+    if matches!(first_lower.as_str(), "no") {
         if tokens.len() < 2 {
             bail!("Usage: no <tunnel-name>");
         }

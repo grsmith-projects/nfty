@@ -6,7 +6,7 @@ use crate::health::{refresh_allowlist_hosts, run_all_probes_once};
 use crate::parser::{parse_nftyfile, validate_allow_entry, validate_host_mapping_name};
 use crate::repl::{handle_line_checked, ShellLevel};
 use crate::state::{AppState, SharedState};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -73,71 +73,6 @@ pub struct CloudflareConfigRequest {
     pub tunnel_token: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct AuthLoginRequest {
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub key: Option<String>,
-}
-
-const SESSION_TTL_SECS: u64 = 12 * 3600;
-
-static ACTIVE_SESSIONS: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<String, std::time::Instant>>,
-> = std::sync::OnceLock::new();
-
-fn session_store() -> &'static std::sync::Mutex<HashMap<String, std::time::Instant>> {
-    ACTIVE_SESSIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-fn issue_session_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let mut hex = String::with_capacity(64);
-    for b in bytes {
-        hex.push_str(&format!("{:02x}", b));
-    }
-    let token = format!("nfty_session_{}", hex);
-    let now = std::time::Instant::now();
-    if let Ok(mut map) = session_store().lock() {
-        map.retain(|_, created| now.duration_since(*created).as_secs() < SESSION_TTL_SECS);
-        map.insert(token.clone(), now);
-    }
-    token
-}
-
-fn verify_session_token(candidate: &str) -> bool {
-    let trimmed = candidate.trim();
-    if !trimmed.starts_with("nfty_session_") || trimmed.len() < 45 {
-        return false;
-    }
-    let now = std::time::Instant::now();
-    let Ok(mut map) = session_store().lock() else {
-        return false;
-    };
-    map.retain(|_, created| now.duration_since(*created).as_secs() < SESSION_TTL_SECS);
-    map.keys()
-        .any(|tok| crate::ssh::constant_time_eq(tok.as_bytes(), trimmed.as_bytes()))
-}
-
-fn verify_appliance_credential(candidate: &str) -> bool {
-    let trimmed = candidate.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if verify_session_token(trimmed) {
-        return true;
-    }
-    if let Some((user, pass)) = trimmed.split_once(':') {
-        if crate::ssh::verify_http_login(user.trim(), pass) {
-            return true;
-        }
-    }
-    let auth = crate::ssh::load_auth_config();
-    crate::ssh::verify_http_login(&auth.username, trimmed)
-}
-
 #[derive(Debug, Serialize)]
 pub struct AllowStatusResponse {
     pub global_allow: Vec<String>,
@@ -146,22 +81,8 @@ pub struct AllowStatusResponse {
     pub expanded_service_sets: BTreeMap<String, Vec<String>>,
 }
 
-pub fn spawn_api_server(shared: SharedState, bind_addr: Option<String>) {
-    let mut primary_port: Option<u16> = None;
-    if let Some(addr) = bind_addr.filter(|s| !s.trim().is_empty()) {
-        primary_port = addr.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok());
-        let shared_main = shared.clone();
-        tokio::spawn(async move {
-            let listener = match TcpListener::bind(&addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("[nfty api] Failed to bind {}: {}", addr, e);
-                    return;
-                }
-            };
-            run_api_listener(listener, shared_main).await;
-        });
-    }
+pub fn spawn_api_server(shared: SharedState) {
+    spawn_controller_socket(shared.clone());
 
     // Dynamically bind any custom `api:<port>` or `web:<port>` ports configured on VIPs or Gateways
     tokio::spawn(async move {
@@ -182,7 +103,7 @@ pub fn spawn_api_server(shared: SharedState, bind_addr: Option<String>) {
                 keep
             });
             for port in desired_ports {
-                if Some(port) == primary_port || listeners.contains_key(&port) {
+                if listeners.contains_key(&port) {
                     continue;
                 }
                 let addr = format!("0.0.0.0:{}", port);
@@ -217,8 +138,7 @@ async fn run_api_listener(listener: TcpListener, shared: SharedState) {
     }
 }
 
-fn extract_api_key_from_request(header_part: &str, query: &str) -> (Option<String>, bool) {
-    let mut is_internal_ipc = false;
+fn extract_api_key_from_request(header_part: &str, query: &str) -> Option<String> {
     let mut candidate_key: Option<String> = None;
 
     for line in header_part.lines().skip(1) {
@@ -228,87 +148,31 @@ fn extract_api_key_from_request(header_part: &str, query: &str) -> (Option<Strin
         let name_lower = name.trim().to_ascii_lowercase();
         let val_trimmed = val.trim();
         match name_lower.as_str() {
-            "x-nfty-internal-ipc" if crate::unikernel::verify_ipc_token(val_trimmed) => {
-                is_internal_ipc = true;
-            }
-            "x-api-key" | "x-nfty-key" => {
-                if !val_trimmed.is_empty() {
-                    candidate_key = Some(val_trimmed.to_string());
-                }
+            "x-api-key" if !val_trimmed.is_empty() => {
+                candidate_key = Some(val_trimmed.to_string());
             }
             "authorization" => {
-                if let Some(rest) = val_trimmed
+                if let Some(tok) = val_trimmed
                     .strip_prefix("Bearer ")
                     .or_else(|| val_trimmed.strip_prefix("bearer "))
-                    .or_else(|| val_trimmed.strip_prefix("Token "))
-                    .or_else(|| val_trimmed.strip_prefix("token "))
+                    .map(str::trim)
+                    .filter(|tok| !tok.is_empty())
                 {
-                    let tok = rest.trim();
-                    if !tok.is_empty() {
-                        candidate_key = Some(tok.to_string());
-                    }
-                } else if let Some(b64) = val_trimmed
-                    .strip_prefix("Basic ")
-                    .or_else(|| val_trimmed.strip_prefix("basic "))
-                {
-                    if let Some(decoded) = decode_basic_auth_token(b64.trim()) {
-                        candidate_key = Some(decoded);
-                    }
-                } else if !val_trimmed.is_empty() {
-                    candidate_key = Some(val_trimmed.to_string());
+                    candidate_key = Some(tok.to_string());
                 }
             }
             _ => {}
         }
     }
 
-    if candidate_key.is_none() && !query.is_empty() {
-        for pair in query.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                if matches!(k, "key" | "api_key" | "token") && !v.trim().is_empty() {
-                    candidate_key = Some(v.trim().to_string());
-                    break;
-                }
-            }
-        }
+    if candidate_key.is_none() {
+        candidate_key = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(k, v)| *k == "key" && !v.trim().is_empty())
+            .map(|(_, v)| v.trim().to_string());
     }
-
-    (candidate_key, is_internal_ipc)
-}
-
-fn decode_basic_auth_token(b64: &str) -> Option<String> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut vals = Vec::with_capacity(b64.len());
-    for b in b64.bytes() {
-        if b == b'=' {
-            break;
-        }
-        let pos = TABLE.iter().position(|&c| c == b)?;
-        vals.push(pos as u8);
-    }
-    let mut out = Vec::new();
-    for chunk in vals.chunks(4) {
-        if chunk.len() >= 2 {
-            out.push((chunk[0] << 2) | (chunk[1] >> 4));
-        }
-        if chunk.len() >= 3 {
-            out.push((chunk[1] << 4) | (chunk[2] >> 2));
-        }
-        if chunk.len() >= 4 {
-            out.push((chunk[2] << 6) | chunk[3]);
-        }
-    }
-    let s = String::from_utf8(out).ok()?;
-    if let Some((_user, pass)) = s.split_once(':') {
-        if !pass.is_empty() {
-            return Some(pass.to_string());
-        }
-    }
-    if !s.is_empty() {
-        Some(s)
-    } else {
-        None
-    }
+    candidate_key
 }
 
 /// Rejects a config whose `web:`/`api:` listeners lack an IP allow-list; such configs are never applied.
@@ -364,47 +228,26 @@ fn decode_path_component(encoded: &str) -> Result<String> {
     Ok(String::from_utf8(decoded)?)
 }
 
-/// Remote clients (and loopback requests without the root-only IPC token) must pass the listener's IP allow-list.
+/// Every client, including loopback, must pass the listener's IP allow-list; keyed listeners also need a key.
 pub fn authenticate_api_request_with_context(
     shared: &SharedState,
-    peer_is_loopback: bool,
-    is_internal_ipc: bool,
     candidate_key: Option<&str>,
     peer_ip: Option<Ipv4Addr>,
     local_port: Option<u16>,
 ) -> std::result::Result<ApiKeyScope, (u16, String)> {
-    if peer_is_loopback && is_internal_ipc {
-        return Ok(ApiKeyScope::ReadWrite);
-    }
-
     let st = shared.read().unwrap();
     let cfg = st.active_config();
-    let remote_access = match cfg.control_access(peer_ip, local_port) {
+    let access = match cfg.control_access(peer_ip, local_port) {
         ControlAccess::Denied(message) => return Err((403, message)),
-        access => Some(access),
+        access => access,
     };
-
-    if let Some(key_str) = candidate_key {
-        let configured_port = local_port.filter(|port| {
-            cfg.control_listeners().iter().any(|listener| listener.port == *port)
-        });
-        let key_scope = match configured_port {
-            Some(port) => cfg.verify_api_key_for_port(key_str, port),
-            None if peer_is_loopback => cfg.verify_api_key(key_str),
-            None => None,
-        };
-        if let Some(scope) = key_scope {
-            return Ok(scope);
-        }
-        if verify_appliance_credential(key_str) {
-            return Ok(ApiKeyScope::ReadWrite);
-        }
-        return Err((401, "Invalid API key or credentials".to_string()));
+    if let Some(key) = candidate_key {
+        return local_port
+            .and_then(|port| cfg.verify_api_key_for_port(key, port))
+            .ok_or((401, "Invalid API key".to_string()));
     }
-
-    match remote_access {
-        Some(ControlAccess::Granted) => Ok(ApiKeyScope::ReadWrite),
-        None if !cfg.has_any_api_keys() => Ok(ApiKeyScope::ReadWrite),
+    match access {
+        ControlAccess::Granted => Ok(ApiKeyScope::ReadWrite),
         _ => Err((
             401,
             "Authentication required: this listener requires an API key".to_string(),
@@ -412,6 +255,82 @@ pub fn authenticate_api_request_with_context(
     }
 }
 
+/// Serves CLI/SSH-session updates on a 0600 Unix socket, accepting only root or the controller's own uid.
+fn spawn_controller_socket(shared: SharedState) {
+    let path = shared.read().unwrap().controller_socket.clone();
+    tokio::spawn(async move {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let _ = std::fs::remove_file(&path);
+        let listener = match tokio::net::UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("[nfty api] Failed to bind controller socket {}: {}", path.display(), e);
+                return;
+            }
+        };
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("[nfty api] Failed to restrict controller socket {}: {}", path.display(), e);
+            return;
+        }
+        let own_uid = unsafe { libc::geteuid() };
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            };
+            let trusted = stream
+                .peer_cred()
+                .is_ok_and(|cred| cred.uid() == 0 || cred.uid() == own_uid);
+            if !trusted {
+                continue;
+            }
+            let state = shared.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_controller_connection(stream, state).await {
+                    eprintln!("[nfty api] Controller request failed: {:#}", e);
+                }
+            });
+        }
+    });
+}
+
+async fn handle_controller_connection(stream: tokio::net::UnixStream, shared: SharedState) -> Result<()> {
+    use tokio::io::AsyncBufReadExt;
+
+    #[derive(Deserialize)]
+    struct ControllerRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    let (reader, mut writer) = stream.into_split();
+    let mut line = String::new();
+    let limit = (MAX_HTTP_BODY_BYTES + 4096) as u64;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::io::BufReader::new(reader).take(limit).read_line(&mut line),
+    )
+    .await
+    .context("Controller request timed out")??;
+    let req: ControllerRequest = serde_json::from_str(line.trim()).context("Malformed controller request")?;
+    let (mut status, mut body) =
+        route_api_request_scoped(&req.method, &req.path, &req.body, &shared, ApiKeyScope::ReadWrite).await;
+    if status == 200 && request_persists_config(&req.method, &req.path, &body) {
+        if let Err(e) = crate::unikernel::persist_to_storage(&shared) {
+            status = 500;
+            body = json!({"ok": false, "error": format!("Operation completed but persistence failed: {:#}", e)});
+        }
+    }
+    let mut resp = json!({"status": status, "body": body}).to_string();
+    resp.push('\n');
+    writer.write_all(resp.as_bytes()).await?;
+    Ok(())
+}
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
@@ -491,7 +410,6 @@ mod http_framing_tests {
         assert!(request_persists_config("POST", "/api/v1/allow", &applied));
         assert!(!request_persists_config("POST", "/api/v1/allow", &staged));
         for path in [
-            "/api/v1/scan",
             "/api/v1/allow/hosts",
             "/api/v1/drain",
             "/api/v1/wg",
@@ -560,7 +478,6 @@ async fn read_full_http_request(stream: &mut TcpStream) -> Result<Option<Vec<u8>
 
 async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> Result<()> {
     let peer_addr = stream.peer_addr().ok();
-    let peer_is_loopback = peer_addr.map(|a| a.ip().is_loopback()).unwrap_or(false);
     let peer_ip = peer_addr.and_then(|a| match a.ip() {
         std::net::IpAddr::V4(v4) => Some(v4),
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
@@ -593,10 +510,9 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
     let full_path = parts[1];
     let (path, query) = full_path.split_once('?').unwrap_or((full_path, ""));
 
-    let (candidate_key, is_internal_ipc) = extract_api_key_from_request(header_part, query);
-    let trusted_ipc = peer_is_loopback && is_internal_ipc;
+    let candidate_key = extract_api_key_from_request(header_part, query);
 
-    if !trusted_ipc {
+    {
         let mut host_hdr: Option<&str> = None;
         let mut origin_hdr: Option<&str> = None;
         let mut sec_fetch_site: Option<&str> = None;
@@ -692,20 +608,18 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
     }
 
     if method == "OPTIONS" {
-        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, X-API-Key, X-Nfty-Key, Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, X-API-Key, Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         stream.write_all(resp.as_bytes()).await?;
         return Ok(());
     }
 
-    if !trusted_ipc {
-        let access = {
-            let st = shared.read().unwrap();
-            st.active_config().control_access(peer_ip, local_port)
-        };
-        if let ControlAccess::Denied(message) = access {
-            send_json(&mut stream, 403, &json!({"ok": false, "error": message})).await?;
-            return Ok(());
-        }
+    let access = {
+        let st = shared.read().unwrap();
+        st.active_config().control_access(peer_ip, local_port)
+    };
+    if let ControlAccess::Denied(message) = access {
+        send_json(&mut stream, 403, &json!({"ok": false, "error": message})).await?;
+        return Ok(());
     }
 
     let is_web_listener = {
@@ -731,95 +645,8 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
         }
     }
 
-    if method == "POST" && path == "/api/v1/auth/login" {
-        let req: AuthLoginRequest = match serde_json::from_str(body_part.trim()) {
-            Ok(r) => r,
-            Err(e) => {
-                send_json(&mut stream, 400, &json!({"ok": false, "error": e.to_string()})).await?;
-                return Ok(());
-            }
-        };
-        if let Some(k) = req.key.as_deref() {
-            let trimmed = k.trim();
-            if !trimmed.is_empty() {
-                let scope_opt = {
-                    let st = shared.read().unwrap();
-                    let cfg = st.active_config();
-                    match local_port {
-                        Some(port) if cfg.control_listeners().iter().any(|listener| listener.port == port) => {
-                            cfg.verify_api_key_for_port(trimmed, port)
-                        }
-                        _ if trusted_ipc => cfg.verify_api_key(trimmed),
-                        _ => None,
-                    }
-                };
-                if let Some(scope) = scope_opt {
-                    send_json(
-                        &mut stream,
-                        200,
-                        &json!({
-                            "ok": true,
-                            "token": trimmed,
-                            "scope": scope.as_str(),
-                            "mode": "api_key",
-                        }),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                if verify_appliance_credential(trimmed) {
-                    send_json(
-                        &mut stream,
-                        200,
-                        &json!({
-                            "ok": true,
-                            "token": issue_session_token(),
-                            "scope": "rw",
-                            "mode": "appliance_login",
-                        }),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                send_json(
-                    &mut stream,
-                    401,
-                    &json!({"ok": false, "error": "Invalid API key"}),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-        let user = req.username.as_deref().unwrap_or("nfty").trim();
-        let pass = req.password.as_deref().unwrap_or("");
-        if crate::ssh::verify_http_login(user, pass) {
-            send_json(
-                &mut stream,
-                200,
-                &json!({
-                    "ok": true,
-                    "token": issue_session_token(),
-                    "scope": "rw",
-                    "username": user,
-                    "mode": "appliance_login",
-                }),
-            )
-            .await?;
-        } else {
-            send_json(
-                &mut stream,
-                401,
-                &json!({"ok": false, "error": "Invalid username or password (or initial password must be rotated via SSH first)"}),
-            )
-            .await?;
-        }
-        return Ok(());
-    }
-
     let scope = match authenticate_api_request_with_context(
         &shared,
-        peer_is_loopback,
-        is_internal_ipc,
         candidate_key.as_deref(),
         peer_ip,
         local_port,
@@ -898,12 +725,12 @@ pub async fn route_api_request_scoped(
     shared: &SharedState,
     scope: ApiKeyScope,
 ) -> (u16, serde_json::Value) {
-    if scope == ApiKeyScope::ReadOnly && (method != "GET" || path == "/api/v1/scan") {
+    if scope == ApiKeyScope::ReadOnly && method != "GET" {
         return (
             403,
             json!({
                 "ok": false,
-                "error": "Forbidden: API key has read-only ('ro') scope; write and scan operations require a read-write ('rw') key"
+                "error": "Forbidden: API key has read-only ('ro') scope; write operations require a read-write ('rw') key"
             }),
         );
     }
@@ -913,7 +740,7 @@ pub async fn route_api_request_scoped(
         st.sync_from_disk_if_changed();
     }
     match (method, path) {
-        ("GET", "/api/v1/status") | ("GET", "/status") => {
+        ("GET", "/api/v1/status") => {
             let flows = crate::features::read_active_flows(shared);
             let mut wg_configs = crate::features::list_saved_wg_configs();
             if scope == ApiKeyScope::ReadOnly {
@@ -975,13 +802,6 @@ pub async fn route_api_request_scoped(
             let flows = crate::features::read_active_flows(shared);
             (200, json!({"ok": true, "flows": flows}))
         }
-        ("GET", "/api/v1/scan") | ("POST", "/api/v1/scan") => {
-            let filter = if body.is_empty() { None } else { Some(body) };
-            match crate::features::scan_network_services_async(filter, shared).await {
-                Ok(discovered) => (200, json!({"ok": true, "discovered": discovered})),
-                Err(e) => (400, json!({"ok": false, "error": format!("{:#}", e)})),
-            }
-        }
         ("GET", "/api/v1/wg") => {
             let mut wg_configs = crate::features::list_saved_wg_configs();
             if scope == ApiKeyScope::ReadOnly {
@@ -1025,7 +845,7 @@ pub async fn route_api_request_scoped(
                 Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
             }
         }
-        ("GET", "/api/v1/cloudflare") | ("GET", "/api/v1/cf") => {
+        ("GET", "/api/v1/cloudflare") => {
             let cf = match crate::features::load_cloudflare_config() {
                 Ok(cf) => cf,
                 Err(e) => return (500, json!({"ok": false, "error": format!("{:#}", e)})),
@@ -1052,7 +872,7 @@ pub async fn route_api_request_scoped(
                 }),
             )
         }
-        ("POST", "/api/v1/cloudflare") | ("POST", "/api/v1/cf") => {
+        ("POST", "/api/v1/cloudflare") => {
             let req: CloudflareConfigRequest = match serde_json::from_str(body) {
                 Ok(r) => r,
                 Err(e) => return (400, json!({"ok": false, "error": e.to_string()})),
@@ -1333,57 +1153,7 @@ pub async fn route_api_request_scoped(
                             json!({"ok": false, "error": "Custom file paths for save/load are not permitted over the HTTP API"}),
                         );
                     }
-                    let interactive_wg = matches!(command.as_str(), "wg" | "wireguard")
-                        && tokens.get(1).map(|sub| {
-                            !matches!(sub.to_ascii_lowercase().as_str(),
-                                "list" | "ls" | "show" | "cat" | "view" | "rm" | "del" | "delete" | "remove")
-                        }).unwrap_or(false);
-                    let interactive_ssh = {
-                        let cur_lvl = level.lock().unwrap().clone();
-                        let is_ssh_key_cmd = matches!(
-                            command.as_str(),
-                            "ssh-key" | "ssh-keys" | "authorized-keys"
-                        ) || (command == "ssh"
-                            && (matches!(
-                                cur_lvl,
-                                ShellLevel::Operational
-                                    | ShellLevel::ConfigRoot
-                                    | ShellLevel::GlobalAllow
-                                    | ShellLevel::Dns
-                            ) || (tokens.len() >= 2
-                                && !tokens[1].starts_with(':')
-                                && tokens[1].parse::<u16>().is_err())));
-                        if is_ssh_key_cmd {
-                            let args = if tokens.len() >= 2
-                                && matches!(
-                                    tokens[1].to_ascii_lowercase().as_str(),
-                                    "key" | "keys"
-                                )
-                            {
-                                &tokens[2..]
-                            } else {
-                                &tokens[1..]
-                            };
-                            match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
-                                None | Some("list") | Some("ls") | Some("status") => false,
-                                Some("show") | Some("cat") | Some("view") | Some("rm")
-                                | Some("del") | Some("delete") | Some("remove") => args.len() < 2,
-                                Some("add") | Some("new") | Some("create") | Some("set") => {
-                                    args.len() < 3
-                                }
-                                _ => true,
-                            }
-                        } else {
-                            false
-                        }
-                    };
-                    if matches!(command.as_str(), "password" | "passwd" | "watch")
-                        || interactive_wg
-                        || interactive_ssh
-                    {
-                        return (400, json!({"ok": false, "error": "Interactive commands are not available over the API"}));
-                    }
-                    match handle_line_checked(trimmed, &level, shared).await {
+                    match crate::repl::run_non_interactive(handle_line_checked(trimmed, &level, shared)).await {
                         Ok(true) => break,
                         Ok(false) => {}
                         Err(e) => return (400, json!({"ok": false, "error": format!("{:#}", e)})),
@@ -1553,1621 +1323,4 @@ async fn send_html(stream: &mut TcpStream, status: u16, html: &str) -> Result<()
     Ok(())
 }
 
-const WEB_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>nfty — L4/L7 Load Balancer, Programmable DNS &amp; WireGuard Gateway Console</title>
-<style>
-  :root {
-    --bg: #080b12;
-    --panel: #111827;
-    --panel-alt: #1a2335;
-    --panel-hover: #212d42;
-    --border: #2a364b;
-    --text: #f3f4f6;
-    --muted: #9ca3af;
-    --cyan: #06b6d4;
-    --blue: #3b82f6;
-    --green: #10b981;
-    --red: #ef4444;
-    --amber: #f59e0b;
-    --purple: #8b5cf6;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
-    line-height: 1.45;
-    display: flex;
-    height: 100vh;
-    overflow: hidden;
-  }
-  code, pre, .mono {
-    font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
-  /* Sidebar */
-  .sidebar {
-    width: 245px;
-    background: var(--panel);
-    border-right: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    flex-shrink: 0;
-  }
-  .brand {
-    padding: 18px 20px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  .brand-title {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 1.25rem;
-    font-weight: 800;
-    letter-spacing: -0.02em;
-    color: #fff;
-  }
-  .brand-dot {
-    width: 10px; height: 10px; border-radius: 50%;
-    background: var(--cyan);
-    box-shadow: 0 0 10px var(--cyan);
-  }
-  .nav-list {
-    padding: 12px 10px;
-    flex: 1;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .nav-btn {
-    background: transparent;
-    border: 1px solid transparent;
-    color: var(--muted);
-    text-align: left;
-    padding: 10px 12px;
-    border-radius: 8px;
-    font-size: 0.87rem;
-    font-weight: 600;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    transition: all 0.12s ease;
-  }
-  .nav-btn:hover {
-    background: var(--panel-alt);
-    color: var(--text);
-  }
-  .nav-btn.active {
-    background: rgba(6, 182, 212, 0.14);
-    border-color: rgba(6, 182, 212, 0.4);
-    color: var(--cyan);
-  }
-  .nav-count {
-    font-size: 0.72rem;
-    padding: 1px 7px;
-    border-radius: 99px;
-    background: var(--panel-alt);
-    color: var(--muted);
-    font-family: monospace;
-  }
-  .sidebar-footer {
-    padding: 14px;
-    border-top: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    font-size: 0.78rem;
-  }
-  /* Main Layout */
-  .main-wrap {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-  .topbar {
-    height: 60px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    padding: 0 24px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-shrink: 0;
-  }
-  .topbar-left {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-  }
-  .topbar-right {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .content {
-    flex: 1;
-    overflow-y: auto;
-    padding: 24px;
-  }
-  .tab-pane { display: none; }
-  .tab-pane.active { display: block; }
-
-  /* Badges & Pills */
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 3px 10px;
-    border-radius: 999px;
-    font-size: 0.74rem;
-    font-weight: 700;
-    letter-spacing: 0.02em;
-  }
-  .badge-rw { background: rgba(16, 185, 129, 0.16); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.4); }
-  .badge-ro { background: rgba(6, 182, 212, 0.16); color: var(--cyan); border: 1px solid rgba(6, 182, 212, 0.4); }
-  .badge-warn { background: rgba(245, 158, 11, 0.16); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.45); }
-  .badge-err { background: rgba(239, 68, 68, 0.16); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.45); }
-  .pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 2px 9px;
-    border-radius: 999px;
-    font-size: 0.74rem;
-    font-weight: 600;
-  }
-  .pill-up { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.35); }
-  .pill-down { background: rgba(239, 68, 68, 0.15); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.35); }
-  .pill-drain { background: rgba(245, 158, 11, 0.15); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.35); }
-  .pill-unknown { background: rgba(156, 163, 175, 0.15); color: var(--muted); border: 1px solid rgba(156, 163, 175, 0.3); }
-  .tag {
-    display: inline-block;
-    background: var(--panel-alt);
-    border: 1px solid var(--border);
-    padding: 2px 7px;
-    border-radius: 5px;
-    font-family: monospace;
-    font-size: 0.76rem;
-    margin: 2px;
-    color: #e5e7eb;
-  }
-
-  /* Buttons & Inputs */
-  .btn {
-    background: var(--panel-alt);
-    color: var(--text);
-    border: 1px solid var(--border);
-    padding: 7px 13px;
-    border-radius: 7px;
-    font-size: 0.82rem;
-    font-weight: 600;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    transition: all 0.12s;
-  }
-  .btn:hover:not(:disabled) { background: var(--panel-hover); border-color: #4b5563; }
-  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
-  .btn-primary { background: rgba(6, 182, 212, 0.18); border-color: var(--cyan); color: #67e8f9; }
-  .btn-primary:hover:not(:disabled) { background: rgba(6, 182, 212, 0.3); }
-  .btn-success { background: rgba(16, 185, 129, 0.18); border-color: var(--green); color: #6ee7b7; }
-  .btn-success:hover:not(:disabled) { background: rgba(16, 185, 129, 0.3); }
-  .btn-amber { background: rgba(245, 158, 11, 0.18); border-color: var(--amber); color: #fcd34d; }
-  .btn-danger { background: rgba(239, 68, 68, 0.16); border-color: var(--red); color: #fca5a5; }
-  .btn-sm { padding: 4px 9px; font-size: 0.75rem; border-radius: 5px; }
-
-  input, select, textarea {
-    background: #0b0f19;
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 7px;
-    padding: 8px 11px;
-    font-size: 0.85rem;
-    outline: none;
-  }
-  input:focus, select:focus, textarea:focus { border-color: var(--cyan); }
-
-  /* Cards & Sections */
-  .cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
-    gap: 14px;
-    margin-bottom: 22px;
-  }
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 15px 18px;
-  }
-  .card .label { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
-  .card .val { font-size: 1.75rem; font-weight: 700; margin-top: 4px; font-family: monospace; }
-  .card .sub { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
-
-  .section {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    margin-bottom: 22px;
-    overflow: hidden;
-  }
-  .section-header {
-    padding: 13px 18px;
-    border-bottom: 1px solid var(--border);
-    font-weight: 600;
-    font-size: 0.92rem;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background: rgba(255,255,255,0.02);
-    flex-wrap: wrap;
-    gap: 10px;
-  }
-  .section-body { padding: 18px; }
-  .grid-2 {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
-    gap: 18px;
-  }
-  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-  th, td { padding: 11px 16px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle; }
-  th { color: var(--muted); font-weight: 600; font-size: 0.73rem; text-transform: uppercase; letter-spacing: 0.05em; background: rgba(0,0,0,0.2); }
-  tr:last-child td { border-bottom: none; }
-  tr:hover td { background: rgba(255,255,255,0.015); }
-  .empty { padding: 28px; text-align: center; color: var(--muted); font-size: 0.88rem; }
-
-  /* Topology Graph */
-  .topo-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
-    gap: 14px;
-    padding: 16px;
-  }
-  .topo-vip-card {
-    background: #0b101b;
-    border: 1px solid var(--border);
-    border-radius: 9px;
-    padding: 14px;
-  }
-  .topo-vip-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding-bottom: 10px;
-    margin-bottom: 10px;
-    border-bottom: 1px dashed var(--border);
-  }
-  .topo-svc-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 7px 10px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    margin-bottom: 6px;
-    font-size: 0.81rem;
-  }
-
-  /* Slide-up CLI Drawer */
-  .cli-drawer {
-    background: #05080f;
-    border-top: 2px solid var(--cyan);
-    height: 290px;
-    display: none;
-    flex-direction: column;
-    flex-shrink: 0;
-  }
-  .cli-drawer.open { display: flex; }
-  .cli-header {
-    padding: 8px 18px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: 0.82rem;
-    font-weight: 600;
-  }
-  .cli-output {
-    flex: 1;
-    padding: 12px 18px;
-    overflow-y: auto;
-    font-family: monospace;
-    font-size: 0.82rem;
-    color: #d1d5db;
-    white-space: pre-wrap;
-  }
-  .cli-input-row {
-    display: flex;
-    border-top: 1px solid var(--border);
-    background: #090d16;
-    align-items: center;
-    padding: 6px 14px;
-    gap: 10px;
-  }
-  .cli-prompt { color: var(--cyan); font-family: monospace; font-weight: 700; font-size: 0.85rem; }
-  .cli-input-row input {
-    flex: 1;
-    border: none;
-    background: transparent;
-    font-family: monospace;
-    font-size: 0.86rem;
-    padding: 6px 4px;
-  }
-
-  /* Modal */
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.72);
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
-  }
-  .modal-backdrop.open { display: flex; }
-  .modal {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    width: 100%;
-    max-width: 520px;
-    padding: 22px;
-    box-shadow: 0 20px 50px rgba(0,0,0,0.6);
-  }
-  .modal h3 { font-size: 1.08rem; margin-bottom: 6px; }
-  .modal p { font-size: 0.83rem; color: var(--muted); margin-bottom: 16px; }
-  .form-row { margin-bottom: 13px; display: flex; flex-direction: column; gap: 5px; }
-  .form-row label { font-size: 0.78rem; color: var(--muted); font-weight: 600; }
-  .toast {
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    background: var(--panel-alt);
-    border: 1px solid var(--cyan);
-    color: #fff;
-    padding: 11px 16px;
-    border-radius: 8px;
-    font-size: 0.84rem;
-    z-index: 200;
-    display: none;
-    box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-  }
-</style>
-</head>
-<body>
-
-<!-- Sidebar Navigation -->
-<aside class="sidebar">
-  <div class="brand">
-    <div class="brand-title">
-      <span class="brand-dot"></span>
-      <span>nfty</span>
-    </div>
-    <span class="tag">web console</span>
-  </div>
-  <div class="nav-list">
-    <button class="nav-btn active" onclick="switchTab('overview', this)">
-      <span>1. Overview &amp; Topology</span>
-      <span class="nav-count" id="nav-cnt-overview">live</span>
-    </button>
-    <button class="nav-btn" onclick="switchTab('vips', this)">
-      <span>2. VIPs &amp; Services</span>
-      <span class="nav-count" id="nav-cnt-vips">0</span>
-    </button>
-    <button class="nav-btn" onclick="switchTab('gateways', this)">
-      <span>3. WireGuard Gateways</span>
-      <span class="nav-count" id="nav-cnt-gws">0</span>
-    </button>
-    <button class="nav-btn" onclick="switchTab('dns', this)">
-      <span>4. Programmable DNS</span>
-      <span class="nav-count" id="nav-cnt-dns">53</span>
-    </button>
-    <button class="nav-btn" onclick="switchTab('firewall', this)">
-      <span>5. Allow-List &amp; CF</span>
-      <span class="nav-count" id="nav-cnt-allow">0</span>
-    </button>
-    <button class="nav-btn" onclick="switchTab('flows', this)">
-      <span>6. Conntrack Flows</span>
-      <span class="nav-count" id="nav-cnt-flows">0</span>
-    </button>
-    <button class="nav-btn" onclick="switchTab('scanner', this)">
-      <span>7. Network Scanner</span>
-      <span class="nav-count" id="nav-cnt-scan">LAN</span>
-    </button>
-    <button class="nav-btn" onclick="switchTab('config', this)">
-      <span>8. Nftyfile &amp; nftables</span>
-      <span class="nav-count">AST</span>
-    </button>
-  </div>
-  <div class="sidebar-footer">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <span style="color:var(--muted)">Auth Scope:</span>
-      <span id="auth-scope-badge" class="badge badge-ro">CHECKING</span>
-    </div>
-    <div id="auth-peer-info" style="color:var(--muted);font-family:monospace;font-size:0.74rem"></div>
-    <button class="btn btn-sm" style="width:100%;justify-content:center;margin-top:4px" onclick="openAuthModal()">
-      🔑 Switch Key / Login
-    </button>
-  </div>
-</aside>
-
-<!-- Main Workspace -->
-<div class="main-wrap">
-  <header class="topbar">
-    <div class="topbar-left">
-      <span id="kernel-badge" class="badge badge-warn">● NFT STATUS UNKNOWN</span>
-      <span id="diff-badge" class="badge badge-warn" style="display:none">● UNCOMMITTED CANDIDATE CHANGES</span>
-      <span id="last-updated" style="font-size:0.8rem;color:var(--muted)">Connecting...</span>
-    </div>
-    <div class="topbar-right">
-      <button class="btn btn-sm" onclick="triggerProbe()" id="btn-probe">⚡ Probe Health Now</button>
-      <button class="btn btn-sm btn-success" onclick="applyCandidate()" id="btn-apply" style="display:none">✔ Apply Candidate</button>
-      <button class="btn btn-sm btn-primary" onclick="toggleCliDrawer()">⌘ Web CLI (`)</button>
-    </div>
-  </header>
-
-  <main class="content">
-    <!-- TAB 1: OVERVIEW & TOPOLOGY -->
-    <div id="tab-overview" class="tab-pane active">
-      <div class="cards">
-        <div class="card">
-          <div class="label">VIPs &amp; Gateways</div>
-          <div class="val" id="stat-vips" style="color:var(--cyan)">0</div>
-          <div class="sub" id="stat-vips-sub">0 services configured</div>
-        </div>
-        <div class="card">
-          <div class="label">Backends / Tunnels UP</div>
-          <div class="val" id="stat-up" style="color:var(--green)">0</div>
-          <div class="sub">Active in kernel verdict map</div>
-        </div>
-        <div class="card">
-          <div class="label">Backends DOWN</div>
-          <div class="val" id="stat-down" style="color:var(--red)">0</div>
-          <div class="sub">Auto-removed from routing</div>
-        </div>
-        <div class="card">
-          <div class="label">Backends DRAINED</div>
-          <div class="val" id="stat-drained" style="color:var(--amber)">0</div>
-          <div class="sub">Maintenance drain active</div>
-        </div>
-        <div class="card">
-          <div class="label">Active Conntrack Flows</div>
-          <div class="val" id="stat-flows" style="color:var(--purple)">0</div>
-          <div class="sub" id="stat-hosts-sub">0 allow-list hosts resolved</div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span>Live VIP, Service &amp; WireGuard Gateway Topology</span>
-          <div style="display:flex;gap:8px">
-            <button class="btn btn-sm rw-only" onclick="openAddServiceModal()">+ Add Service / VIP</button>
-          </div>
-        </div>
-        <div id="topo-wrap" class="topo-grid">
-          <div class="empty">Loading live topology...</div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span>All Services &amp; Gateway Health Matrix</span>
-        </div>
-        <div id="overview-table-wrap">
-          <div class="empty">Loading services...</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- TAB 2: VIPS & SERVICES -->
-    <div id="tab-vips" class="tab-pane">
-      <div class="section">
-        <div class="section-header">
-          <span>Virtual IPs (VIPs), L4/L7 Services &amp; Backend Controls</span>
-          <div style="display:flex;gap:8px">
-            <button class="btn btn-sm btn-primary rw-only" onclick="openAddServiceModal()">+ Add VIP / Service</button>
-          </div>
-        </div>
-        <div id="vips-detail-wrap">
-          <div class="empty">Loading VIPs and services...</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- TAB 3: WIREGUARD GATEWAYS -->
-    <div id="tab-gateways" class="tab-pane">
-      <div class="grid-2">
-        <div class="section">
-          <div class="section-header">
-            <span>Upload / Save WireGuard Profile (<code>/data/wg/*.conf</code>)</span>
-          </div>
-          <div class="section-body">
-            <div class="form-row">
-              <label>Profile Filename (e.g. <code>mullvad-us-sea-001.conf</code>)</label>
-              <input type="text" id="wg-upload-name" placeholder="mullvad-us-sea-001.conf">
-            </div>
-            <div class="form-row">
-              <label>WireGuard Configuration (<code>[Interface]</code> &amp; <code>[Peer]</code>)</label>
-              <textarea id="wg-upload-body" rows="6" class="mono" placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = 10.64.0.1/32&#10;&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = 198.51.100.1:51820&#10;AllowedIPs = 0.0.0.0/0"></textarea>
-            </div>
-            <button class="btn btn-primary rw-only" onclick="uploadWgProfile()">Save WireGuard Profile</button>
-          </div>
-        </div>
-
-        <div class="section">
-          <div class="section-header">
-            <span>Quick Gateway / Port-Forward Command Builder</span>
-          </div>
-          <div class="section-body">
-            <div class="form-row">
-              <label>Gateway IP or DHCP Name</label>
-              <input type="text" id="gw-quick-ip" placeholder="192.168.1.10">
-            </div>
-            <div class="form-row">
-              <label>Directive (e.g. <code>killswitch on</code>, <code>privoxy:8118</code>, <code>forward 51413 to 192.168.1.50:51413</code>, <code>tunnel wg0.conf</code>)</label>
-              <input type="text" id="gw-quick-cmd" placeholder="forward 51413 to 192.168.1.50:51413">
-            </div>
-            <button class="btn btn-success rw-only" onclick="runGatewayQuickCmd()">Apply to Gateway</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span>Configured Virtual Gateways &amp; ECMP WireGuard Tunnels</span>
-        </div>
-        <div id="gateways-table-wrap">
-          <div class="empty">Loading gateways...</div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span>Saved WireGuard Profiles on Disk (<code>/data/wg</code>)</span>
-        </div>
-        <div id="wg-files-wrap">
-          <div class="empty">Loading saved WireGuard configs...</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- TAB 4: PROGRAMMABLE DNS -->
-    <div id="tab-dns" class="tab-pane">
-      <div class="grid-2">
-        <div class="section">
-          <div class="section-header">
-            <span>Add Authoritative DNS Record / Split-Horizon Rule</span>
-          </div>
-          <div class="section-body">
-            <div class="form-row">
-              <label>DNS Directive Type</label>
-              <select id="dns-cmd-type">
-                <option value="a">A Record (a &lt;fqdn&gt; &lt;ipv4&gt;)</option>
-                <option value="cname">CNAME Alias (cname &lt;alias&gt; &lt;target&gt;)</option>
-                <option value="address">Wildcard Override (address &lt;*.domain&gt; &lt;ip&gt;)</option>
-                <option value="txt">TXT Record (txt &lt;fqdn&gt; "&lt;value&gt;")</option>
-                <option value="route">Policy Route via Gateway (route &lt;domain&gt; via &lt;gw&gt;)</option>
-                <option value="bypass">Bypass Gateway (bypass &lt;domain&gt; from &lt;gw&gt;)</option>
-                <option value="block">Adblock Sinkhole (block &lt;*.domain&gt;)</option>
-                <option value="upstream">Upstream Resolver (upstream &lt;ip&gt;)</option>
-                <option value="forward">Conditional Forward Zone (forward &lt;domain&gt; &lt;ip&gt;)</option>
-              </select>
-            </div>
-            <div class="form-row">
-              <label>Arguments (e.g. <code>nas.lan 192.168.1.50</code> or <code>*.netflix.com via 192.168.1.10</code>)</label>
-              <input type="text" id="dns-cmd-args" placeholder="nas.lan 192.168.1.50">
-            </div>
-            <button class="btn btn-primary rw-only" onclick="addDnsDirective()">Add &amp; Apply DNS Rule</button>
-          </div>
-        </div>
-
-        <div class="section">
-          <div class="section-header">
-            <span>Programmable DNS Engine Settings (<code>dnsmasq</code>)</span>
-          </div>
-          <div class="section-body" id="dns-settings-wrap">
-            <div class="empty">Loading DNS settings...</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span>Configured DNS Records, Policy Routes (<code>nftset</code>) &amp; Adblock Domains</span>
-        </div>
-        <div id="dns-records-wrap">
-          <div class="empty">No custom DNS block configured yet.</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- TAB 5: FIREWALL ALLOW-LIST & CLOUDFLARE -->
-    <div id="tab-firewall" class="tab-pane">
-      <div class="grid-2">
-        <div class="section">
-          <div class="section-header">
-            <span>Add Firewall Allow-List Rule (CIDR, Hostname, or Wildcard)</span>
-            <button class="btn btn-sm" onclick="refreshAllowlistDns()">🔄 Refresh DNS Now</button>
-          </div>
-          <div class="section-body">
-            <div class="form-row">
-              <label>Target Scope (leave empty for Global Allow-List, or enter Service Key like <code>192.168.1.4:8000</code>)</label>
-              <input type="text" id="allow-service-key" placeholder="Global (or e.g. 192.168.1.4:8000)">
-            </div>
-            <div class="form-row">
-              <label>Source CIDR / IP Wildcard / Hostname (e.g. <code>192.168.0.0/16</code>, <code>*.office.lan</code>, <code>10.0.0.0/8</code>)</label>
-              <input type="text" id="allow-host-pattern" placeholder="192.168.0.0/16">
-            </div>
-            <button class="btn btn-primary rw-only" onclick="addAllowEntry()">+ Add to Allow-List &amp; Apply</button>
-          </div>
-        </div>
-
-        <div class="section">
-          <div class="section-header">
-            <span>Register Dynamic Host -&gt; IP Mapping</span>
-          </div>
-          <div class="section-body">
-            <div class="form-row">
-              <label>Hostname (e.g. <code>laptop.office.lan</code>)</label>
-              <input type="text" id="reg-host-name" placeholder="laptop.office.lan">
-            </div>
-            <div class="form-row">
-              <label>IPv4 Address(es) (comma or space separated)</label>
-              <input type="text" id="reg-host-ips" placeholder="192.168.1.99">
-            </div>
-            <button class="btn btn-success rw-only" onclick="registerHostMapping()">Register Host IP</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span>Active Allow-Lists &amp; Resolved Host Table</span>
-        </div>
-        <div id="allow-table-wrap">
-          <div class="empty">Loading allow-lists...</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- TAB 6: LIVE CONNTRACK FLOWS -->
-    <div id="tab-flows" class="tab-pane">
-      <div class="section">
-        <div class="section-header">
-          <span>Live Kernel Conntrack Flows (<code>/proc/net/nf_conntrack</code>)</span>
-          <div style="display:flex;gap:10px;align-items:center">
-            <input type="text" id="flow-filter" placeholder="Filter by IP, port, proto, state..." oninput="renderFlowsTable()" style="width:260px">
-            <button class="btn btn-sm" id="btn-pause-flows" onclick="toggleFlowsPause()">⏸ Pause</button>
-          </div>
-        </div>
-        <div id="flows-table-wrap">
-          <div class="empty">Loading active flows...</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- TAB 7: NETWORK SCANNER -->
-    <div id="tab-scanner" class="tab-pane">
-      <div class="section">
-        <div class="section-header">
-          <span>LAN &amp; LXD Container Service Discovery</span>
-          <div style="display:flex;gap:10px;align-items:center">
-            <input type="text" id="scan-target" placeholder="Optional subnet/host (e.g. 192.168.1.0/24)" style="width:270px">
-            <button class="btn btn-primary rw-only" id="btn-scan" onclick="runNetworkScan()">🔍 Scan Network</button>
-          </div>
-        </div>
-        <div id="scan-table-wrap">
-          <div class="empty">Click <strong>Scan Network</strong> to discover live containers, hosts, and open ports.</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- TAB 8: CONFIG & NFTABLES -->
-    <div id="tab-config" class="tab-pane">
-      <div class="grid-2">
-        <div class="section">
-          <div class="section-header">
-            <span>Declarative <code>Nftyfile</code> Configuration</span>
-            <button class="btn btn-sm btn-success rw-only" onclick="saveAndApplyNftyfile()">💾 Save &amp; Apply Nftyfile</button>
-          </div>
-          <div style="padding:12px">
-            <textarea id="nftyfile-editor" rows="24" class="mono" style="width:100%;background:#060911;color:#e5e7eb;font-size:0.82rem;line-height:1.45"></textarea>
-          </div>
-        </div>
-
-        <div class="section">
-          <div class="section-header">
-            <span>Compiled Kernel <code>nftables</code> Ruleset (<code>table ip nfty</code>)</span>
-          </div>
-          <pre id="nft-box" style="padding:16px;overflow:auto;max-height:560px;font-size:0.8rem;background:#060911;color:#a7f3d0"></pre>
-        </div>
-      </div>
-    </div>
-  </main>
-
-  <!-- Slide-Up Web CLI Drawer -->
-  <div id="cli-drawer" class="cli-drawer">
-    <div class="cli-header">
-      <span>nfty Interactive Web CLI (executes against <code>POST /api/v1/cli</code>)</span>
-      <div style="display:flex;gap:8px">
-        <button class="btn btn-sm" onclick="runCliQuick('show')">show</button>
-        <button class="btn btn-sm" onclick="runCliQuick('diff')">diff</button>
-        <button class="btn btn-sm btn-success" onclick="runCliQuick('apply')">apply</button>
-        <button class="btn btn-sm" onclick="toggleCliDrawer()">✕ Close</button>
-      </div>
-    </div>
-    <div id="cli-output" class="cli-output"># Type any nfty CLI command below (e.g. 'vip 192.168.1.4; web:8000; allow 192.168.0.0/16; apply')</div>
-    <div class="cli-input-row">
-      <span class="cli-prompt">nfty(config)#</span>
-      <input type="text" id="cli-input" placeholder="vip 192.168.1.4; web:8000; allow 192.168.0.0/16; apply" onkeydown="if(event.key==='Enter')sendCliCommand()">
-      <button class="btn btn-sm btn-primary" onclick="sendCliCommand()">Run</button>
-    </div>
-  </div>
-</div>
-
-<!-- Auth / Login Modal -->
-<div id="auth-modal" class="modal-backdrop">
-  <div class="modal">
-    <h3>Authenticate to nfty Web Console</h3>
-    <p>If your IP is in the <code>web:&lt;port&gt;</code> allow-list, no key is required. You can also enter an API key (<code>nfty_ro_...</code> / <code>nfty_rw_...</code>) or sign in with the appliance password.</p>
-    <div class="form-row">
-      <label>API Key (Bearer / X-API-Key)</label>
-      <input type="password" id="modal-api-key" placeholder="nfty_rw_... or nfty_ro_...">
-    </div>
-    <div style="text-align:center;color:var(--muted);font-size:0.76rem;margin:8px 0">— OR APPLIANCE LOGIN —</div>
-    <div class="form-row">
-      <label>Username</label>
-      <input type="text" id="modal-username" value="nfty">
-    </div>
-    <div class="form-row">
-      <label>Password</label>
-      <input type="password" id="modal-password" placeholder="Appliance SSH/CLI password">
-    </div>
-    <div id="modal-auth-err" style="color:var(--red);font-size:0.8rem;margin-bottom:10px"></div>
-    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
-      <button class="btn" onclick="clearSavedAuth()">Use IP Allow-List (Clear Key)</button>
-      <button class="btn" onclick="closeAuthModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="submitAuthModal()">Sign In</button>
-    </div>
-  </div>
-</div>
-
-<!-- Add VIP / Service Modal -->
-<div id="svc-modal" class="modal-backdrop">
-  <div class="modal">
-    <h3>Add or Update VIP Service</h3>
-    <p>Configure a forwarded backend service, local <code>web:8000</code> console, <code>api:9090</code>, <code>ssh:22</code>, or <code>dns:53</code> on a Virtual IP.</p>
-    <div class="form-row">
-      <label>VIP Address or DHCP Name (e.g. <code>192.168.1.4</code> or <code>web-app</code>)</label>
-      <input type="text" id="svc-modal-vip" placeholder="192.168.1.4">
-    </div>
-    <div class="form-row">
-      <label>Service Spec (e.g. <code>80 to 192.168.20.10:5055</code>, <code>web:8000</code>, <code>api:8080</code>, <code>ssh:22</code>)</label>
-      <input type="text" id="svc-modal-spec" placeholder="80 to 192.168.20.10:5055">
-    </div>
-    <div class="form-row">
-      <label>Optional Allow-List CIDR / Hostname (e.g. <code>192.168.0.0/16</code>)</label>
-      <input type="text" id="svc-modal-allow" placeholder="192.168.0.0/16">
-    </div>
-    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
-      <button class="btn" onclick="closeAddServiceModal()">Cancel</button>
-      <button class="btn btn-success" onclick="submitAddServiceModal()">Create &amp; Apply</button>
-    </div>
-  </div>
-</div>
-
-<div id="toast" class="toast"></div>
-
-<script>
-let stateData = null;
-let currentScope = 'ro';
-let flowsPaused = false;
-let editorDirty = false;
-
-function escapeHtml(value) {
-  return String(value ?? '').replace(/[&<>"']/g, ch => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  })[ch]);
-}
-
-function getAuthToken() {
-  const params = new URLSearchParams(window.location.search);
-  if (params.get('key')) return params.get('key');
-  return sessionStorage.getItem('nfty_auth_token') || localStorage.getItem('nfty_auth_token') || '';
-}
-
-function setAuthToken(tok) {
-  if (tok) {
-    sessionStorage.setItem('nfty_auth_token', tok);
-    localStorage.setItem('nfty_auth_token', tok);
-  } else {
-    sessionStorage.removeItem('nfty_auth_token');
-    localStorage.removeItem('nfty_auth_token');
-  }
-}
-
-async function apiFetch(path, options = {}) {
-  const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
-  const tok = getAuthToken();
-  if (tok) {
-    headers['Authorization'] = 'Bearer ' + tok;
-  }
-  const res = await fetch(path, Object.assign({}, options, { headers }));
-  return res;
-}
-
-function showToast(msg, isError = false) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.style.borderColor = isError ? 'var(--red)' : 'var(--cyan)';
-  el.style.display = 'block';
-  clearTimeout(window._toastTimer);
-  window._toastTimer = setTimeout(() => { el.style.display = 'none'; }, 3500);
-}
-
-function switchTab(tabId, btnEl) {
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
-  const target = document.getElementById('tab-' + tabId);
-  if (target) target.classList.add('active');
-  if (btnEl) btnEl.classList.add('active');
-}
-
-function toggleCliDrawer() {
-  const d = document.getElementById('cli-drawer');
-  d.classList.toggle('open');
-  if (d.classList.contains('open')) {
-    document.getElementById('cli-input').focus();
-  }
-}
-
-document.addEventListener('keydown', (e) => {
-  if (e.key === '`' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) {
-    e.preventDefault();
-    toggleCliDrawer();
-  }
-});
-
-function updateScopeUI(scope, mode, peerIp) {
-  currentScope = scope || 'ro';
-  const badge = document.getElementById('auth-scope-badge');
-  if (currentScope === 'rw') {
-    badge.className = 'badge badge-rw';
-    badge.textContent = mode === 'allowlist' ? 'READ-WRITE (ALLOWLIST)' : 'READ-WRITE (RW)';
-  } else {
-    badge.className = 'badge badge-ro';
-    badge.textContent = 'READ-ONLY (RO)';
-  }
-  const peerEl = document.getElementById('auth-peer-info');
-  peerEl.textContent = peerIp ? `Client IP: ${peerIp}` : '';
-  document.querySelectorAll('.rw-only').forEach(btn => {
-    btn.disabled = (currentScope !== 'rw');
-    btn.title = (currentScope !== 'rw') ? 'Requires Read-Write (rw) access' : '';
-  });
-}
-
-async function checkWhoami() {
-  try {
-    const res = await apiFetch('/api/v1/auth/whoami');
-    if (res.ok) {
-      const info = await res.json();
-      updateScopeUI(info.scope, info.mode, info.peer_ip);
-      return true;
-    } else if (res.status === 401) {
-      openAuthModal();
-      return false;
-    }
-  } catch (e) {}
-  return false;
-}
-
-function openAuthModal() {
-  document.getElementById('modal-auth-err').textContent = '';
-  document.getElementById('modal-api-key').value = getAuthToken();
-  document.getElementById('auth-modal').classList.add('open');
-}
-
-function closeAuthModal() {
-  document.getElementById('auth-modal').classList.remove('open');
-}
-
-function clearSavedAuth() {
-  setAuthToken('');
-  closeAuthModal();
-  refreshDashboard();
-}
-
-async function submitAuthModal() {
-  const key = document.getElementById('modal-api-key').value.trim();
-  const username = document.getElementById('modal-username').value.trim();
-  const password = document.getElementById('modal-password').value;
-  const payload = key ? { key } : { username, password };
-  try {
-    const res = await fetch('/api/v1/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const data = await res.json();
-    if (!res.ok || !data.ok) {
-      document.getElementById('modal-auth-err').textContent = data.error || 'Authentication failed';
-      return;
-    }
-    setAuthToken(data.token);
-    closeAuthModal();
-    showToast(`Signed in with ${data.scope.toUpperCase()} access`);
-    refreshDashboard();
-  } catch (e) {
-    document.getElementById('modal-auth-err').textContent = e.message;
-  }
-}
-
-function openAddServiceModal(defaultVip = '') {
-  if (defaultVip) document.getElementById('svc-modal-vip').value = defaultVip;
-  document.getElementById('svc-modal').classList.add('open');
-}
-function closeAddServiceModal() {
-  document.getElementById('svc-modal').classList.remove('open');
-}
-async function submitAddServiceModal() {
-  const vip = document.getElementById('svc-modal-vip').value.trim();
-  const spec = document.getElementById('svc-modal-spec').value.trim();
-  const allow = document.getElementById('svc-modal-allow').value.trim();
-  if (!vip || !spec) {
-    showToast('VIP and Service Spec are required', true);
-    return;
-  }
-  let cmd = `vip ${vip}; ${spec}`;
-  if (allow) cmd += `; allow ${allow}`;
-  cmd += `; apply`;
-  await execCli(cmd);
-  closeAddServiceModal();
-}
-
-async function execCli(command) {
-  try {
-    const res = await apiFetch('/api/v1/cli', {
-      method: 'POST',
-      body: JSON.stringify({ command })
-    });
-    const data = await res.json();
-    if (!res.ok || data.ok === false) {
-      showToast(data.error || 'Command failed', true);
-      return null;
-    }
-    showToast('Applied: ' + command);
-    const out = document.getElementById('cli-output');
-    out.textContent += `\nnfty(config)# ${command}\n✔ OK (applied)\n`;
-    out.scrollTop = out.scrollHeight;
-    editorDirty = false;
-    await refreshDashboard();
-    return data;
-  } catch (e) {
-    showToast(e.message, true);
-    return null;
-  }
-}
-
-async function sendCliCommand() {
-  const inp = document.getElementById('cli-input');
-  const cmd = inp.value.trim();
-  if (!cmd) return;
-  inp.value = '';
-  const data = await execCli(cmd);
-  if (data && data.nftyfile && (cmd === 'show' || cmd.startsWith('show '))) {
-    const out = document.getElementById('cli-output');
-    out.textContent += data.nftyfile + '\n';
-    out.scrollTop = out.scrollHeight;
-  }
-}
-
-async function runCliQuick(cmd) {
-  document.getElementById('cli-input').value = cmd;
-  await sendCliCommand();
-}
-
-async function triggerProbe() {
-  const res = await apiFetch('/api/v1/probe', { method: 'POST', body: '{}' });
-  if (res.ok) {
-    showToast('Active health probes completed');
-    refreshDashboard();
-  } else {
-    const d = await res.json().catch(() => ({}));
-    showToast(d.error || 'Probe requires RW scope', true);
-  }
-}
-
-async function applyCandidate() {
-  const res = await apiFetch('/api/v1/apply', { method: 'POST', body: '{}' });
-  const d = await res.json().catch(() => ({}));
-  if (res.ok) {
-    showToast('Candidate configuration committed to kernel');
-    editorDirty = false;
-    refreshDashboard();
-  } else {
-    showToast(d.error || 'Failed to apply candidate', true);
-  }
-}
-
-async function toggleBackendDrain(ep, currentlyDrained) {
-  const path = currentlyDrained ? '/api/v1/enable' : '/api/v1/drain';
-  const res = await apiFetch(path, {
-    method: 'POST',
-    body: JSON.stringify({ backend: ep })
-  });
-  if (res.ok) {
-    showToast(`${currentlyDrained ? 'Enabled' : 'Drained'} backend ${ep}`);
-    refreshDashboard();
-  } else {
-    const d = await res.json().catch(() => ({}));
-    showToast(d.error || 'Operation failed', true);
-  }
-}
-
-async function deleteService(svcKey) {
-  const res = await apiFetch('/api/v1/services/' + encodeURIComponent(svcKey), { method: 'DELETE' });
-  if (res.ok) {
-    showToast(`Deleted service ${svcKey}`);
-    refreshDashboard();
-  } else {
-    const d = await res.json().catch(() => ({}));
-    showToast(d.error || 'Delete failed', true);
-  }
-}
-
-async function generateServiceKey(vipKey, svcDisplay, scope) {
-  await execCli(`vip ${vipKey}; ${svcDisplay}; key new ${scope}; apply`);
-}
-
-async function uploadWgProfile() {
-  const name = document.getElementById('wg-upload-name').value.trim();
-  const config = document.getElementById('wg-upload-body').value.trim();
-  if (!name || !config) {
-    showToast('Profile name and config content required', true);
-    return;
-  }
-  const res = await apiFetch('/api/v1/wg', {
-    method: 'POST',
-    body: JSON.stringify({ name, config })
-  });
-  const d = await res.json().catch(() => ({}));
-  if (res.ok && d.ok) {
-    showToast(`Saved WireGuard profile ${d.filename}`);
-    document.getElementById('wg-upload-body').value = '';
-    refreshDashboard();
-  } else {
-    showToast(d.error || 'Failed to save WireGuard profile', true);
-  }
-}
-
-async function runGatewayQuickCmd() {
-  const gw = document.getElementById('gw-quick-ip').value.trim();
-  const cmd = document.getElementById('gw-quick-cmd').value.trim();
-  if (!gw || !cmd) {
-    showToast('Gateway and directive required', true);
-    return;
-  }
-  await execCli(`gateway ${gw}; ${cmd}; apply`);
-}
-
-async function addDnsDirective() {
-  const t = document.getElementById('dns-cmd-type').value;
-  const args = document.getElementById('dns-cmd-args').value.trim();
-  if (!args) {
-    showToast('DNS rule arguments required', true);
-    return;
-  }
-  await execCli(`dns; ${t} ${args}; apply`);
-  document.getElementById('dns-cmd-args').value = '';
-}
-
-async function addAllowEntry() {
-  const svc = document.getElementById('allow-service-key').value.trim();
-  const host = document.getElementById('allow-host-pattern').value.trim();
-  if (!host) {
-    showToast('CIDR or host pattern required', true);
-    return;
-  }
-  const payload = { hosts: host.split(/[\s,]+/).filter(Boolean), apply: true };
-  if (svc) payload.service = svc;
-  const res = await apiFetch('/api/v1/allow', {
-    method: 'POST',
-    body: JSON.stringify(payload)
-  });
-  const d = await res.json().catch(() => ({}));
-  if (res.ok && d.ok) {
-    showToast(`Added ${host} to allow-list`);
-    document.getElementById('allow-host-pattern').value = '';
-    refreshDashboard();
-  } else {
-    showToast(d.error || 'Failed to update allow-list', true);
-  }
-}
-
-async function removeAllowEntry(svcKey, entry) {
-  const payload = { hosts: [entry], apply: true };
-  if (svcKey) payload.service = svcKey;
-  const res = await apiFetch('/api/v1/allow', {
-    method: 'DELETE',
-    body: JSON.stringify(payload)
-  });
-  if (res.ok) {
-    showToast(`Removed ${entry} from allow-list`);
-    refreshDashboard();
-  }
-}
-
-async function registerHostMapping() {
-  const host = document.getElementById('reg-host-name').value.trim();
-  const ips = document.getElementById('reg-host-ips').value.trim().split(/[\s,]+/).filter(Boolean);
-  if (!host || !ips.length) {
-    showToast('Hostname and at least one IPv4 address required', true);
-    return;
-  }
-  const res = await apiFetch('/api/v1/allow/hosts', {
-    method: 'POST',
-    body: JSON.stringify({ host, ips })
-  });
-  const d = await res.json().catch(() => ({}));
-  if (res.ok && d.ok) {
-    showToast(`Registered ${host} -> ${ips.join(', ')}`);
-    refreshDashboard();
-  } else {
-    showToast(d.error || 'Failed to register host', true);
-  }
-}
-
-async function refreshAllowlistDns() {
-  const res = await apiFetch('/api/v1/allow/refresh', { method: 'POST', body: '{}' });
-  if (res.ok) {
-    showToast('Allow-list hostnames resolved & synced to kernel sets');
-    refreshDashboard();
-  }
-}
-
-function toggleFlowsPause() {
-  flowsPaused = !flowsPaused;
-  document.getElementById('btn-pause-flows').textContent = flowsPaused ? '▶ Resume' : '⏸ Pause';
-}
-
-async function runNetworkScan() {
-  const btn = document.getElementById('btn-scan');
-  const filter = document.getElementById('scan-target').value.trim();
-  btn.disabled = true;
-  btn.textContent = 'Scanning...';
-  try {
-    const res = await apiFetch('/api/v1/scan', {
-      method: 'POST',
-      body: filter
-    });
-    const data = await res.json();
-    if (!res.ok || !data.ok) {
-      showToast(data.error || 'Scan failed', true);
-      return;
-    }
-    const list = data.discovered || [];
-    document.getElementById('nav-cnt-scan').textContent = list.length;
-    const wrap = document.getElementById('scan-table-wrap');
-    if (list.length === 0) {
-      wrap.innerHTML = `<div class="empty">No open services discovered on target subnet.</div>`;
-    } else {
-      const rows = list.map(d => `<tr>
-        <td><code>#${escapeHtml(d.index)}</code></td>
-        <td><strong>${escapeHtml(d.host || d.ip)}</strong> <span class="tag">${escapeHtml(d.ip)}</span></td>
-        <td><span class="tag">${escapeHtml(d.port)}/${escapeHtml(d.service_name || 'tcp')}</span></td>
-        <td>${d.banner ? escapeHtml(d.banner) : '<span style="color:var(--muted)">tcp open</span>'}</td>
-        <td>
-          <button class="btn btn-sm btn-primary" data-index="${escapeHtml(d.index)}" data-host="${escapeHtml(d.host || d.ip)}" data-port="${escapeHtml(d.port)}" onclick="adoptDiscovered(Number(this.dataset.index), this.dataset.host, Number(this.dataset.port))">+ Adopt into VIP</button>
-        </td>
-      </tr>`).join('');
-      wrap.innerHTML = `<table>
-        <thead><tr><th>#</th><th>Host / Container</th><th>Port</th><th>Service / Banner</th><th>Action</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>`;
-    }
-  } catch (e) {
-    showToast(e.message, true);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '🔍 Scan Network';
-  }
-}
-
-async function adoptDiscovered(idx, host, port) {
-  const vip = prompt(`Adopt ${host}:${port} into which VIP (leave blank for auto DHCP VIP '${host}'):`, '');
-  if (vip === null) return;
-  const cmd = vip.trim() ? `adopt ${idx} vip ${vip.trim()}; apply` : `adopt ${idx}; apply`;
-  await execCli(cmd);
-}
-
-async function saveAndApplyNftyfile() {
-  const body = document.getElementById('nftyfile-editor').value;
-  const res = await apiFetch('/api/v1/config', {
-    method: 'PUT',
-    body
-  });
-  const d = await res.json().catch(() => ({}));
-  if (res.ok && d.ok) {
-    editorDirty = false;
-    showToast('Saved & applied Nftyfile configuration');
-    refreshDashboard();
-  } else {
-    showToast(d.error || 'Failed to parse or apply Nftyfile', true);
-  }
-}
-
-function renderFlowsTable() {
-  if (!stateData) return;
-  const flows = stateData.flows || [];
-  const q = (document.getElementById('flow-filter').value || '').toLowerCase().trim();
-  const filtered = q
-    ? flows.filter(f => `${f.proto} ${f.state} ${f.src}:${f.sport} ${f.dst}:${f.dport} ${f.nat_target || ''}`.toLowerCase().includes(q))
-    : flows;
-
-  const wrap = document.getElementById('flows-table-wrap');
-  if (filtered.length === 0) {
-    wrap.innerHTML = `<div class="empty">No matching active conntrack flows.</div>`;
-    return;
-  }
-  const rows = filtered.slice(0, 100).map(f => `<tr>
-    <td><span class="tag">${escapeHtml(f.proto)}</span></td>
-    <td><span class="pill ${f.state === 'ESTABLISHED' ? 'pill-up' : 'pill-unknown'}">${escapeHtml(f.state)}</span></td>
-    <td><code>${escapeHtml(f.src)}:${escapeHtml(f.sport)}</code></td>
-    <td><strong>${escapeHtml(f.dst)}:${escapeHtml(f.dport)}</strong></td>
-    <td><code style="color:var(--green)">${escapeHtml(f.nat_target || 'local / direct')}</code></td>
-    <td><code>${escapeHtml(f.mark && f.mark !== '0' ? '0x' + f.mark : '-')}</code></td>
-    <td><code>${escapeHtml(f.packets)} pkts / ${escapeHtml(f.bytes)} B</code></td>
-  </tr>`).join('');
-  wrap.innerHTML = `<table>
-    <thead>
-      <tr>
-        <th>Proto</th>
-        <th>State</th>
-        <th>Client (Source)</th>
-        <th>VIP / Destination</th>
-        <th>NAT Target / Tunnel</th>
-        <th>FW Mark</th>
-        <th>Traffic</th>
-      </tr>
-    </thead>
-    <tbody>${rows}</tbody>
-  </table>`;
-}
-
-function setKernelBadge(applied) {
-  const badge = document.getElementById('kernel-badge');
-  badge.textContent = applied === true ? '● NFT APPLY REPORTED'
-    : applied === false ? '● NO NFT APPLY REPORTED' : '● NFT STATUS UNKNOWN';
-  badge.className = applied === true ? 'badge badge-rw' : 'badge badge-warn';
-  badge.title = 'Controller-reported apply state; current kernel state is not independently verified.';
-}
-
-async function refreshDashboard() {
-  try {
-    const res = await apiFetch('/api/v1/status');
-    if (!res.ok) {
-      setKernelBadge(null);
-      document.getElementById('last-updated').textContent = 'Status unavailable';
-      if (res.status === 401) openAuthModal();
-      return;
-    }
-    const data = await res.json();
-    stateData = data;
-    setKernelBadge(data.kernel_applied);
-
-    const cfg = data.active_config || { vips: {}, services: {}, gateways: {}, global_allow: [] };
-    const services = Object.values(cfg.services || {});
-    const gateways = Object.values(cfg.gateways || {});
-    const vipsMap = cfg.vips || {};
-    const runtime = data.runtime || {};
-    const activeMap = data.active_backends || {};
-    const resolvedHosts = data.resolved_hosts || {};
-    const flows = data.flows || [];
-    const wgConfigs = data.wg_configs || {};
-
-    // Check candidate vs running diff
-    const hasDiff = JSON.stringify(data.running) !== JSON.stringify(data.candidate);
-    document.getElementById('diff-badge').style.display = hasDiff ? 'inline-flex' : 'none';
-    document.getElementById('btn-apply').style.display = (hasDiff && currentScope === 'rw') ? 'inline-flex' : 'none';
-
-    // Sidebar counts
-    const allVipKeys = new Set(Object.keys(vipsMap));
-    services.forEach(s => { if (s.vip_id) allVipKeys.add(s.vip_id); else if (s.listen_ip) allVipKeys.add(s.listen_ip); });
-    document.getElementById('nav-cnt-vips').textContent = `${allVipKeys.size}/${services.length}`;
-    document.getElementById('nav-cnt-gws').textContent = gateways.length;
-    document.getElementById('nav-cnt-allow').textContent = (cfg.global_allow || []).length + Object.keys(resolvedHosts).length;
-    document.getElementById('nav-cnt-flows').textContent = flows.length;
-
-    // 1. Overview & Health Matrix
-    let up = 0, down = 0, drained = 0;
-    let matrixRows = '';
-
-    for (const svc of services) {
-      const activeEps = activeMap[svc.key] || [];
-      const vipStr = svc.vip ? `${svc.vip.interface}/${svc.vip.prefix_len}` : 'any';
-      const isWeb = svc.name && svc.name.startsWith('web:');
-      const isApi = svc.name && svc.name.startsWith('api:');
-      const typeBadge = isWeb
-        ? `<span class="tag" style="border-color:var(--cyan);color:var(--cyan)">WEB UI</span>`
-        : (isApi ? `<span class="tag" style="border-color:var(--purple);color:var(--purple)">CONTROL API</span>` : `<span class="tag">${escapeHtml(svc.proto)}</span>`);
-      const allowRules = [...(cfg.global_allow || []), ...(svc.allow || [])];
-      const allowTags = allowRules.length
-        ? allowRules.map(a => `<span class="tag">${escapeHtml(a)}</span>`).join('')
-        : '<span style="color:var(--muted)">any</span>';
-
-      const backends = svc.backends || [];
-      backends.forEach((b, idx) => {
-        const ep = b.host ? `${b.host}(${b.ip}):${b.port}` : `${b.ip}:${b.port}`;
-        const isLocal = b.ip === '127.0.0.1';
-        const rt = runtime[ep] || { health: isLocal ? 'UP' : 'UNKNOWN', drained: false, packets: 0, bytes: 0, pps: 0 };
-        const isRouting = isLocal || activeEps.includes(ep);
-
-        let pill = '';
-        if (rt.drained) {
-          drained++;
-          pill = `<span class="pill pill-drain">● DRAINED</span>`;
-        } else if (rt.health === 'UP' || isLocal) {
-          up++;
-          const lat = rt.latency_ms != null ? ` (${rt.latency_ms.toFixed(1)}ms)` : '';
-          pill = `<span class="pill pill-up">● UP${lat}</span>`;
-        } else if (rt.health === 'DOWN') {
-          down++;
-          pill = `<span class="pill pill-down">● DOWN</span>`;
-        } else {
-          pill = `<span class="pill pill-unknown">● UNCHECKED</span>`;
-        }
-
-        const actionBtn = (!isLocal && currentScope === 'rw')
-          ? `<button class="btn btn-sm ${rt.drained ? 'btn-success' : 'btn-amber'}" data-endpoint="${escapeHtml(ep)}" data-drained="${rt.drained ? 'true' : 'false'}" onclick="toggleBackendDrain(this.dataset.endpoint, this.dataset.drained === 'true')">${rt.drained ? 'Enable' : 'Drain'}</button>`
-          : '';
-
-        matrixRows += `<tr>
-          <td>${idx === 0 ? `<strong>${escapeHtml(svc.key)}</strong> ${typeBadge} ${svc.name ? `<span class="tag">${escapeHtml(svc.name)}</span>` : ''}` : ''}</td>
-          <td>${idx === 0 ? `<span class="tag">${escapeHtml(vipStr)}</span>` : ''}</td>
-          <td>${idx === 0 ? allowTags : ''}</td>
-          <td><code>${escapeHtml(isLocal ? 'local appliance (' + svc.port + ')' : ep)}</code></td>
-          <td>${pill}</td>
-          <td>${isRouting ? '<span class="tag" style="color:var(--green);border-color:var(--green)">ROUTING</span>' : '<span class="tag">EXCLUDED</span>'}</td>
-          <td><code>${escapeHtml(rt.packets || 0)} pkts / ${escapeHtml(rt.bytes || 0)} B</code></td>
-          <td>${actionBtn}</td>
-        </tr>`;
-      });
-    }
-
-    for (const gw of gateways) {
-      const vipStr = gw.vip ? `${gw.vip.interface}/${gw.vip.prefix_len}` : 'any';
-      const tunnels = gw.tunnels || [];
-      tunnels.forEach((t, idx) => {
-        const ep = `wg:${t.name}(${t.iface})`;
-        const rt = runtime[ep] || { health: 'UNKNOWN', packets: 0, bytes: 0 };
-        if (rt.health === 'UP') up++; else if (rt.health === 'DOWN') down++;
-        const lat = rt.latency_ms != null ? ` (${rt.latency_ms.toFixed(1)}ms)` : '';
-        const pill = rt.health === 'UP'
-          ? `<span class="pill pill-up">● UP${lat}</span>`
-          : (rt.health === 'DOWN' ? `<span class="pill pill-down">● DOWN</span>` : `<span class="pill pill-unknown">● READY</span>`);
-        matrixRows += `<tr>
-          <td>${idx === 0 ? `<strong>gw:${escapeHtml(gw.key)}</strong> <span class="tag">wg-ecmp</span>` : ''}</td>
-          <td>${idx === 0 ? `<span class="tag">${escapeHtml(vipStr)}</span>` : ''}</td>
-          <td>${idx === 0 ? '<span class="tag">LAN</span>' : ''}</td>
-          <td><code>${escapeHtml(ep)}</code></td>
-          <td>${pill}</td>
-          <td><span class="tag" style="color:var(--cyan)">ECMP TUNNEL</span></td>
-          <td><code>${escapeHtml(rt.packets || 0)} pkts / ${escapeHtml(rt.bytes || 0)} B</code></td>
-          <td></td>
-        </tr>`;
-      });
-    }
-
-    document.getElementById('stat-vips').textContent = allVipKeys.size + gateways.length;
-    document.getElementById('stat-vips-sub').textContent = `${services.length} services, ${gateways.length} gateways`;
-    document.getElementById('stat-up').textContent = up;
-    document.getElementById('stat-down').textContent = down;
-    document.getElementById('stat-drained').textContent = drained;
-    document.getElementById('stat-flows').textContent = flows.length;
-    document.getElementById('stat-hosts-sub').textContent = `${Object.keys(resolvedHosts).length} allow-list hosts resolved`;
-
-    document.getElementById('overview-table-wrap').innerHTML = matrixRows
-      ? `<table><thead><tr><th>Service / Gateway</th><th>Interface</th><th>Allow-List</th><th>Backend / Target</th><th>Health</th><th>Verdict</th><th>Traffic</th><th>Action</th></tr></thead><tbody>${matrixRows}</tbody></table>`
-      : `<div class="empty">No services configured yet.</div>`;
-
-    // Render Topology Cards
-    let topoHtml = '';
-    for (const vipKey of allVipKeys) {
-      const vipSvcs = services.filter(s => s.vip_id === vipKey || s.listen_ip === vipKey);
-      const svcsList = vipSvcs.map(s => {
-        const bStr = (s.backends || []).map(b => b.ip === '127.0.0.1' ? 'local' : (b.host ? `${b.host}:${b.port}` : `${b.ip}:${b.port}`)).join(', ');
-        const allowCount = (s.allow || []).length;
-        return `<div class="topo-svc-row">
-          <div><strong>${escapeHtml(s.name || (':' + s.port))}</strong> <span class="tag">:${escapeHtml(s.port)}</span></div>
-          <div style="color:var(--muted);font-family:monospace;font-size:0.76rem">→ ${escapeHtml(bStr)} ${allowCount ? `<span class="tag" style="color:var(--cyan)">allow:${allowCount}</span>` : ''}</div>
-        </div>`;
-      }).join('');
-      topoHtml += `<div class="topo-vip-card">
-        <div class="topo-vip-head">
-          <div><strong style="color:var(--cyan);font-size:0.95rem">VIP ${escapeHtml(vipKey)}</strong></div>
-          <button class="btn btn-sm" data-vip="${escapeHtml(vipKey)}" onclick="openAddServiceModal(this.dataset.vip)">+ Service</button>
-        </div>
-        ${svcsList || '<div style="color:var(--muted);font-size:0.8rem">No services attached</div>'}
-      </div>`;
-    }
-    for (const gw of gateways) {
-      const tList = (gw.tunnels || []).map(t => `<div class="topo-svc-row">
-        <div><strong>${escapeHtml(t.iface)}</strong> <span class="tag">${escapeHtml(t.name)}</span></div>
-        <div style="color:var(--green);font-family:monospace;font-size:0.75rem">ECMP w=${escapeHtml(t.weight || 1)}</div>
-      </div>`).join('');
-      const fList = (gw.forwards || []).map(f => `<div class="topo-svc-row">
-        <div><strong>fwd :${escapeHtml(f.listen_port)}</strong></div>
-        <div style="font-family:monospace;font-size:0.75rem">→ ${escapeHtml(f.backend.host || f.backend.ip)}:${escapeHtml(f.backend.port)}</div>
-      </div>`).join('');
-      topoHtml += `<div class="topo-vip-card" style="border-color:rgba(139,92,246,0.45)">
-        <div class="topo-vip-head">
-          <div><strong style="color:var(--purple);font-size:0.95rem">Gateway ${escapeHtml(gw.key)}</strong></div>
-          <span class="tag">${gw.killswitch ? 'killswitch:on' : 'killswitch:off'}</span>
-        </div>
-        ${fList}${tList}
-      </div>`;
-    }
-    document.getElementById('topo-wrap').innerHTML = topoHtml || `<div class="empty">No VIPs or Gateways configured.</div>`;
-
-    // 2. Render VIPs & Services Detail Tab
-    let vipsDetailHtml = '';
-    for (const vipKey of allVipKeys) {
-      const vipSvcs = services.filter(s => s.vip_id === vipKey || s.listen_ip === vipKey);
-      const rows = vipSvcs.map(s => {
-        const disp = s.name || `${s.port}`;
-        const allowBadges = (s.allow || []).map(a => `<span class="tag">${escapeHtml(a)} <a href="#" data-service="${escapeHtml(s.key)}" data-entry="${escapeHtml(a)}" onclick="removeAllowEntry(this.dataset.service,this.dataset.entry);return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ');
-        const keysBadges = (s.api_keys || []).map(k => `<span class="tag"><code>${escapeHtml(k.key)}</code> (${escapeHtml(k.scope)})</span>`).join(' ');
-        const isApiOrWeb = disp.startsWith('api:') || disp.startsWith('web:');
-        const keyBtns = (isApiOrWeb && currentScope === 'rw')
-          ? `<button class="btn btn-sm" data-vip="${escapeHtml(vipKey)}" data-service="${escapeHtml(disp)}" onclick="generateServiceKey(this.dataset.vip,this.dataset.service,'ro')">+ RO Key</button>
-             <button class="btn btn-sm" data-vip="${escapeHtml(vipKey)}" data-service="${escapeHtml(disp)}" onclick="generateServiceKey(this.dataset.vip,this.dataset.service,'rw')">+ RW Key</button>`
-          : '';
-        return `<tr>
-          <td><strong>${escapeHtml(disp)}</strong> <span class="tag">${escapeHtml(s.key)}</span></td>
-          <td><code>:${escapeHtml(s.port)}/${escapeHtml(s.proto)}</code></td>
-          <td>${(s.backends || []).map(b => `<code>${escapeHtml(b.host ? b.host + '(' + b.ip + ')' : b.ip)}:${escapeHtml(b.port)}</code>`).join(', ')}</td>
-          <td>${allowBadges || '<span style="color:var(--muted)">none</span>'}</td>
-          <td>${keysBadges || '<span style="color:var(--muted)">none (allow-list auth)</span>'}</td>
-          <td style="display:flex;gap:6px;flex-wrap:wrap">
-            ${keyBtns}
-            ${currentScope === 'rw' ? `<button class="btn btn-sm btn-danger" data-service="${escapeHtml(s.key)}" onclick="deleteService(this.dataset.service)">Delete</button>` : ''}
-          </td>
-        </tr>`;
-      }).join('');
-      vipsDetailHtml += `<div style="padding:14px 18px;border-bottom:1px solid var(--border);background:rgba(6,182,212,0.05);display:flex;justify-content:space-between;align-items:center">
-        <strong>VIP ${escapeHtml(vipKey)}</strong>
-        <button class="btn btn-sm btn-primary" data-vip="${escapeHtml(vipKey)}" onclick="openAddServiceModal(this.dataset.vip)">+ Add Service on ${escapeHtml(vipKey)}</button>
-      </div>
-      <table>
-        <thead><tr><th>Service</th><th>Listen</th><th>Backends</th><th>Allow-List</th><th>API / Web Keys</th><th>Actions</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="6" class="empty">No services on this VIP</td></tr>'}</tbody>
-      </table>`;
-    }
-    document.getElementById('vips-detail-wrap').innerHTML = vipsDetailHtml || `<div class="empty">No VIPs configured.</div>`;
-
-    // 3. Render Gateways & WireGuard Tab
-    let gwHtml = '';
-    for (const gw of gateways) {
-      const svcs = (gw.services || []).map(s => `<span class="tag">${escapeHtml(s.kind)}:${escapeHtml(s.port)}</span>`).join(' ');
-      const fwds = (gw.forwards || []).map(f => `<span class="tag">:${escapeHtml(f.listen_port)} → ${escapeHtml(f.backend.host || f.backend.ip)}:${escapeHtml(f.backend.port)}</span>`).join(' ');
-      const tRows = (gw.tunnels || []).map(t => {
-        const ep = `wg:${t.name}(${t.iface})`;
-        const rt = runtime[ep] || {};
-        return `<tr>
-          <td><strong>${escapeHtml(t.iface)}</strong></td>
-          <td><code>${escapeHtml(t.name)}</code></td>
-          <td><span class="tag">weight ${escapeHtml(t.weight || 1)}</span></td>
-          <td><span class="pill ${rt.health === 'UP' ? 'pill-up' : 'pill-unknown'}">● ${escapeHtml(rt.health || 'READY')} ${rt.latency_ms != null ? '(' + rt.latency_ms.toFixed(1) + 'ms)' : ''}</span></td>
-          <td><code>${escapeHtml(rt.packets || 0)} pkts / ${escapeHtml(rt.bytes || 0)} B</code></td>
-        </tr>`;
-      }).join('');
-      gwHtml += `<div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
-        <div><strong>Gateway ${escapeHtml(gw.key)}</strong> ${svcs} ${fwds}</div>
-        <span class="badge ${gw.killswitch ? 'badge-rw' : 'badge-warn'}">Killswitch: ${gw.killswitch ? 'ON' : 'OFF'}</span>
-      </div>
-      <table>
-        <thead><tr><th>Interface</th><th>Profile</th><th>Weight</th><th>Tunnel Health</th><th>Traffic</th></tr></thead>
-        <tbody>${tRows || '<tr><td colspan="5" class="empty">Direct Gateway (no WireGuard tunnels attached)</td></tr>'}</tbody>
-      </table>`;
-    }
-    document.getElementById('gateways-table-wrap').innerHTML = gwHtml || `<div class="empty">No WireGuard gateways configured.</div>`;
-
-    const wgEntries = Object.entries(wgConfigs);
-    document.getElementById('wg-files-wrap').innerHTML = wgEntries.length
-      ? `<table><thead><tr><th>Filename</th><th>Interface Address</th><th>Endpoint</th><th>Private Key</th></tr></thead><tbody>${
-          wgEntries.map(([name, res]) => {
-            const w = res.Ok || {};
-            return `<tr><td><strong>${escapeHtml(name)}</strong></td><td><code>${escapeHtml(w.address || '-')}</code></td><td><code>${escapeHtml(w.endpoint || '-')}</code></td><td><code>${escapeHtml(w.private_key ? w.private_key.slice(0, 10) + '...' : '<redacted>')}</code></td></tr>`;
-          }).join('')
-        }</tbody></table>`
-      : `<div class="empty">No WireGuard .conf files found in /data/wg</div>`;
-
-    // 4. Programmable DNS Tab
-    const dns = cfg.dns;
-    if (dns) {
-      document.getElementById('dns-settings-wrap').innerHTML = `
-        <div style="display:flex;flex-wrap:wrap;gap:10px">
-          <span class="tag">Domain: <strong>${escapeHtml(dns.domain || 'none')}</strong></span>
-          <span class="tag">Cache: <strong>${escapeHtml(dns.cache_size)}</strong></span>
-          <span class="tag">Auto-VIPs: <strong>${dns.auto_vips ? 'on' : 'off'}</strong></span>
-          <span class="tag">Auto-Hosts: <strong>${dns.auto_hosts ? 'on' : 'off'}</strong></span>
-          <span class="tag">Health-Aware: <strong>${dns.health_aware ? 'on' : 'off'}</strong></span>
-          <span class="tag">Upstreams: <strong>${escapeHtml((dns.upstreams || []).join(', '))}</strong></span>
-        </div>`;
-      const recRows = [
-        ...(dns.records || []).map(r => `<tr><td><span class="tag">RECORD</span></td><td><code>${escapeHtml(JSON.stringify(r))}</code></td></tr>`),
-        ...(dns.nft_rules || []).map(r => `<tr><td><span class="tag" style="color:var(--cyan)">${r.action === 'bypass' ? 'BYPASS' : 'NFTSET ROUTE'}</span></td><td><code>${escapeHtml((r.domains || []).join(', '))} → ${escapeHtml(r.gateway)}</code></td></tr>`),
-        ...(dns.blocks || []).map(d => `<tr><td><span class="tag" style="color:var(--red)">ADBLOCK</span></td><td><code>${escapeHtml(d)} → 0.0.0.0</code></td></tr>`)
-      ].join('');
-      document.getElementById('dns-records-wrap').innerHTML = recRows
-        ? `<table><thead><tr><th>Type</th><th>Rule / Record</th></tr></thead><tbody>${recRows}</tbody></table>`
-        : `<div class="empty">DNS engine enabled with auto-VIP &amp; auto-host synthesis.</div>`;
-    } else {
-      document.getElementById('dns-settings-wrap').innerHTML = `<div class="empty">DNS block not yet enabled. Add a rule on the left or run <code>dns; apply</code> in Web CLI.</div>`;
-    }
-
-    // 5. Firewall Allow-List Tab
-    const globalAllow = (cfg.global_allow || []).map(a => `<span class="tag">${escapeHtml(a)} <a href="#" data-entry="${escapeHtml(a)}" onclick="removeAllowEntry(null,this.dataset.entry);return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ');
-    const svcAllowRows = services.filter(s => (s.allow || []).length > 0).map(s => `<tr>
-      <td><strong>${escapeHtml(s.key)}</strong> ${s.name ? `<span class="tag">${escapeHtml(s.name)}</span>` : ''}</td>
-      <td>${s.allow.map(a => `<span class="tag">${escapeHtml(a)} <a href="#" data-service="${escapeHtml(s.key)}" data-entry="${escapeHtml(a)}" onclick="removeAllowEntry(this.dataset.service,this.dataset.entry);return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ')}</td>
-    </tr>`).join('');
-    const hostRows = Object.entries(resolvedHosts).map(([h, ips]) => `<tr>
-      <td><strong>${escapeHtml(h)}</strong></td>
-      <td><code>${escapeHtml((ips || []).join(', '))}</code></td>
-    </tr>`).join('');
-    document.getElementById('allow-table-wrap').innerHTML = `
-      <div style="padding:14px 18px;border-bottom:1px solid var(--border)">
-        <strong>Global Allow-List:</strong> ${globalAllow || '<span style="color:var(--muted)">none (per-service allow-lists active)</span>'}
-      </div>
-      <table>
-        <thead><tr><th>Service / Hostname</th><th>Allowed CIDRs / Resolved IPv4s</th></tr></thead>
-        <tbody>
-          ${svcAllowRows}
-          ${hostRows}
-        </tbody>
-      </table>`;
-
-    // 6. Conntrack Flows Tab
-    if (!flowsPaused) {
-      renderFlowsTable();
-    }
-
-    // 8. Nftyfile & nftables Tab
-    const ed = document.getElementById('nftyfile-editor');
-    if (!editorDirty && document.activeElement !== ed) {
-      ed.value = data.nftyfile || '# Empty Nftyfile';
-    }
-    document.getElementById('nft-box').textContent = data.nft_ruleset || '';
-    document.getElementById('last-updated').textContent = 'Live • ' + new Date().toLocaleTimeString();
-  } catch (e) {
-    setKernelBadge(null);
-    document.getElementById('last-updated').textContent = 'Reconnecting...';
-  }
-}
-
-document.getElementById('nftyfile-editor').addEventListener('input', () => {
-  editorDirty = true;
-});
-
-(async function init() {
-  await checkWhoami();
-  await refreshDashboard();
-  setInterval(refreshDashboard, 2500);
-})();
-</script>
-</body>
-</html>
-"##;
+const WEB_CONSOLE_HTML: &str = include_str!("web/index.html");

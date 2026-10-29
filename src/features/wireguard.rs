@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::net::Ipv4Addr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -674,103 +673,12 @@ pub fn save_wg_config_file(name: &str, content: &str) -> Result<(String, ParsedW
     Ok((filename, parsed))
 }
 
-/// Opens `nano` (or `vi`) on `/data/wg/<name>.conf` so the user can paste/edit any WireGuard config.
-pub fn edit_wg_config_interactive(
-    name: &str,
-    preferred_editor: Option<&str>,
-) -> Result<Option<String>> {
-    fs::create_dir_all("/data/wg").context("Failed to prepare WireGuard config directory")?;
-    let filename = normalize_wg_filename(name)?;
-    let full_path = Path::new("/data/wg").join(&filename);
-    let existed_before = full_path.exists();
-
-    let template = format!(
-        "# WireGuard configuration: {}\n# Paste your [Interface] and [Peer] blocks below, then save (Ctrl+O, Enter, Ctrl+X in nano).\n\n",
-        filename
-    );
-    if !existed_before {
-        crate::unikernel::write_atomic(&full_path, template.as_bytes())?;
-    } else {
-        let metadata = fs::symlink_metadata(&full_path)
-            .with_context(|| format!("Cannot inspect {}", full_path.display()))?;
-        if !metadata.file_type().is_file() {
-            bail!("WireGuard config '{}' is not a regular file", full_path.display());
-        }
-        fs::set_permissions(&full_path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Cannot secure {}", full_path.display()))?;
-    }
-
-    let editor = match preferred_editor {
-        Some("vi") | Some("vim") => "vi",
-        Some("nano") => "nano",
-        _ => {
-            if Path::new("/bin/nano").exists() || Path::new("/usr/bin/nano").exists() {
-                "nano"
-            } else {
-                "vi"
-            }
-        }
-    };
-
-    let status = Command::new(editor)
-        .arg(&full_path)
-        .env(
-            "TERM",
-            std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
-        )
-        .env("TERMINFO", "/usr/share/terminfo")
-        .status()
-        .with_context(|| format!("Failed to launch editor '{}'", editor))?;
-
-    fs::set_permissions(&full_path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("Cannot secure {}", full_path.display()))?;
-    if !status.success() {
-        bail!("Editor '{}' exited with non-zero status", editor);
-    }
-
-    let raw = fs::read_to_string(&full_path)
-        .with_context(|| format!("Cannot read {}", full_path.display()))?;
-    let non_comment_lines: usize = raw
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        .filter(|l| !l.is_empty())
-        .count();
-
-    if non_comment_lines == 0 {
-        if !existed_before {
-            fs::remove_file(&full_path)
-                .with_context(|| format!("Cannot remove {}", full_path.display()))?;
-        }
-        println!("  {} Aborted (empty WireGuard config).", "⚠".yellow());
-        return Ok(None);
-    }
-
-    match parse_wg_conf_str(&raw) {
-        Ok(parsed) => {
-            println!(
-                "  {} Saved & validated {} -> endpoint {} (addr {})",
-                "✔".green().bold(),
-                filename.bold().cyan(),
-                parsed.endpoint.yellow(),
-                parsed.address.green()
-            );
-            Ok(Some(filename))
-        }
-        Err(e) => {
-            println!(
-                "  {} Saved /data/wg/{}, but validation warning: {}",
-                "⚠".yellow().bold(),
-                filename.bold(),
-                e
-            );
-            Ok(Some(filename))
-        }
-    }
-}
-
-/// Interactive line-by-line paste mode for a WireGuard config (`wg paste <name>`).
+/// Interactive line-by-line paste mode for a WireGuard config (`wg add <name>`).
 pub fn paste_wg_config_interactive(name: &str) -> Result<Option<String>> {
     use std::io::{self, BufRead};
+    crate::repl::require_interactive_terminal(
+        "Pasting a WireGuard config (upload it via POST /api/v1/wg instead)",
+    )?;
     let filename = normalize_wg_filename(name)?;
     println!(
         "  Paste WireGuard configuration for {} below.",
@@ -815,19 +723,15 @@ pub fn paste_wg_config_interactive(name: &str) -> Result<Option<String>> {
     Ok(Some(saved_name))
 }
 
-/// Handles `wg ...` CLI subcommands (`wg`, `wg add <name>`, `wg edit <name>`, `wg vi <name>`, `wg paste <name>`, `wg show <name>`, `wg rm <name>`).
+/// Handles `wg` config-file subcommands: `wg [list]`, `wg add <name>` (paste, terminal only), `wg show <name>`, `wg rm <name>`.
 pub fn handle_wg_cli_command(args: &[&str]) -> Result<Option<String>> {
-    if args.is_empty()
-        || args[0].eq_ignore_ascii_case("list")
-        || args[0].eq_ignore_ascii_case("ls")
-    {
+    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
         let saved = list_saved_wg_configs();
         println!("{}", "Saved WireGuard Configs (/data/wg/):".bold().cyan());
         if saved.is_empty() {
             println!(
                 "  {}",
-                "(none — run 'wg add <name>' to open nano and paste a config, or 'wg paste <name>')"
-                    .dimmed()
+                "(none — run 'wg add <name>' to paste a config, or POST /api/v1/wg)".dimmed()
             );
         } else {
             for (name, res) in saved {
@@ -845,37 +749,19 @@ pub fn handle_wg_cli_command(args: &[&str]) -> Result<Option<String>> {
         }
         println!(
             "\n  {}",
-            "Tip: 'wg add <name>' (opens nano), 'wg vi <name>', 'wg paste <name>', 'wg show <name>', 'wg rm <name>'"
-                .dimmed()
+            "Tip: 'wg add <name>', 'wg show <name>', 'wg rm <name>'".dimmed()
         );
         return Ok(None);
     }
 
-    let sub = args[0].to_ascii_lowercase();
-    match sub.as_str() {
-        "add" | "edit" | "nano" | "new" => {
+    match args[0].to_ascii_lowercase().as_str() {
+        "add" => {
             if args.len() < 2 {
-                bail!(
-                    "Usage: wg {} <name> (e.g. 'wg {} mullvad-us-sea-001')",
-                    sub,
-                    sub
-                );
-            }
-            edit_wg_config_interactive(args[1], Some("nano"))
-        }
-        "vi" | "vim" => {
-            if args.len() < 2 {
-                bail!("Usage: wg vi <name> (e.g. 'wg vi mullvad-us-sea-001')");
-            }
-            edit_wg_config_interactive(args[1], Some("vi"))
-        }
-        "paste" | "import" => {
-            if args.len() < 2 {
-                bail!("Usage: wg paste <name> (e.g. 'wg paste mullvad-us-sea-001')");
+                bail!("Usage: wg add <name> (e.g. 'wg add mullvad-us-sea-001')");
             }
             paste_wg_config_interactive(args[1])
         }
-        "show" | "cat" | "view" => {
+        "show" => {
             if args.len() < 2 {
                 bail!("Usage: wg show <name>");
             }
@@ -890,7 +776,7 @@ pub fn handle_wg_cli_command(args: &[&str]) -> Result<Option<String>> {
             }
             Ok(None)
         }
-        "rm" | "del" | "delete" | "remove" => {
+        "rm" => {
             if args.len() < 2 {
                 bail!("Usage: wg rm <name>");
             }
@@ -905,13 +791,12 @@ pub fn handle_wg_cli_command(args: &[&str]) -> Result<Option<String>> {
             );
             Ok(None)
         }
-        _ => {
-            // Treat `wg mullvad-us-sea-001` as `wg add mullvad-us-sea-001`
-            edit_wg_config_interactive(args[0], Some("nano"))
-        }
+        other => bail!(
+            "Unknown wg subcommand '{}' (expected: list, add <name>, show <name>, rm <name>, peer ...)",
+            other
+        ),
     }
 }
-
 /// Probes a WireGuard tunnel interface (`wg0`, `wg1`, ...) via `ping -I <iface> 1.1.1.1`.
 pub async fn probe_wg_tunnel(iface: &str) -> (HealthState, Option<f64>, Option<String>) {
     let iface_owned = iface.to_string();

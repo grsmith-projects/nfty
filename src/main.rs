@@ -7,7 +7,6 @@ pub mod parser;
 pub mod repl;
 pub mod ssh;
 pub mod state;
-pub mod tui;
 pub mod unikernel;
 
 use crate::api::spawn_api_server;
@@ -20,7 +19,6 @@ use crate::parser::parse_nftyfile;
 use crate::repl::{handle_line_checked, print_status_table, run_repl, ShellLevel};
 use crate::ssh::{enforce_first_login_password_change_if_needed, spawn_ssh_server};
 use crate::state::{AppState, SharedState};
-use crate::tui::run_watch_dashboard;
 use crate::unikernel::{
     init_unikernel_appliance, persist_and_notify_controller, persist_to_storage,
 };
@@ -42,10 +40,6 @@ struct Cli {
     #[arg(short, long, default_value = "Nftyfile")]
     file: PathBuf,
 
-    /// Optional explicit bind address for the HTTP/JSON Control API (otherwise only `api:<port>` / `web:<port>` in Nftyfile are bound)
-    #[arg(long)]
-    api_bind: Option<String>,
-
     /// Bind address for the embedded SSH2 appliance server
     #[arg(long, default_value = "0.0.0.0:22")]
     ssh_bind: String,
@@ -54,7 +48,7 @@ struct Cli {
     #[arg(long, hide = true)]
     ssh_session: bool,
 
-    /// Boot in Unikernel / Appliance mode (mounts /proc, /sys, /data if PID 1, enables native Rust L4 dataplane)
+    /// Boot in Unikernel / Appliance mode (mounts /proc, /sys, /data if PID 1 and runs the appliance controller)
     #[arg(long)]
     unikernel: bool,
 
@@ -72,8 +66,6 @@ enum Commands {
     Shell,
     /// Run as a headless standalone daemon / unikernel appliance (API + health-checker + DNS allow-list sync)
     Daemon,
-    /// Open the live terminal dashboard (TUI)
-    Watch,
     /// Show service & backend status table
     Status,
     /// Validate Nftyfile and run nftables dry-run check
@@ -113,7 +105,7 @@ async fn main() -> Result<()> {
             && !cli.ssh_session
             && matches!(
                 cli.subcommand.as_ref(),
-                None | Some(Commands::Shell) | Some(Commands::Daemon) | Some(Commands::Watch)
+                None | Some(Commands::Shell) | Some(Commands::Daemon)
             ));
 
     let mut effective_file = cli.file.clone();
@@ -131,17 +123,36 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut loaded_invalid_config = false;
     let initial_cfg = if effective_file.exists() {
         let raw = fs::read_to_string(&effective_file)
             .with_context(|| format!("Failed to read {}", effective_file.display()))?;
-        parse_nftyfile(&raw)
-            .with_context(|| format!("Failed to parse {}", effective_file.display()))?
+        match parse_nftyfile(&raw) {
+            Ok(cfg) => cfg,
+            // PID 1 must not exit on a bad config: keep SSH reachable and preserve the file for repair.
+            Err(e) if runs_appliance_controller => {
+                loaded_invalid_config = true;
+                let backup = effective_file.with_extension("invalid");
+                if !backup.exists() || !raw.trim().is_empty() {
+                    let _ = fs::copy(&effective_file, &backup);
+                }
+                eprintln!(
+                    "[nfty] Failed to parse {}: {:#}\n[nfty] Booting with an empty config; original saved to {}",
+                    effective_file.display(),
+                    e,
+                    backup.display()
+                );
+                Config::new()
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to parse {}", effective_file.display()))
+            }
+        }
     } else {
         Config::new()
     };
 
     let mut app_state = AppState::new(initial_cfg, effective_file.clone());
-    app_state.api_bind = cli.api_bind.clone();
     app_state.controller_is_authoritative = runs_appliance_controller
         || (cli.command.is_none()
             && !cli.ssh_session
@@ -167,11 +178,7 @@ async fn main() -> Result<()> {
     let shared: SharedState = Arc::new(RwLock::new(app_state));
 
     if runs_appliance_controller {
-        spawn_ssh_server(
-            cli.ssh_bind.clone(),
-            effective_file.clone(),
-            cli.api_bind.clone(),
-        );
+        spawn_ssh_server(cli.ssh_bind.clone(), effective_file.clone());
         // Auto-apply initial config on unikernel boot before starting background tasks
         if !matches!(cli.subcommand.as_ref(), Some(Commands::Daemon)) {
             let mut st = shared.write().unwrap();
@@ -189,7 +196,7 @@ async fn main() -> Result<()> {
     }
     if shared.read().unwrap().controller_is_authoritative {
         spawn_background_tasks(shared.clone());
-        spawn_api_server(shared.clone(), cli.api_bind.clone());
+        spawn_api_server(shared.clone());
     }
 
     if cli.ssh_session {
@@ -227,22 +234,13 @@ async fn main() -> Result<()> {
                 let next = st.candidate.clone();
                 apply_config(&mut st, next)?;
             }
-            persist_to_storage(&shared)?;
-            if let Some(ref bind) = cli.api_bind {
-                println!(
-                    "nfty daemon running (API: http://{}, Config: {})",
-                    bind,
-                    effective_file.display()
-                );
-            } else {
-                println!("nfty daemon running (Config: {})", effective_file.display());
+            if !loaded_invalid_config {
+                persist_to_storage(&shared)?;
             }
+            println!("nfty daemon running (Config: {})", effective_file.display());
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
-        }
-        Commands::Watch => {
-            run_watch_dashboard(shared).await?;
         }
         Commands::Status => {
             print_status_table(&shared);
@@ -588,8 +586,8 @@ service 192.168.1.240:443 {
         assert_eq!(reparsed.services["sonarr:80"].backends[0].port, 8989);
     }
 
-    #[tokio::test]
-    async fn test_multi_vhost_and_adopt_and_dhcp_gateway() {
+    #[test]
+    fn test_multi_vhost_and_dhcp_gateway() {
         let raw = r#"
 vip 192.168.1.4 {
     80 to 192.168.2.215:8989 {
@@ -602,7 +600,6 @@ vip 192.168.1.4 {
 gateway mullvad {
     dhcp eth0
     vlan 30
-    privoxy:8118
 }
 "#;
         let cfg = parse_nftyfile(raw).expect("parse multi-vhost + dhcp gateway");
@@ -612,30 +609,6 @@ gateway mullvad {
 
         let nft = compile_nft_ruleset(&cfg, None);
         assert!(nft.contains("redirect to :80"));
-
-        let shared: SharedState = Arc::new(RwLock::new(AppState::new(
-            Config::new(),
-            PathBuf::from("Nftyfile"),
-        )));
-        {
-            let mut st = shared.write().unwrap();
-            st.discovered_services.push(crate::state::DiscoveredService {
-                index: 1,
-                host: Some("app-backend".to_string()),
-                ip: Ipv4Addr::new(192, 168, 2, 215),
-                port: 8989,
-                service_name: "sonarr".to_string(),
-                banner: "Sonarr".to_string(),
-                latency_ms: 0.4,
-            });
-        }
-        let level = Arc::new(Mutex::new(ShellLevel::ConfigRoot));
-        handle_line("adopt 1", &level, &shared).await;
-        let st = shared.read().unwrap();
-        assert!(st.candidate.vips.contains_key("sonarr"));
-        assert!(st.candidate.vips["sonarr"].dhcp);
-        assert!(st.candidate.services.contains_key("sonarr:80"));
-        assert_eq!(st.candidate.services["sonarr:80"].backends[0].port, 8989);
     }
 
     #[tokio::test]
@@ -1058,7 +1031,7 @@ service 192.168.1.240:80 {
     #[test]
     fn test_readonly_config_redacts_inline_secrets() {
         let cfg = parse_nftyfile(
-            "service 80 {\n to 192.0.2.1:80\n auth user:password\n}\n\
+            "service 80 {\n to 192.0.2.1:80\n cloudflare-auth ops@example.com\n}\n\
              gateway 192.0.2.5 {\n tunnels {\n\
              tunnel address 10.0.0.2/32 privkey private-secret peer peer-key endpoint 192.0.2.2:51820\n\
              }\n}\n",
@@ -1067,7 +1040,7 @@ service 192.168.1.240:80 {
         let redacted = cfg.redacted_for_readonly();
         let json = serde_json::to_string(&redacted).unwrap();
         let text = redacted.format_nftyfile();
-        for secret in ["user:password", "private-secret"] {
+        for secret in ["ops@example.com", "private-secret"] {
             assert!(!json.contains(secret));
             assert!(!text.contains(secret));
         }
@@ -1136,8 +1109,6 @@ vip 192.168.1.4 {
         assert_eq!(
             crate::api::authenticate_api_request_with_context(
                 &shared,
-                false,
-                false,
                 Some("nfty_rw_committed_token"),
                 client,
                 Some(9090),
@@ -1146,8 +1117,6 @@ vip 192.168.1.4 {
         );
         assert!(crate::api::authenticate_api_request_with_context(
             &shared,
-            false,
-            false,
             Some("nfty_rw_uncommitted_candidate"),
             client,
             Some(9090),
@@ -1187,8 +1156,6 @@ vip 192.168.1.4 {
         assert_eq!(
             crate::api::authenticate_api_request_with_context(
                 &shared,
-                false,
-                false,
                 None,
                 Some("192.168.1.50".parse().unwrap()),
                 Some(8000),
@@ -1200,8 +1167,6 @@ vip 192.168.1.4 {
         assert_eq!(
             crate::api::authenticate_api_request_with_context(
                 &shared,
-                false,
-                false,
                 None,
                 Some("10.0.0.50".parse().unwrap()),
                 Some(8000),
@@ -1215,8 +1180,6 @@ vip 192.168.1.4 {
         assert_eq!(
             crate::api::authenticate_api_request_with_context(
                 &shared,
-                false,
-                false,
                 None,
                 Some("192.168.1.50".parse().unwrap()),
                 Some(8080),
@@ -1246,8 +1209,6 @@ vip 192.168.1.4 {
         let peer: Ipv4Addr = peer.parse().unwrap();
         crate::api::authenticate_api_request_with_context(
             shared,
-            peer.is_loopback(),
-            peer.is_loopback(),
             None,
             Some(peer),
             Some(port),
@@ -1275,11 +1236,8 @@ vip 192.168.1.4 {
         let shared = shared_from(open);
         assert_eq!(control_auth(&shared, "192.168.1.50", 8000).unwrap_err().0, 403);
         assert_eq!(control_auth(&shared, "192.168.1.50", 8080).unwrap_err().0, 403);
-        // Loopback (local CLI / IPC) keeps working.
-        assert_eq!(
-            control_auth(&shared, "127.0.0.1", 8000),
-            Ok(crate::ast::ApiKeyScope::ReadWrite)
-        );
+        // Loopback gets no implicit trust; local tooling uses the controller Unix socket.
+        assert_eq!(control_auth(&shared, "127.0.0.1", 8000).unwrap_err().0, 403);
 
         // Hostname entries are rejected for web/api listeners and never grant access.
         let hostname = r#"
@@ -1349,31 +1307,21 @@ vip 192.168.1.4 {
     }
 
     #[test]
-    fn test_local_service_auth_is_rejected_before_applying() {
-        let udp_cfg = parse_nftyfile(
-            "service 192.0.2.10:80/udp {\n to 192.0.2.20:8080\n auth alice:secret\n}\n",
-        ).unwrap();
-        let mut state = AppState::new(Config::new(), PathBuf::from("Nftyfile"));
-        let error = apply_config(&mut state, udp_cfg).err().unwrap().to_string();
-        assert!(error.contains("Basic Auth"));
-        assert!(state.running.is_empty());
-
-        let tls_cfg = parse_nftyfile(
-            "service 192.0.2.10:443 {\n to 192.0.2.20:8443\n auth alice:secret\n}\n",
-        ).unwrap();
-        let error = apply_config(&mut state, tls_cfg).err().unwrap().to_string();
-        assert!(error.contains("Basic Auth"));
-        assert!(state.running.is_empty());
-
-        let tcp_cfg = parse_nftyfile(
+    fn test_removed_service_auth_directives_are_rejected() {
+        let error = parse_nftyfile(
             "service 192.0.2.10:80 {\n to 192.0.2.20:8080\n auth alice:secret\n}\n",
+        ).err().unwrap();
+        assert!(format!("{:#}", error).contains("removed"));
+        for rule in ["nfty", "alice:secret", "example.com", "a@b@example.com"] {
+            let raw = format!("service 192.0.2.10:80 {{\n cloudflare-auth {}\n}}\n", rule);
+            assert!(parse_nftyfile(&raw).is_err(), "{} should be rejected", rule);
+        }
+        let cfg = parse_nftyfile(
+            "service 192.0.2.10:80 {\n cloudflare-auth ops@example.com *@example.org\n}\n",
         ).unwrap();
-        apply_config(&mut state, tcp_cfg).unwrap();
-        let rules = compile_nft_ruleset(&state.running, Some(&state));
-        assert!(rules.contains("redirect to :18443"));
-        assert!(!rules.contains("dnat to 192.0.2.20:8080"));
+        let svc = cfg.services.values().next().unwrap();
+        assert_eq!(svc.cloudflare_auth, vec!["ops@example.com", "*@example.org"]);
     }
-
     #[test]
     fn test_down_service_only_shares_healthy_l7_routing_on_tcp() {
         fn service(
@@ -1502,19 +1450,16 @@ vip 192.168.1.4 {
 
     #[test]
     fn test_cloudflare_access_verification_is_per_host() {
-        let mut service = crate::ast::Service::new(
-            "192.0.2.10:80".to_string(),
-            Some("192.0.2.10".parse().unwrap()),
-            80,
-            crate::ast::Proto::Tcp,
-        );
-        service.cloudflare = Some("app.example.com".to_string());
-        service.cloudflare_auth.push("ops@example.com".to_string());
+        let cfg = parse_nftyfile(
+            "service 192.0.2.10:80 {\n to 192.0.2.20:8080\n cloudflare-dns app.example.com\n cloudflare-auth ops@example.com\n}\n",
+        ).unwrap();
         let mut cf = crate::features::CloudflareConfig::default();
         cf.protected_access_hosts.insert("other.example.com".to_string());
-        assert!(crate::features::service_uses_local_cf_auth_proxy(&service, &cf));
+        let routes = crate::features::cloudflare::collect_cloudflare_routes_with_config(&cfg, &cf);
+        assert_eq!(routes[0].2, "http_status:403");
         cf.protected_access_hosts.insert("app.example.com".to_string());
-        assert!(!crate::features::service_uses_local_cf_auth_proxy(&service, &cf));
+        let routes = crate::features::cloudflare::collect_cloudflare_routes_with_config(&cfg, &cf);
+        assert_eq!(routes[0].2, "http://192.0.2.20:8080");
     }
 
     #[test]
@@ -1547,7 +1492,6 @@ gateway 192.168.1.10 {
     #[tokio::test]
     async fn test_debug_mode_and_non24_prefix_persistence() {
         let state = AppState::new(Config::new(), PathBuf::from("Nftyfile"));
-        assert_eq!(state.api_bind, None);
 
         let shared: SharedState = Arc::new(RwLock::new(state));
         let level = Arc::new(Mutex::new(ShellLevel::Operational));
@@ -1639,13 +1583,11 @@ gateway 192.168.1.10 {
 
     #[tokio::test]
     async fn test_security_review_hardening_regressions() {
-        // 1. Loopback without valid IPC token is subject to the listener IP allow-list
+        // 1. Loopback is subject to the listener IP allow-list
         let shared = shared_from("vip 192.168.1.4 {\n    web:8000 {\n        allow 192.168.1.0/24\n    }\n}\n");
         assert_eq!(
             crate::api::authenticate_api_request_with_context(
                 &shared,
-                true,
-                false,
                 None,
                 Some(Ipv4Addr::LOCALHOST),
                 Some(8000),
@@ -1654,9 +1596,6 @@ gateway 192.168.1.10 {
             .0,
             403
         );
-        assert!(!crate::unikernel::verify_ipc_token("1"));
-        let real_tok = crate::unikernel::read_or_create_ipc_token();
-        assert!(crate::unikernel::verify_ipc_token(&real_tok));
 
         // 2. Gateway allow emits nfty:gw-policy-drop for ssh:22 and web:8000
         let gw_cfg = parse_nftyfile(
@@ -1677,25 +1616,7 @@ gateway 192.168.1.10 {
             .iter()
             .any(|e| e.contains("cloudflare-dns cannot be used on a web:/api: control listener")));
 
-        // 4. Gateway proxy destination filter blocks loopback, link-local, and appliance IPs
-        assert!(crate::features::is_forbidden_proxy_destination(
-            &shared,
-            Ipv4Addr::new(127, 0, 0, 1)
-        ));
-        assert!(crate::features::is_forbidden_proxy_destination(
-            &shared,
-            Ipv4Addr::new(169, 254, 1, 1)
-        ));
-        assert!(crate::features::is_forbidden_proxy_destination(
-            &shared,
-            Ipv4Addr::new(192, 168, 1, 4)
-        ));
-        assert!(!crate::features::is_forbidden_proxy_destination(
-            &shared,
-            Ipv4Addr::new(1, 1, 1, 1)
-        ));
-
-        // 5. Host / Origin authority validation blocks DNS rebinding domains
+        // 4. Host / Origin authority validation blocks DNS rebinding domains
         let st = shared.read().unwrap();
         assert!(st
             .active_config()
@@ -1708,20 +1629,21 @@ gateway 192.168.1.10 {
             .is_trusted_control_authority("evil.attacker.example:8000", &st.resolved_hosts));
         drop(st);
 
-        // 6. /api/v1/cli blocks custom save/load paths and interactive ssh key commands
+        // 5. /api/v1/cli blocks custom save/load paths and every stdin prompt (key paste, password)
         for blocked_cmd in [
             r#"{"command":"save /data/auth.json"}"#,
             r#"{"command":"load /etc/passwd"}"#,
-            r#"{"command":"ssh paste workstation"}"#,
             r#"{"command":"ssh add workstation"}"#,
-            r#"{"command":"ssh vi workstation"}"#,
+            r#"{"command":"wg add mullvad"}"#,
+            r#"{"command":"gateway gw1; tunnels; add mullvad"}"#,
+            r#"{"command":"password"}"#,
         ] {
             let (status, _) =
                 crate::api::route_api_request("POST", "/api/v1/cli", blocked_cmd, &shared).await;
             assert_eq!(status, 400, "expected 400 for {blocked_cmd}");
         }
 
-        // 7. Iterated salted PBKDF-v2 password hashing and legacy v1 verification
+        // 6. Iterated salted PBKDF-v2 password hashing and legacy v1 verification
         let h1 = crate::ssh::hash_password("hunter2");
         let h2 = crate::ssh::hash_password("hunter2");
         assert!(h1.starts_with("nfty-pbkdf-v2$"));

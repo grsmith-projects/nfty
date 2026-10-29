@@ -69,7 +69,7 @@ pub fn handle_show(args: &[&str], level: &ShellLevel, shared: &SharedState) {
                 }
                 return;
             }
-            "ssh" | "ssh-keys" => {
+            "ssh" => {
                 let _ = crate::ssh::handle_ssh_cli_command(&["list"]);
                 return;
             }
@@ -178,7 +178,7 @@ pub fn print_status_table(shared: &SharedState) {
         && !cfg.has_any_dns_enabled()
     {
         println!(
-            "No VIPs, services, gateways, or DNS configured. Run 'scan' to discover services or 'configure' -> 'vip <name>'."
+            "No VIPs, services, gateways, or DNS configured. Run 'configure' -> 'vip <name>' to get started."
         );
         return;
     }
@@ -236,13 +236,11 @@ pub fn print_status_table(shared: &SharedState) {
             .map(|h| format!(" [{}]", h))
             .unwrap_or_default();
         if let Some(cf_host) = svc.cloudflare.as_deref() {
-            if svc.cloudflare_auth.is_empty() && svc.auth.is_empty() {
+            if svc.cloudflare_auth.is_empty() {
                 host_badge.push_str(&format!(" [cf:{}]", cf_host));
             } else {
                 host_badge.push_str(&format!(" [cf:{} 🔒]", cf_host));
             }
-        } else if !svc.auth.is_empty() {
-            host_badge.push_str(" [🔒]");
         }
 
         if svc.backends.is_empty() {

@@ -12,23 +12,23 @@ It compiles a declarative configuration file (`/data/Nftyfile`), an interactive 
 | :--- | :--- |
 | [1. Getting Started & Deployment Guide](./getting-started.md) | Building from source (`glibc` and static `musl`), deployment modes (Standalone Daemon, LXD Container, Bootable Unikernel VM, Bare-Metal ARM64/RK3588S), initial VIP bootstrap, SSH setup, and CLI usage. |
 | [2. `Nftyfile` Configuration Reference](./nftyfile-reference.md) | Declarative syntax reference for `/data/Nftyfile`: global `allow` ACLs, static/VLAN/DHCP `macvlan` `vip` blocks, L4/L7 `service` blocks, `gateway` blocks, `dns` blocks, and `no ...` negation rules. |
-| [3. Interactive CLI & Live TUI Guide](./interactive-cli-and-tui.md) | Operational vs. Configuration modes, hierarchical drill-down contexts, Candidate vs. Running state workflows, rollback timers (`apply confirm <secs>`), service discovery (`scan`/`adopt`), and the `watch` TUI. |
+| [3. Interactive CLI Guide](./interactive-cli-and-tui.md) | Operational vs. Configuration modes, hierarchical drill-down contexts, Candidate vs. Running state workflows, rollback timers (`apply confirm <secs>`), and troubleshooting (`debug`). |
 | [4. REST API & Web Console Reference](./api-reference.md) | Configuring `web:<port>` (interactive Web Console with IP allow-list auth) and `api:<port>` (headless JSON API with `ro`/`rw` keys), key redaction behavior, and HTTP endpoint schemas. |
-| [5. Programmable DNS, WireGuard Gateways & Cloudflare Tunnels](./dns-and-wireguard-gateways.md) | `dnsmasq` supervision, health-aware DNS, split-horizon zones, `nftset` domain policy routing (`route`/`bypass`), multi-tunnel WireGuard ECMP gateways, inbound port forwards, `privoxy`/`socks5` proxies, and Cloudflare Tunnels. |
-| [6. `web:<port>` Web Console Specification](./web-interface-spec.md) | Architecture and view reference for the embedded 8-tab single-page Web Console, allow-list authentication, and Web CLI drawer. |
+| [5. Programmable DNS, WireGuard Gateways & Cloudflare Tunnels](./dns-and-wireguard-gateways.md) | `dnsmasq` supervision, health-aware DNS, split-horizon zones, `nftset` domain policy routing (`route`/`bypass`), multi-tunnel WireGuard ECMP gateways, inbound port forwards, and Cloudflare Tunnels. |
+| [6. `web:<port>` Web Console Specification](./web-interface-spec.md) | Architecture and view reference for the embedded 7-tab single-page Web Console, allow-list authentication, and Web CLI drawer. |
 
 ---
 
 ## Architecture Overview
 
-`nfty` separates candidate and running configuration from kernel and userspace dataplanes. `test`/`validate` can dry-run the generated `nftables` rules; applying a configuration spans additional subsystems and is not one atomic transaction.
+`nfty` separates candidate and running configuration from kernel and userspace dataplanes. `test` can dry-run the generated `nftables` rules; applying a configuration spans additional subsystems and is not one atomic transaction.
 
 ```mermaid
 flowchart TD
     subgraph ControlPlane["Control Plane & Management Interfaces"]
-        CLI["CLI & One-Shot Commands<br/>(nfty, nfty status, nfty diff, nfty watch)"]
+        CLI["CLI & One-Shot Commands<br/>(nfty, nfty status, nfty diff)<br/>via root-only /run/nfty/ctl.sock"]
         SSH["Embedded SSH2 Server (russh :22)<br/>(/data/auth.json Salted SHA-256)"]
-        WEB["Web Console (web:8000)<br/>(Allow-List Auth + 8-Tab SPA)"]
+        WEB["Web Console (web:8000)<br/>(Allow-List Auth + 7-Tab SPA)"]
         API["Headless Control API (api:8080)<br/>(Scoped rw / ro Keys + Secret Redaction)"]
     end
 
@@ -36,7 +36,7 @@ flowchart TD
         Cand["Candidate Config (In-Memory AST)"]
         Run["Running Config (Active AST + History Stack)"]
         Disk["Atomic /data Persistence<br/>(Nftyfile, auth.json, hosts.json, cloudflare.json, /data/wg/*.conf)"]
-        Health["Active Health & Discovery Prober<br/>(TCP, HTTP, ICMP Ping, WireGuard, ARP/LXD Scanner)"]
+        Health["Active Health Prober<br/>(TCP, HTTP, ICMP Ping, WireGuard)"]
     end
 
     subgraph KernelDataplane["Linux Kernel Dataplane (table ip nfty + Netlink)"]
@@ -50,16 +50,15 @@ flowchart TD
 
     subgraph UserspaceSupervisors["Supervised Userspace Dataplane Services"]
         DNS["dnsmasq Supervisor (dns:53)<br/>Auto-VIP/Host Synthesis, Health-Aware Records,<br/>Split-Horizon Zones, Blocklists & nftset= Population"]
-        L7["mDNS Responder (224.0.0.251:5353)<br/>& L7 HTTP Host / TLS SNI Router (:80 / :443)"]
-        GWProxy["Gateway Proxy Supervisor<br/>Socket-Marked Privoxy (HTTP/CONNECT :8118)<br/>& SOCKS5 (:1080) Listeners"]
-        CF["Cloudflare Tunnel Supervisor (cloudflared)<br/>Remotely-Managed CNAMEs, Access Policies,<br/>& Local HTTP Basic-Auth Gate (:18443)"]
+        L7["mDNS Responder (224.0.0.251:5353)<br/>& L7 HTTP Host / TLS SNI Router (:80 / :443)<br/>bound only while hostnames are configured"]
+        CF["Cloudflare Tunnel Supervisor (cloudflared)<br/>Remotely-Managed CNAMEs & Access Policies"]
     end
 
     CLI --> Cand
     SSH --> Cand
     WEB --> Cand
     API --> Cand
-    Cand -- "validate + apply / commit (confirm <secs>)" --> Run
+    Cand -- "test + apply (confirm <secs>)" --> Run
     Run <--> Disk
     Health <--> Run
 
@@ -73,8 +72,6 @@ flowchart TD
     Run -- "SIGHUP / /run/nfty-dnsmasq.*" --> DNS
     DNS -- "nftset= Dynamic IP Insertion" --> Mangle
     Run --> L7
-    Run --> GWProxy
-    GWProxy -- "SO_MARK + SO_BINDTODEVICE" --> WGRoute
     Run --> CF
 ```
 
@@ -88,9 +85,9 @@ flowchart TD
 | **Kernel L4 Load Balancing** | `table ip nfty` (`prerouting`) | TCP, UDP, or dual-stack (`both`) port forwarding; weighted `round-robin` (`numgen inc mod N`) or source-IP `sticky` (`ip saddr mod N`) verdict maps; `nat` (masquerade) or `transparent` (preserve client IP) modes; automatic `backup` backend failover. |
 | **Active Health Checking** | `health.rs` | Periodic `tcp`, `http <path>`, and `ping` (ICMP) probes with latency tracking. Unhealthy or manually `drained` backends are removed from active kernel `nftables` maps and DNS responses without dropping existing flows. |
 | **Allow-Lists & Rate Limiting** | `table ip nfty` (`allow_*`, `meter_*`) | Global and per-service/per-gateway ACLs supporting exact IPs, CIDRs (`10.0.0.0/8`), IP wildcards (`192.168.1.*`), hostnames (`admin.office.lan`), and wildcard hostnames (`*.office.lan`). Per-IP or global rate guards apply to first packets in the NAT chain, not every packet in an established flow. |
-| **L7 Host/SNI Proxy & mDNS** | `features/vhost_mdns.rs` | Multiplexes ports `80` and `443` across multiple backend services on the same VIP by inspecting HTTP `Host` headers and TLS ClientHello `SNI` extensions. Includes an embedded multicast mDNS responder (`224.0.0.251:5353`). |
-| **Internet NAT & WireGuard Gateways** | `features/wireguard.rs` / `gateway_proxy.rs` | Virtual Gateway IPs (`gateway 192.168.10.20`) usable as a LAN default gateway. Operates in Direct Internet NAT mode or WireGuard Multi-Tunnel ECMP mode with per-tunnel `fwmark` routing tables, `ct mark` connection pinning, WAN leak `killswitch`, inbound port forwarding (`forward <port> to <ip:port>`), and built-in `privoxy:8118` and `socks5:1080` proxies. |
+| **L7 Host/SNI Proxy & mDNS** | `features/vhost_mdns.rs` | Multiplexes ports `80` and `443` across multiple backend services on the same VIP by inspecting HTTP `Host` headers and TLS ClientHello `SNI` extensions. Includes an embedded multicast mDNS responder (`224.0.0.251:5353`). Both listeners bind only while a configured hostname needs them. |
+| **Internet NAT & WireGuard Gateways** | `features/wireguard.rs` | Virtual Gateway IPs (`gateway 192.168.10.20`) usable as a LAN default gateway. Operates in Direct Internet NAT mode or WireGuard Multi-Tunnel ECMP mode with per-tunnel `fwmark` routing tables, `ct mark` connection pinning, WAN leak `killswitch`, and inbound port forwarding (`forward <port> to <ip:port>`). |
 | **Programmable DNS (`dnsmasq` + `nftset`)** | `features/dns.rs` | `dnsmasq` supervisor with automatic VIP/host `A` and `PTR` synthesis, health-aware record filtering, authoritative `a`/`aaaa`/`address`/`cname`/`txt`/`srv`/`mx`/`ptr` records, conditional split-horizon `forward` zones (optionally pinned `via <gateway>`), domain blocklists, and `nftset` domain routing (`route <domain> via <gw>`, `bypass <domain> from <gw>`). |
-| **Cloudflare Tunnels** | `features/cloudflare.rs` | `cloudflare-dns <fqdn>` provisions Cloudflare Tunnels, ingress rules, and proxied CNAME records. `cloudflare-auth` supports Access email/domain policies; local service `auth` is currently rejected on apply. |
-| **Web Console & Control API** | `api.rs` | `web:<port>` serves the embedded 8-tab Web Console (`GET /`) with IP allow-list authentication; `api:<port>` serves the headless JSON API (`/api/v1/*`) with `rw` and `ro` scoped API keys and automatic secret redaction (`<redacted-rw-key>`). |
-| **PID-1 Unikernel & Container Runtime** | `unikernel.rs` / `ssh.rs` | Boots as `/sbin/init`, mounts `/proc`, `/sys`, `/dev`, and persistent `/data`, runs an embedded SSH2 server (`russh`) with first-login password rotation, and provides a `ratatui` terminal dashboard (`watch`). |
+| **Cloudflare Tunnels** | `features/cloudflare.rs` | `cloudflare-dns <fqdn>` provisions Cloudflare Tunnels, ingress rules, and proxied CNAME records. `cloudflare-auth` supports Access email/domain policies and fails closed (`403`) until the policy is verified. |
+| **Web Console & Control API** | `api.rs` | `web:<port>` serves the embedded 7-tab Web Console (`GET /`) with IP allow-list authentication; `api:<port>` serves the headless JSON API (`/api/v1/*`) with `rw` and `ro` scoped API keys and automatic secret redaction (`<redacted-rw-key>`). |
+| **PID-1 Unikernel & Container Runtime** | `unikernel.rs` / `ssh.rs` | Boots as `/sbin/init`, mounts `/proc`, `/sys`, `/dev`, and persistent `/data`, runs an embedded SSH2 server (`russh`) with first-login password rotation, and serves local CLI sessions over the root-only controller socket (`/run/nfty/ctl.sock`). |

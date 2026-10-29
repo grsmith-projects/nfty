@@ -467,20 +467,20 @@ pub async fn handle_debug_command(
     let args = &tokens[1..];
 
     match cmd.as_str() {
-        "configure" | "conf" | "config" => {
+        "configure" => {
             *level.lock().unwrap() = ShellLevel::ConfigRoot;
             Ok(())
         }
         "ping" => run_ping_command(args),
-        "traceroute" | "tracepath" | "tr" => run_traceroute_command(args),
+        "traceroute" => run_traceroute_command(args),
         "arping" => run_arping_command(args),
-        "tcp" | "nc" | "portcheck" => run_tcp_probe_command(args).await,
-        "dns" | "nslookup" | "dig" | "resolve" => {
+        "tcp" => run_tcp_probe_command(args).await,
+        "dns" => {
             if args.is_empty() {
                 crate::features::handle_dns_cli_command(&["status"], shared)
             } else if matches!(
                 args[0].to_ascii_lowercase().as_str(),
-                "status" | "test" | "lookup" | "query" | "config" | "reload" | "flush"
+                "status" | "test" | "config" | "reload"
             ) {
                 crate::features::handle_dns_cli_command(args, shared)
             } else {
@@ -489,11 +489,11 @@ pub async fn handle_debug_command(
                 crate::features::handle_dns_cli_command(&lookup_args, shared)
             }
         }
-        "interfaces" | "iface" | "ifaces" | "ip" | "addr" | "links" => run_interfaces_command(),
-        "routes" | "route" => run_routes_command(args),
-        "arp" | "neigh" | "neighbors" => run_arp_table_command(),
-        "sockets" | "ports" | "netstat" | "ss" => run_sockets_command(),
-        "wg" | "wireguard" => {
+        "interfaces" => run_interfaces_command(),
+        "routes" => run_routes_command(args),
+        "arp" => run_arp_table_command(),
+        "sockets" => run_sockets_command(),
+        "wg" => {
             if args.is_empty() {
                 run_wg_debug_command()
             } else {
@@ -501,14 +501,14 @@ pub async fn handle_debug_command(
                 Ok(())
             }
         }
-        "nft" | "ruleset" | "counters" => run_nft_debug_command(),
-        "conntrack" | "flows" | "sessions" => {
+        "nft" => run_nft_debug_command(),
+        "flows" => {
             crate::features::print_flows_table(shared);
             Ok(())
         }
-        "dmesg" | "klog" => run_dmesg_command(),
+        "dmesg" => run_dmesg_command(),
         _ => bail!(
-            "Unknown debug command '{}'. Type '?' for available troubleshooting tools (ping, traceroute, tcp, dns, arping, interfaces, routes, arp, sockets, wg, nft, conntrack, dmesg).",
+            "Unknown debug command '{}'. Type '?' for available troubleshooting tools (ping, traceroute, tcp, dns, arping, interfaces, routes, arp, sockets, wg, nft, flows, dmesg).",
             cmd
         ),
     }

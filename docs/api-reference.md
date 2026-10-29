@@ -13,21 +13,21 @@
 5. [Status, Config, NFT & Flows Endpoints](#5-status-config-nft--flows-endpoints)
 6. [Allowlist & Dynamic Host Registration Endpoints](#6-allowlist--dynamic-host-registration-endpoints)
 7. [Backend Drain, Undrain & Health Probe Endpoints](#7-backend-drain-undrain--health-probe-endpoints)
-8. [LAN Discovery, WireGuard & Cloudflare Endpoints](#8-lan-discovery-wireguard--cloudflare-endpoints)
+8. [WireGuard & Cloudflare Endpoints](#8-wireguard--cloudflare-endpoints)
 9. [1:1 CLI Execution & Service CRUD Endpoints](#9-11-cli-execution--service-crud-endpoints)
 
 ---
 
 ## 1. Enabling `web:<port>` vs. `api:<port>`
 
-By default, **`nfty` does not bind any Control API or Web Console port** unless you explicitly declare `web:<port>` or `api:<port>` inside a `vip` or `gateway` block in `/data/Nftyfile` (or pass `--api-bind <ip:port>` on the daemon CLI).
+By default, **`nfty` does not bind any Control API or Web Console port** unless you explicitly declare `web:<port>` or `api:<port>` inside a `vip` or `gateway` block in `/data/Nftyfile`.
 
 `nfty` enforces a strict separation between the interactive Web Console (`web:<port>`) and the headless JSON Control API (`api:<port>`):
 
-- **`web:<port>`** (default `:8000`): Serves the interactive 8-tab JavaScript Web Console (`GET /`, `/ui`, `/dashboard`, `/index.html`) plus the `/api/v1/*` endpoints it calls. Requires an IP/CIDR `allow` list (e.g. `allow { 192.168.0.0/16 }`) so allowed operators can use the web frontend directly in their browser.
+- **`web:<port>`** (default `:8000`): Serves the interactive 7-tab JavaScript Web Console (`GET /`, `/ui`, `/dashboard`, `/index.html`) plus the `/api/v1/*` endpoints it calls. Requires an IP/CIDR `allow` list (e.g. `allow { 192.168.0.0/16 }`) so allowed operators can use the web frontend directly in their browser.
 - **`api:<port>`** (default `:9090`): Serves **only** the headless JSON Control API (`/api/v1/*`; `GET /` returns `404 Not Found` JSON). Requires an IP/CIDR `allow` list, plus a scoped `rw` or `ro` API key if any keys are configured.
 
-Both listener types **must** have at least one IP, CIDR, or IPv4-wildcard allow entry (their own, their gateway's, or the global `allow`). Configs without one fail `validate`/`apply` and are rejected by `PUT /api/v1/config`. Hostname entries are not accepted for these listeners. Remote clients outside the allow-list, or connecting to a port with no `web:`/`api:` listener, get `403`. Loopback clients (the local CLI) are not affected.
+Both listener types **must** have at least one IP, CIDR, or IPv4-wildcard allow entry (their own, their gateway's, or the global `allow`). Configs without one fail `test`/`apply` and are rejected by `PUT /api/v1/config`. Hostname entries are not accepted for these listeners. Remote clients outside the allow-list, or connecting to a port with no `web:`/`api:` listener, get `403`. Loopback clients get no special treatment.
 
 ### `Nftyfile` Configuration
 
@@ -91,34 +91,28 @@ When one or more `api:<port>` blocks are configured on VIPs or Gateways, the `nf
 
 ### Supported Authentication Headers & Parameters
 
-Clients can present their API key using any of the following four standard mechanisms:
+Clients can present their API key using one of three mechanisms:
 
-1. **Bearer / Token Authorization Header** (Recommended):
+1. **Bearer Token Authorization Header** (Recommended):
    ```http
    Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b
    ```
-   *(Also accepts `Authorization: Token <key>`)*
 2. **Custom API Key Header**:
    ```http
    X-API-Key: nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b
    ```
-   *(Also accepts `X-Nfty-Key: <key>`)*
-3. **HTTP Basic Auth**:
-   ```bash
-   curl -u admin:nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b http://192.168.1.4:9090/api/v1/status
-   ```
-   *(Any username is accepted; the password field is verified as the API key)*
-4. **URL Query Parameter** (Convenient for browser bookmarks and Prometheus/Grafana scrapers):
+3. **URL Query Parameter** (Convenient for Prometheus/Grafana scrapers; prefer a header where possible because URLs can end up in logs):
    ```text
    http://192.168.1.4:9090/api/v1/status?key=nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a
    ```
-   *(Also accepts `?api_key=<key>` or `?token=<key>`)*
+
+There is no username/password login for the web console or API. Access is controlled by the listener's IP allow-list plus optional API keys.
 
 > [!NOTE]
 > **Loopback & Unconfigured Key Behavior**
-> - Remote clients must pass the receiving listener's IP allow-list. A listener with no configured keys grants allow-listed clients read-write access; a keyed listener requires a matching key or appliance credential.
-> - On a shared port, a key must be accepted by every keyed listener on that port and receives the least privilege granted by them. Loopback CLI IPC uses an internal header that grants read-write access without a key. Any local process able to reach the listener can send that header, so local processes must be trusted.
-
+> - Every client, including loopback, must pass the receiving listener's IP allow-list. A listener with no configured keys grants allow-listed clients read-write access; a keyed listener requires a matching key.
+> - On a shared port, a key must be accepted by every keyed listener on that port and receives the least privilege granted by them.
+> - Local CLI and SSH sessions do not use HTTP. They reach the controller over a Unix socket (`/run/nfty/ctl.sock`, mode `0600`) that accepts only root or the controller's own user.
 ### Permission Scopes & Secret Redaction (`rw` vs `ro`)
 
 Every API key is assigned either `rw` (**Read-Write**) or `ro` (**Read-Only**) scope:
@@ -126,7 +120,6 @@ Every API key is assigned either `rw` (**Read-Write**) or `ro` (**Read-Only**) s
 | Capability | `rw` (Read-Write Key) | `ro` (Read-Only Key) | Logged-in SSH/Local CLI User |
 | :--- | :---: | :---: | :---: |
 | `GET /api/v1/status`, `/config`, `/nft`, `/flows`, `/allow` | Allowed | Allowed | Full CLI access |
-| `GET /api/v1/scan` & `POST /api/v1/scan` (Active LAN scan) | Allowed | `403 Forbidden` | Allowed (`scan`) |
 | `POST` / `PUT` / `DELETE` configuration & drain mutations | Allowed | `403 Forbidden` | Allowed |
 | Visibility of `ro` API keys in config output | Full plaintext | Full plaintext | Full plaintext |
 | Visibility of `rw` API keys in config output | Full plaintext | Redacted as `<redacted-rw-key>` | Full plaintext |
@@ -136,12 +129,12 @@ Every API key is assigned either `rw` (**Read-Write**) or `ro` (**Read-Only**) s
 > **Why `ro` Redacts `rw` Keys and WireGuard Private Keys**
 > Because `GET /api/v1/status` and `GET /api/v1/config` return the full `Nftyfile` AST and formatted configuration text, an `ro` key holder would be able to escalate privileges to `rw` if `rw` keys were returned in cleartext. `nfty` automatically sanitizes all `rw` keys to `<redacted-rw-key>` and all WireGuard private/preshared keys to `<redacted>` whenever a request is authenticated with an `ro` token.
 
-If an `ro` token attempts a write or scan operation, `nfty` returns `403 Forbidden`:
+If an `ro` token attempts a write operation, `nfty` returns `403 Forbidden`:
 
 ```json
 {
   "ok": false,
-  "error": "Forbidden: API key has read-only ('ro') scope; write and scan operations require a read-write ('rw') key"
+  "error": "Forbidden: API key has read-only ('ro') scope; write operations require a read-write ('rw') key"
 }
 ```
 
@@ -149,19 +142,18 @@ If an `ro` token attempts a write or scan operation, `nfty` returns `403 Forbidd
 
 ## 3. Interactive Web Console (`web:<port>`)
 
-Navigating to `http://192.168.1.4:8000/` (or `/dashboard`, `/ui`, `/index.html`) on any port configured with `web:<port>` serves the built-in dark-mode **8-Tab Interactive Web Console**:
+Navigating to `http://192.168.1.4:8000/` (or `/dashboard`, `/ui`, `/index.html`) on any port configured with `web:<port>` serves the built-in dark-mode **7-Tab Interactive Web Console**:
 
 - **Strict Port Separation**: `GET /` is only served on `web:<port>` listeners (e.g., `web:8000`). Hitting `GET /` on an `api:<port>` listener (e.g., `api:8080`) returns `404 Not Found` (`application/json`).
 - **IP Allow-List Authentication**: `web:8000` requires an allow-list such as `allow { 192.168.0.0/16 }`; any browser client on `192.168.0.0/16` is automatically authenticated with `rw` access without needing to paste an API key. Clients outside it receive `403`.
-- **8 Interactive Views + Web CLI Drawer**:
+- **7 Interactive Views + Web CLI Drawer**:
   1. **Overview & Topology** (KPI cards, live VIP/Service/Gateway topology cards, health matrix, 1-click Probe Now)
   2. **VIPs & Services** (1-click Backend Drain/Enable, Add/Delete Service, API Key generator)
   3. **WireGuard Gateways** (Upload `.conf` profiles, ECMP tunnel health/latency/traffic, port forwards)
   4. **Programmable DNS** (`dnsmasq` settings, authoritative records, `nftset` policy routes, adblock domains)
   5. **Allow-List & Cloudflare** (Global & per-service allow-lists, dynamic host->IP registration, Refresh DNS Now)
   6. **Conntrack Flows** (Real-time `/proc/net/nf_conntrack` table with search/filter and pause/resume)
-  7. **Network Scanner** (`POST /api/v1/scan` LAN discovery with 1-click **+ Adopt into VIP**)
-  8. **Nftyfile & `nftables`** (Editable `Nftyfile` with Save & Apply + compiled `table ip nfty` viewer)
+  7. **Nftyfile & `nftables`** (Editable `Nftyfile` with Save & Apply + compiled `table ip nfty` viewer)
   - **Slide-Up Web CLI (`)**: Press `` ` `` to run any `nfty` CLI command directly in the browser.
 
 ---
@@ -170,26 +162,24 @@ Navigating to `http://192.168.1.4:8000/` (or `/dashboard`, `/ui`, `/index.html`)
 
 | Method | Endpoint | Min Scope | Description |
 | :--- | :--- | :---: | :--- |
-| `GET` | `/`, `/dashboard`, `/ui` | `web:<port>` only | Serves the embedded 8-tab interactive HTML/JS Web Console (`404` on `api:<port>`). |
+| `GET` | `/`, `/dashboard`, `/ui` | `web:<port>` only | Serves the embedded 7-tab interactive HTML/JS Web Console (`404` on `api:<port>`). |
 | `GET` | `/api/v1/auth/whoami` | `ro` / Allow-List | Returns active authentication scope (`rw` or `ro`), mode (`allowlist` or `token`), client IP, and listener port. |
-| `POST` | `/api/v1/auth/login` | Public | Exchanges an API key or appliance username/password (`nfty`) for a session token and scope. |
-| `GET` | `/api/v1/status` (or `/status`) | `ro` | Full appliance snapshot: config, backend health/RTT, active backends, flows, WireGuard profiles, and compiled `nftables` ruleset. |
+| `GET` | `/api/v1/status` | `ro` | Full appliance snapshot: config, backend health/RTT, active backends, flows, WireGuard profiles, and compiled `nftables` ruleset. |
 | `GET` | `/api/v1/config` | `ro` | Returns structured JSON and formatted `Nftyfile` text for both `running` and `candidate` configs. |
 | `PUT` | `/api/v1/config` | `rw` | Parses and applies an `Nftyfile` with checked operations and best-effort restoration; the overall apply is not atomic. |
 | `GET` | `/api/v1/nft` | `ro` | Returns the compiled kernel `nftables` script (`table ip nfty` and `table netdev nfty_ingress`). |
 | `GET` | `/api/v1/flows` | `ro` | Returns active NAT connections parsed from `/proc/net/nf_conntrack`. |
-| `GET`, `POST` | `/api/v1/scan` | `rw` | Scans known local targets or a specified host or `/24`–`/32` CIDR for TCP services, with neighbor/rDNS discovery. |
 | `GET` | `/api/v1/wg` | `ro` | Lists saved WireGuard `.conf` profiles in `/data/wg/` (`PrivateKey` redacted for `ro`). |
 | `POST` | `/api/v1/wg` | `rw` | Uploads and validates a WireGuard `.conf` profile into `/data/wg/<name>.conf`. |
-| `GET` | `/api/v1/cloudflare` (or `/api/v1/cf`) | `ro` | Returns `cloudflared` daemon status, tunnel metadata, and active `cloudflare-dns` / `cloudflare-auth` routes. |
-| `POST` | `/api/v1/cloudflare` (or `/api/v1/cf`) | `rw` | Updates Cloudflare API/tunnel credentials in `/data/cloudflare.json` and reconciles the tunnel. |
+| `GET` | `/api/v1/cloudflare` | `ro` | Returns `cloudflared` daemon status, tunnel metadata, and active `cloudflare-dns` / `cloudflare-auth` routes. |
+| `POST` | `/api/v1/cloudflare` | `rw` | Updates Cloudflare API/tunnel credentials in `/data/cloudflare.json` and reconciles the tunnel. |
 | `GET` | `/api/v1/allow` | `ro` | Returns global allowlists, per-service allowlists, resolved DNS host mappings, and expanded `nftables` IP sets. |
 | `POST`, `PUT` | `/api/v1/allow` | `rw` | Appends (`POST`) or replaces (`PUT`) global or per-service allowlist entries and optionally applies to the kernel. |
 | `DELETE` | `/api/v1/allow` | `rw` | Removes specified entries from the global or per-service allowlist. |
 | `POST`, `PUT` | `/api/v1/allow/hosts` | `rw` | Registers or updates a dynamic hostname-to-IPv4 mapping and immediately refreshes kernel allow sets. |
 | `POST` | `/api/v1/allow/refresh` | `rw` | Forces immediate DNS re-resolution of all hostname and wildcard allowlist entries. |
-| `POST` | `/api/v1/backends/drain` (or `/api/v1/drain`) | `rw` | Marks a backend `ip:port` as `DRAINING` and removes it from the kernel `nftables` verdict map. |
-| `POST` | `/api/v1/backends/undrain` (or `/api/v1/enable`) | `rw` | Clears `DRAINING` on a backend `ip:port` and restores it to active kernel rotation. |
+| `POST` | `/api/v1/drain` | `rw` | Marks a backend `ip:port` as `DRAINING` and removes it from the kernel `nftables` verdict map. |
+| `POST` | `/api/v1/enable` | `rw` | Clears `DRAINING` on a backend `ip:port` and restores it to active kernel rotation. |
 | `POST` | `/api/v1/probe` | `rw` | Triggers an immediate health check cycle across all services and returns probe outcomes. |
 | `POST` | `/api/v1/cli` | `rw` | Executes any semicolon-separated or multi-line CLI command string (1:1 parity with interactive shell). |
 | `POST` | `/api/v1/apply` | `rw` | Validates and commits the current `candidate` configuration to `running` and reloads the kernel. |
@@ -239,8 +229,8 @@ curl -s -H "Authorization: Bearer nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a" \
         "vip": "192.168.1.4",
         "listen_port": 443,
         "proto": "tcp",
-        "mode": "dnat",
-        "balance": { "Sticky": { "timeout_secs": 1800 } },
+        "mode": "nat",
+        "balance": "sticky",
         "backends": [
           { "ip": "192.168.1.21", "port": 443, "weight": 2, "backup": false },
           { "ip": "192.168.1.22", "port": 443, "weight": 1, "backup": false }
@@ -434,12 +424,11 @@ curl -s -X POST \
 
 ---
 
-## 7. Backend Drain, Undrain & Health Probe Endpoints
+## 7. Backend Drain, Enable & Health Probe Endpoints
 
-### `POST /api/v1/backends/drain` & `POST /api/v1/backends/undrain`
+### `POST /api/v1/drain` & `POST /api/v1/enable`
 
-Gracefully drains or undrains (re-enables) a backend `<ip:port>` across all services.
-*(Note: `/api/v1/drain` and `/api/v1/enable` are also supported as endpoint aliases.)*
+Gracefully drains or re-enables a backend `<ip:port>` across all services.
 
 - When drained, the backend is immediately removed from the kernel `nftables` `numgen` / sticky verdict map so new connections are routed only to remaining healthy backends, while existing `conntrack` sessions continue undisturbed.
 
@@ -448,7 +437,7 @@ Gracefully drains or undrains (re-enables) a backend `<ip:port>` across all serv
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
   -d '{"backend": "192.168.1.21:443"}' \
-  http://192.168.1.4:9090/api/v1/backends/drain
+  http://192.168.1.4:9090/api/v1/drain
 ```
 
 **Drain Response (`200 OK`):**
@@ -460,15 +449,15 @@ curl -s -X POST \
 }
 ```
 
-**Undrain / Enable Request:**
+**Enable Request:**
 ```bash
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
   -d '{"backend": "192.168.1.21:443"}' \
-  http://192.168.1.4:9090/api/v1/backends/undrain
+  http://192.168.1.4:9090/api/v1/enable
 ```
 
-**Undrain Response (`200 OK`):**
+**Enable Response (`200 OK`):**
 ```json
 {
   "ok": true,
@@ -507,40 +496,7 @@ curl -s -X POST \
 
 ---
 
-## 8. LAN Discovery, WireGuard & Cloudflare Endpoints
-
-### `GET /api/v1/scan` & `POST /api/v1/scan` (`rw` Scope Required)
-
-Scans known local targets (or a `/24`–`/32` CIDR/host in the `POST` body) for open TCP services and reverse DNS hostnames. Discovery does not register host mappings in the allow-list cache.
-
-```bash
-curl -s -X POST \
-  -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
-  -d '192.168.1.0/24' \
-  http://192.168.1.4:9090/api/v1/scan
-```
-
-**Response (`200 OK`):**
-```json
-{
-  "ok": true,
-  "discovered": [
-    {
-      "ip": "192.168.1.21",
-      "hostname": "k8s-worker-01.lan",
-      "mac": "00:16:3e:a1:b2:c3",
-      "interface": "eth0",
-      "open_ports": [
-        { "port": 22, "service_hint": "ssh" },
-        { "port": 443, "service_hint": "https" },
-        { "port": 6443, "service_hint": "k8s-api" }
-      ]
-    }
-  ]
-}
-```
-
----
+## 8. WireGuard & Cloudflare Endpoints
 
 ### `GET /api/v1/wg` & `POST /api/v1/wg`
 
@@ -581,7 +537,7 @@ curl -s -X POST \
 
 ### `GET /api/v1/cloudflare` & `POST /api/v1/cloudflare`
 
-Manages the integrated Cloudflare DNS and Zero-Trust `cloudflared` tunnel supervisor (also accessible at `/api/v1/cf`).
+Manages the integrated Cloudflare DNS and Zero-Trust `cloudflared` tunnel supervisor.
 
 **Example (`POST /api/v1/cloudflare`):**
 ```bash
@@ -607,7 +563,7 @@ Executes any interactive CLI command sequence (separated by `;` or newlines) sta
 curl -s -X POST \
   -H "Authorization: Bearer nfty_rw_84f9a2d1c3e5b7091a2b3c4d5e6f7a8b" \
   -d '{
-    "command": "vip 192.168.1.4; service redis:6379; balance sticky 10m; to 192.168.1.41:6379 weight 2; to 192.168.1.42:6379 backup; apply; save"
+    "command": "vip 192.168.1.4; service redis:6379; balance sticky; to 192.168.1.41:6379 weight 2; to 192.168.1.42:6379 backup; apply; save"
   }' \
   http://192.168.1.4:9090/api/v1/cli
 ```

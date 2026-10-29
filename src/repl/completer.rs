@@ -24,11 +24,6 @@ impl NftyHelper {
             for h in st.resolved_hosts.keys() {
                 set.insert(h.clone());
             }
-            for d in &st.discovered_services {
-                if let Some(h) = &d.host {
-                    set.insert(h.clone());
-                }
-            }
             for svc in st.candidate.services.values() {
                 for b in &svc.backends {
                     if let Some(h) = &b.host {
@@ -58,9 +53,6 @@ impl NftyHelper {
     fn known_host_ports(&self) -> Vec<String> {
         let mut set = std::collections::BTreeSet::new();
         if let Ok(st) = self.state.read() {
-            for d in &st.discovered_services {
-                set.insert(d.target_spec());
-            }
             for svc in st.candidate.services.values() {
                 for b in &svc.backends {
                     if !b.ip.is_loopback() {
@@ -201,8 +193,8 @@ impl Completer for NftyHelper {
                         .collect();
                     return Ok((start_pos, matches));
                 }
-                "wg" | "wireguard" => {
-                    let list = vec!["list", "add", "edit", "paste", "show", "rm", "status"];
+                "wg" => {
+                    let list = vec!["list", "add", "show", "rm", "peer", "qr"];
                     let matches = list
                         .into_iter()
                         .filter(|c| c.starts_with(prefix))
@@ -213,8 +205,8 @@ impl Completer for NftyHelper {
                         .collect();
                     return Ok((start_pos, matches));
                 }
-                "ssh" | "ssh-key" | "ssh-keys" => {
-                    let list = vec!["list", "add", "edit", "paste", "vi", "show", "rm", "key"];
+                "ssh" => {
+                    let list = vec!["list", "add", "show", "rm"];
                     let matches = list
                         .into_iter()
                         .filter(|c| c.starts_with(prefix))
@@ -225,7 +217,7 @@ impl Completer for NftyHelper {
                         .collect();
                     return Ok((start_pos, matches));
                 }
-                "cf" | "cloudflare" => {
+                "cf" => {
                     let list = vec![
                         "status",
                         "token",
@@ -269,20 +261,7 @@ impl Completer for NftyHelper {
                         .collect();
                     return Ok((start_pos, matches));
                 }
-                "scan" => {
-                    let mut list = self.known_hosts();
-                    list.push("192.168.1.0/24".to_string());
-                    let matches = list
-                        .into_iter()
-                        .filter(|c| c.starts_with(prefix))
-                        .map(|c| Pair {
-                            display: c.clone(),
-                            replacement: c,
-                        })
-                        .collect();
-                    return Ok((start_pos, matches));
-                }
-                "ping" | "traceroute" | "tracepath" | "arping" => {
+                "ping" | "traceroute" | "arping" => {
                     let mut list = self.known_hosts();
                     list.push("1.1.1.1".to_string());
                     list.push("8.8.8.8".to_string());
@@ -308,7 +287,7 @@ impl Completer for NftyHelper {
                         .collect();
                     return Ok((start_pos, matches));
                 }
-                "debug" | "troubleshoot" | "diag" => {
+                "debug" => {
                     let list = vec![
                         "ping",
                         "traceroute",
@@ -334,25 +313,7 @@ impl Completer for NftyHelper {
                         .collect();
                     return Ok((start_pos, matches));
                 }
-                "adopt" => {
-                    let st = self.state.read().unwrap();
-                    let mut list = Vec::new();
-                    for d in &st.discovered_services {
-                        list.push(d.index.to_string());
-                        list.push(d.suggested_vip_name());
-                        list.push(d.target_spec());
-                    }
-                    let matches = list
-                        .into_iter()
-                        .filter(|c| c.starts_with(prefix))
-                        .map(|c| Pair {
-                            display: c.clone(),
-                            replacement: c,
-                        })
-                        .collect();
-                    return Ok((start_pos, matches));
-                }
-                "apply" | "commit" => {
+                "apply" => {
                     let list = vec!["confirm 60".to_string(), "confirm 30".to_string()];
                     let matches = list
                         .into_iter()
@@ -366,7 +327,7 @@ impl Completer for NftyHelper {
                 }
                 _ => {}
             }
-        } else if word_idx == 2 && (cmd0 == "wg" || cmd0 == "wireguard") {
+        } else if word_idx == 2 && cmd0 == "wg" && matches!(cmd1.as_str(), "show" | "rm") {
             let files = self.wg_conf_files();
             let matches = files
                 .into_iter()
@@ -377,21 +338,7 @@ impl Completer for NftyHelper {
                 })
                 .collect();
             return Ok((start_pos, matches));
-        } else if (word_idx == 2 || word_idx == 3)
-            && matches!(cmd0.as_str(), "ssh" | "ssh-key" | "ssh-keys")
-        {
-            if word_idx == 2 && matches!(cmd1.as_str(), "key" | "keys") {
-                let list = vec!["list", "add", "edit", "paste", "vi", "show", "rm"];
-                let matches = list
-                    .into_iter()
-                    .filter(|c| c.starts_with(prefix))
-                    .map(|c| Pair {
-                        display: c.to_string(),
-                        replacement: c.to_string(),
-                    })
-                    .collect();
-                return Ok((start_pos, matches));
-            }
+        } else if word_idx == 2 && cmd0 == "ssh" && matches!(cmd1.as_str(), "show" | "rm") {
             let files = self.ssh_pub_files();
             let matches = files
                 .into_iter()
@@ -402,38 +349,11 @@ impl Completer for NftyHelper {
                 })
                 .collect();
             return Ok((start_pos, matches));
-        } else if word_idx >= 2 && cmd0 == "adopt" {
-            if words.get(word_idx.saturating_sub(1)).copied() == Some("vip") {
-                let st = self.state.read().unwrap();
-                let list: Vec<String> = st.candidate.vips.keys().cloned().collect();
-                let matches = list
-                    .into_iter()
-                    .filter(|c| c.starts_with(prefix))
-                    .map(|c| Pair {
-                        display: c.clone(),
-                        replacement: c,
-                    })
-                    .collect();
-                return Ok((start_pos, matches));
-            } else {
-                let list = vec!["vip".to_string(), "port".to_string(), "vlan".to_string()];
-                let matches = list
-                    .into_iter()
-                    .filter(|c| c.starts_with(prefix))
-                    .map(|c| Pair {
-                        display: c.clone(),
-                        replacement: c,
-                    })
-                    .collect();
-                return Ok((start_pos, matches));
-            }
         }
 
         let lvl = self.level.lock().unwrap().clone();
         let candidates: Vec<String> = match (&lvl, word_idx) {
             (ShellLevel::Operational, 0) => vec![
-                "scan",
-                "adopt",
                 "bootstrap",
                 "configure",
                 "debug",
@@ -446,7 +366,6 @@ impl Completer for NftyHelper {
                 "wg",
                 "ssh",
                 "cf",
-                "watch",
                 "probe",
                 "show",
                 "drain",
@@ -471,11 +390,9 @@ impl Completer for NftyHelper {
                 "wg",
                 "nft",
                 "flows",
-                "conntrack",
                 "dmesg",
                 "probe",
                 "status",
-                "watch",
                 "show",
                 "configure",
                 "..",
@@ -491,8 +408,6 @@ impl Completer for NftyHelper {
                 "gateway",
                 "service",
                 "dns",
-                "scan",
-                "adopt",
                 "bootstrap",
                 "allow",
                 "host",
@@ -510,7 +425,6 @@ impl Completer for NftyHelper {
                 "save",
                 "load",
                 "status",
-                "watch",
                 "probe",
                 "password",
                 "exit",
@@ -581,14 +495,7 @@ impl Completer for NftyHelper {
             .collect(),
             (ShellLevel::ConfigRoot, 1) if cmd0 == "vip" => {
                 let st = self.state.read().unwrap();
-                let mut list: Vec<String> = st.candidate.vips.keys().cloned().collect();
-                for d in &st.discovered_services {
-                    let s = d.suggested_vip_name();
-                    if !list.contains(&s) {
-                        list.push(s);
-                    }
-                }
-                list
+                st.candidate.vips.keys().cloned().collect()
             }
             (ShellLevel::ConfigRoot, 1) if cmd0 == "gateway" => {
                 let st = self.state.read().unwrap();
@@ -643,9 +550,6 @@ impl Completer for NftyHelper {
                     "interface",
                     "cloudflare-dns",
                     "cloudflare-auth",
-                    "auth",
-                    "scan",
-                    "adopt",
                     "no",
                     "show",
                     "diff",
@@ -684,7 +588,6 @@ impl Completer for NftyHelper {
                 list.push("dhcp".to_string());
                 list.push("cloudflare-dns".to_string());
                 list.push("cloudflare-auth".to_string());
-                list.push("auth".to_string());
                 list.push("ssh:22".to_string());
                 list.push("api:9090".to_string());
                 list.push("web:8000".to_string());
@@ -697,7 +600,6 @@ impl Completer for NftyHelper {
                 "hostname",
                 "cloudflare-dns",
                 "cloudflare-auth",
-                "auth",
                 "key",
                 "balance",
                 "mode",
@@ -759,20 +661,15 @@ impl Completer for NftyHelper {
                 "50/sec burst 100 per-ip".to_string(),
                 "600/min per-ip".to_string(),
             ],
-            (ShellLevel::Service(_), 1) if cmd0 == "cloudflare-auth" || cmd0 == "cf-auth" => vec![
+            (ShellLevel::Service(_), 1) if cmd0 == "cloudflare-auth" => vec![
                 "*@example.com".to_string(),
                 "you@example.com".to_string(),
-            ],
-            (ShellLevel::Service(_), 1) if cmd0 == "auth" => vec![
-                "admin:password".to_string(),
-                "nfty".to_string(),
             ],
             (ShellLevel::Service(k), 1) if cmd0 == "no" => {
                 let mut list = vec![
                     "hostname".to_string(),
                     "cloudflare-dns".to_string(),
                     "cloudflare-auth".to_string(),
-                    "auth".to_string(),
                     "key".to_string(),
                     "check".to_string(),
                     "limit".to_string(),
@@ -791,8 +688,6 @@ impl Completer for NftyHelper {
             (ShellLevel::Gateway(_), 0) => vec![
                 "wg-in:51820",
                 "peer",
-                "privoxy:8118",
-                "socks5:1080",
                 "ssh:22",
                 "dns:53",
                 "api:9090",
@@ -905,11 +800,10 @@ impl Completer for NftyHelper {
             }
             (ShellLevel::Gateway(gw_k), 1) if cmd0 == "no" => {
                 let mut list = vec![
-                    "privoxy".to_string(),
-                    "socks5".to_string(),
                     "ssh".to_string(),
                     "dns".to_string(),
                     "api".to_string(),
+                    "web".to_string(),
                     "key".to_string(),
                     "forward".to_string(),
                     "killswitch".to_string(),
@@ -927,19 +821,17 @@ impl Completer for NftyHelper {
             (ShellLevel::GatewayTunnels(_), 0) => {
                 let mut list = self.wg_conf_files();
                 for cmd in [
-                    "add", "paste", "nano", "vi", "no", "show", "apply", "top", "..", "up", "exit",
-                    "help",
+                    "add", "no", "show", "apply", "top", "..", "up", "exit", "help",
                 ] {
                     list.push(cmd.to_string());
                 }
                 list
             }
             (ShellLevel::GatewayService(_), 0) => vec![
-                "privoxy:8118",
-                "socks5:1080",
                 "ssh:22",
                 "dns:53",
                 "api:9090",
+                "web:8000",
                 "no",
                 "show",
                 "top",

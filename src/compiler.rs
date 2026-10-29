@@ -420,8 +420,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                         && other.hostname.is_some()
                 })
                 .count()
-                > 1
-            || (svc.port == 80 && svc.hostname.is_some() && !svc.auth.is_empty());
+                > 1;
         out.push_str(&format!("\n        # --- service {} ---\n", svc.key));
         for proto_str in expand_protos(svc.proto) {
             emit_service_prerouting(
@@ -486,9 +485,7 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                             ));
                         }
                     }
-                    GatewayServiceKind::Privoxy
-                    | GatewayServiceKind::Socks5
-                    | GatewayServiceKind::Dns => {}
+                    GatewayServiceKind::Dns => {}
                 }
             }
         }
@@ -818,24 +815,6 @@ fn emit_service_prerouting(
             "        {}{}{} counter redirect to :{} comment \"nfty:svc={}\"\n",
             match_prefix, allow_guard, rate_guard, svc.port, svc.key
         ));
-        return;
-    }
-
-    if !svc.auth.is_empty() && proto_str == "tcp" {
-        out.push_str(&format!(
-            "        {}{}{} counter redirect to :{} comment \"nfty:svc={}\"\n",
-            match_prefix,
-            allow_guard,
-            rate_guard,
-            crate::features::CF_LOCAL_AUTH_PORT,
-            svc.key
-        ));
-        if has_allow_rules || svc.limit.is_some() {
-            out.push_str(&format!(
-                "        {} counter drop comment \"nfty:svc-policy-drop={}\"\n",
-                match_prefix, svc.key
-            ));
-        }
         return;
     }
 
@@ -1476,22 +1455,6 @@ pub struct ValidationReport {
 
 fn configuration_safety_errors(config: &Config) -> Vec<String> {
     let mut errors = Vec::new();
-    for svc in config.services.values() {
-        if !svc.auth.is_empty() {
-            if svc.proto != Proto::Tcp {
-                errors.push(format!(
-                    "service '{}': local Basic Auth ('auth') requires TCP and cannot be enforced on UDP",
-                    svc.key
-                ));
-            } else if svc.port == 443 {
-                errors.push(format!(
-                    "service '{}': local Basic Auth ('auth') cannot inspect encrypted TLS passthrough on port 443",
-                    svc.key
-                ));
-            }
-        }
-    }
-
     let services: Vec<_> = config.services.values().collect();
     for (index, svc) in services.iter().enumerate() {
         for other in &services[index + 1..] {
@@ -1873,7 +1836,7 @@ pub fn apply_config(state: &mut AppState, next: Config) -> Result<ApplyResult> {
     let previous = state.running.clone();
     let stopped_cloudflare = previous != next
         && [&previous, &next].iter().any(|config| config.services.values().any(|svc| {
-            svc.cloudflare.is_some() && (!svc.auth.is_empty() || !svc.cloudflare_auth.is_empty())
+            svc.cloudflare.is_some() && !svc.cloudflare_auth.is_empty()
         }));
     if stopped_cloudflare {
         crate::features::cloudflare::prepare_cloudflare_config_update()

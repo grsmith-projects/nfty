@@ -61,8 +61,6 @@ gateway 192.168.10.20 {
     balance round-robin
     killswitch on
     check ping 5s
-    privoxy:8118
-    socks5:1080
     forward 51413 to 192.168.20.15:51413
     tunnels {
         wg-exit-01.conf weight 2
@@ -85,7 +83,7 @@ The top-level `allow` block defines a global source IPv4 access-control list (AC
 | **IPv4 CIDR** | `10.10.0.0/16`, `172.16.0.0/12` | Inserted as a CIDR interval into the `nftables` set. |
 | **IPv4 Octet Wildcard** | `192.168.1.*`, `10.0.*.*`, `*` | Automatically expanded to CIDR (`192.168.1.0/24`, `10.0.0.0/16`, `0.0.0.0/0`). |
 | **Exact Hostname** | `admin.office.lan`, `workstation.local` | Resolved via `/data/hosts.json`, `/etc/hosts`, and DNS; refreshed automatically in the background. |
-| **Wildcard Hostname** | `*.office.lan`, `dev-*.corp.lan` | Matched dynamically against known hostnames in `/data/hosts.json` and `/etc/hosts`. Register mappings explicitly with `host` or `POST /api/v1/allow/hosts`; scans do not modify the allow-list host cache. |
+| **Wildcard Hostname** | `*.office.lan`, `dev-*.corp.lan` | Matched dynamically against known hostnames in `/data/hosts.json` and `/etc/hosts`. Register mappings explicitly with `host` or `POST /api/v1/allow/hosts`. |
 
 ### Syntax Example
 
@@ -176,7 +174,7 @@ vip 10.20.0.10/24 {
 
 | Directive | Arguments | Description |
 | :--- | :--- | :--- |
-| `interface` (or `vip` / `dev`) | `<iface>[/<prefix>]` | Binds the VIP to a specific network interface and CIDR prefix length (e.g., `interface eth1/24` or `interface eth0.30/24`). |
+| `interface` (or `vip`) | `<iface>[/<prefix>]` | Binds the VIP to a specific network interface and CIDR prefix length (e.g., `interface eth1/24` or `interface eth0.30/24`). |
 | `dhcp` | `[<iface> \| on \| off]` | Enables or disables `macvlan` + `udhcpc` dynamic IP leasing on `<iface>` (defaults to `eth0`). |
 | `vlan` | `<1-4094>` | Configures an 802.1Q VLAN ID on the parent interface (`<iface>.<vlan>`). |
 | `ssh` / `ssh:<port>` | Optional port (default `22`) | Enables the embedded `nfty` SSH2 management shell on this VIP. Without this directive, port 22 is dropped on the VIP. |
@@ -188,11 +186,11 @@ vip 10.20.0.10/24 {
 
 ### 3.5 `web:<port>` (Web Console) and `api:<port>` (Headless JSON API) Inside a VIP
 
-No Control API or Web Console port is bound by default unless declared via `web:<port>` or `api:<port>` in `Nftyfile` (or `--api-bind`). `nfty` enforces strict separation between `web:<port>` and `api:<port>`:
-- **`web:<port>`** serves the interactive 8-tab HTML/JS Web Console (`GET /`) and requires an IP `allow` list (e.g., `allow { 192.168.0.0/16 }`).
+No Control API or Web Console port is bound by default unless declared via `web:<port>` or `api:<port>` in `Nftyfile`. `nfty` enforces strict separation between `web:<port>` and `api:<port>`:
+- **`web:<port>`** serves the interactive 7-tab HTML/JS Web Console (`GET /`) and requires an IP `allow` list (e.g., `allow { 192.168.0.0/16 }`).
 - **`api:<port>`** serves only the headless JSON Control API (`/api/v1/*`), requires an IP `allow` list, and is further secured with scoped `ro` or `rw` API keys.
 
-Every `web:` and `api:` listener must be covered by at least one IP, CIDR, or IPv4-wildcard allow entry (its own, its gateway's, or the global `allow`). Otherwise `validate`/`apply` fail. Hostname entries (e.g. `*.office.lan`) are rejected on these listeners and ignored when they come from the global allow-list:
+Every `web:` and `api:` listener must be covered by at least one IP, CIDR, or IPv4-wildcard allow entry (its own, its gateway's, or the global `allow`). Otherwise `test`/`apply` fail. Hostname entries (e.g. `*.office.lan`) are rejected on these listeners and ignored when they come from the global allow-list:
 
 ```hcl
 vip 192.168.1.4/21 {
@@ -239,12 +237,11 @@ Services can be defined either nested inside a `vip { ... }` block or at the top
 | `proto` | `proto <tcp\|udp\|both>` | `tcp` | Sets L4 transport protocol (`tcp`, `udp`, or `both` for TCP+UDP). |
 | `balance` | `balance <round-robin\|sticky>` | `round-robin` | Kernel `nftables` load-balancing algorithm. `round-robin` uses `numgen inc mod N`; `sticky` uses `ip saddr mod N` source-IP hashing. |
 | `mode` | `mode <nat\|transparent>` | `nat` | `nat` applies `masquerade` in `postrouting` so return traffic routes back through `nfty`. `transparent` preserves the original client source IP (requires backends to use `nfty` as their default gateway). |
-| `check` | `check <tcp \| http [/path] \| ping \| off> [<secs>s]` | None (or `tcp 5s` on `adopt`) | Configures active health probing. Unhealthy backends are dynamically removed from the kernel verdict map. |
+| `check` | `check <tcp \| http [/path] \| ping \| off> [<secs>s]` | None | Configures active health probing. Unhealthy backends are dynamically removed from the kernel verdict map. |
 | `limit` | `limit <rate>/<sec\|min> [burst <N>] [per-ip\|global]` | None | Limits first-packet matches in the kernel NAT chain; established flows are not packet-rate limited. Defaults to `per-ip` dynamic meter sets (`size 65535; timeout 1m`). |
-| `hostname` | `hostname <fqdn.local>` | None | Announces `<fqdn.local>` via multicast mDNS (`224.0.0.251:5353`), registers it in `dnsmasq` (`auto-vips on`), and enables L7 HTTP `Host` / TLS `SNI` virtual-host routing when multiple services share port `80` or `443`. |
+| `hostname` | `hostname <fqdn.local>` | None | Announces `<fqdn.local>` via multicast mDNS (`224.0.0.251:5353`), registers it in `dnsmasq` (`auto-vips on`), and enables L7 HTTP `Host` / TLS `SNI` virtual-host routing when multiple services share port `80` or `443`. The mDNS responder and per-port L7 listeners bind only while at least one configured hostname needs them. |
 | `cloudflare-dns` | `cloudflare-dns <fqdn>` | None | Publishes the service publicly via a remotely-managed Cloudflare Tunnel and creates a proxied DNS `CNAME` record for `<fqdn>`. |
-| `cloudflare-auth` | `cloudflare-auth <email \| *@domain>...` | None | Configures a Cloudflare Zero-Trust Access self-hosted application and email/domain allow policy (e.g., `ops@example.com *@example.com`). |
-| `auth` | `auth <user:pass \| nfty>...` | None | Enforces HTTP Basic Auth across both Cloudflare Tunnel and local TCP VIP requests (`redirect to :80` / `:18443`). Rejected on UDP or encrypted TLS passthrough port `443`. |
+| `cloudflare-auth` | `cloudflare-auth <email \| *@domain>...` | None | Configures a Cloudflare Zero-Trust Access self-hosted application and email/domain allow policy (e.g., `ops@example.com *@example.com`). The tunnel answers `403` for the hostname until the Access policy is verified. |
 | `key` | `key <new \| token> [ro\|rw]` | None | Attaches a scoped (`ro` or `rw`) API key when the service is `api:<port>`. |
 | `vip` / `interface` | `interface <iface[/prefix]>` | Inherited from `vip` block | Binds a standalone `service <ip:port>` to a specific NIC and subnet prefix. |
 | `vlan` | `vlan <1-4094>` | Inherited from `vip` block | Attaches an 802.1Q VLAN tag to the service's VIP. |
@@ -309,17 +306,15 @@ vip 10.0.10.50/24 {
 ```
 
 - **Weights (`weight 1`–`100`)**: A backend with `weight 3` receives 3 slots in the kernel `nftables` `vmap` for every 1 slot of a `weight 1` backend.
-- **Standby Failover (`backup`)**: Backends marked `backup` (or `standby`) are excluded from the kernel `nftables` verdict map while at least one primary backend is healthy (`UP`). If all primary backends fail health checks or are manually drained, `nfty` automatically activates the `backup` backends.
+- **Standby Failover (`backup`)**: Backends marked `backup` are excluded from the kernel `nftables` verdict map while at least one primary backend is healthy (`UP`). If all primary backends fail health checks or are manually drained, `nfty` automatically activates the `backup` backends.
 
 ---
 
 ## 5. `gateway <ip[/cidr] | name> { ... }` Blocks
 
 A `gateway` block provisions a Virtual Gateway IP (either a static IPv4 like `gateway 192.168.10.20/24` or a named DHCP `macvlan` host like `gateway vpn-exit { dhcp eth0 }`) that LAN hosts, VMs, or containers can use as:
-1. Their **default IPv4 gateway** (`ip route replace default via 192.168.10.20`),
-2. An **HTTP/HTTPS `CONNECT` proxy** (`privoxy:8118`),
-3. A **SOCKS5 proxy** (`socks5:1080`), or
-4. A **DNS resolver** (`dns:53`).
+1. Their **default IPv4 gateway** (`ip route replace default via 192.168.10.20`), or
+2. A **DNS resolver** (`dns:53`).
 
 ### 5.1 Direct Internet NAT Mode vs. WireGuard Tunnel Mode
 
@@ -337,14 +332,12 @@ A `gateway` block provisions a Virtual Gateway IP (either a static IPv4 like `ga
 | `balance` | `balance <round-robin\|sticky>` | `round-robin` | Selects how new flows are distributed across active WireGuard tunnels (`numgen inc mod N` vs `jhash ip saddr . ip daddr mod N`). |
 | `killswitch` | `killswitch <on\|off>` | `on` | Drops new gateway traffic when no tunnel is eligible and drops marked external traffic leaving a non-WireGuard interface. |
 | `check` | `check <ping\|tcp\|http> [<secs>s]` | `ping 5s` | Probes each WireGuard tunnel interface (`ping -I wgN 1.1.1.1`) and removes dead tunnels from the ECMP verdict map. |
-| `privoxy:<port>` | `privoxy:8118` (or `privoxy`) | Disabled | Starts a privacy-sanitizing HTTP + HTTPS `CONNECT` proxy bound to the gateway IP and socket-marked (`SO_MARK` + `SO_BINDTODEVICE`) to egress through the gateway's healthy WireGuard tunnels. |
-| `socks5:<port>` | `socks5:1080` (or `socks5`) | Disabled | Starts an RFC 1928 SOCKS5 proxy bound to the gateway IP and pinned to the gateway's WireGuard tunnels. |
 | `ssh:<port>` | `ssh:22` (or `ssh`) | Disabled | Enables the `nfty` SSH shell on the gateway IP. |
 | `dns:<port>` | `dns:53` (or `dns`) | Disabled | Binds `dnsmasq` to the gateway IP and routes upstream DNS queries through the gateway's healthy WireGuard tunnel (`server=<ip>@wgN`). |
 | `api:<port>` | `api:9090 { key ... }` | Disabled | Enables the HTTP/JSON Control API on the gateway IP with optional scoped `ro`/`rw` keys. |
 | `forward` | `forward <port[/proto]> to <ip_or_host:port>` | None | Forwards inbound traffic arriving on the gateway's `wg*` interfaces on `<port>` (`tcp`, `udp`, or `both`) to a LAN backend, pinning the connection's `ct mark` so reply traffic returns out the exact same WireGuard tunnel. |
-| `wg-in:<port>` | `wg-in:51820 { ... }` (aliases: `wg-server:<port>`, `wireguard:<port>`) | Disabled | Configures a WireGuard Ingress VPN server (`ig0..igN`) on UDP `<port>` (default `51820`) for remote client dial-in or full-tunnel exit chaining. |
-| `allow` | `allow { <entry>... }` | None | Restricts which LAN client IPs/hosts are permitted to route or proxy through this gateway. |
+| `wg-in:<port>` | `wg-in:51820 { ... }` | Disabled | Configures a WireGuard Ingress VPN server (`ig0..igN`) on UDP `<port>` (default `51820`) for remote client dial-in or full-tunnel exit chaining. |
+| `allow` | `allow { <entry>... }` | None | Restricts which LAN client IPs/hosts are permitted to route through this gateway. |
 | `tunnels` | `tunnels { <tunnel>... }` | None | Attaches one or more file-based (`/data/wg/*.conf`) or inline WireGuard tunnels. |
 
 ### 5.3 `tunnels { ... }` Syntax (File-Based & Inline)
@@ -363,8 +356,6 @@ gateway 192.168.10.20/24 {
     balance sticky
     killswitch on
     check ping 5s
-    privoxy:8118
-    socks5:1080
     dns:53
     api:9091 {
         key nfty_ro_99887766554433221100aabbccddeeff ro
@@ -392,11 +383,11 @@ Inside a `gateway` block, `wg-in:<port> { ... }` configures an inbound WireGuard
 
 | Sub-Directive | Syntax | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `subnet` / `address` | `subnet <ip/prefix>` | `10.99.<idx>.1/24` | Sets the WireGuard server interface address and client IP allocation pool (e.g., `10.99.0.1/24`). |
+| `subnet` | `subnet <ip/prefix>` | `10.99.<idx>.1/24` | Sets the WireGuard server interface address and client IP allocation pool (e.g., `10.99.0.1/24`). |
 | `endpoint` | `endpoint <host_or_ip[:port]>` | `<gateway_ip>:<port>` | Sets the public `Endpoint = <host>:<port>` embedded into generated client `.conf` files and QR codes. |
 | `dns` | `dns <ip\|off>` | Server tunnel IP (`10.99.0.1`) | Sets the `DNS = <ip>` server advertised in generated client `.conf` files (`dns off` omits `DNS =`). |
 | `split-tunnel` | `split-tunnel <full \| lan \| cidr...>` | `full` | Controls `AllowedIPs` in generated client configs (`full` -> `0.0.0.0/0`; `lan` -> tunnel subnet + gateway LAN CIDR; custom CIDRs -> tunnel subnet + listed CIDRs). |
-| `peer` | `peer <name> <ip/32> pubkey <b64> [psk <b64>] [keepalive <secs>]` | None | Registers a remote WireGuard client peer in `Nftyfile` (or use `peer add <name> [pubkey <b64>]` in the CLI to auto-allocate the next IP and generate keys/QR codes). |
+| `peer` | `peer <name> <ip/32> pubkey <b64> [psk <b64>]` | None | Registers a remote WireGuard client peer in `Nftyfile` (or use `peer add <name> [pubkey <b64>]` in the CLI to auto-allocate the next IP and generate keys/QR codes). |
 
 ```hcl
 gateway 169.254.10.20/24 {
@@ -491,7 +482,7 @@ dns {
 
 ## 7. Negation Directives (`no ...`) Across All Contexts
 
-In both `Nftyfile` and the interactive CLI, any setting, block, backend, tunnel, key, or DNS record can be removed using `no <directive>` (or `delete` / `remove`):
+In both `Nftyfile` and the interactive CLI, any setting, block, backend, tunnel, key, or DNS record can be removed using `no <directive>`:
 
 | Context | Negation Syntax | Effect |
 | :--- | :--- | :--- |
@@ -504,12 +495,12 @@ In both `Nftyfile` and the interactive CLI, any setting, block, backend, tunnel,
 | **VIP (`config-vip`)** | `no ssh:22` / `no dns:53` / `no api:9090` | Disables local SSH, DNS, or HTTP Control API on the VIP. |
 | **VIP (`config-vip`)** | `no <service_target>` | Removes a forwarded service (e.g., `no plex:32400` or `no 80`) from the VIP. |
 | **Service (`config-service`)** | `no check` / `no limit` / `no hostname` | Removes health checking, rate limiting, or the mDNS/L7 hostname from the service. |
-| **Service (`config-service`)** | `no cloudflare-dns` / `no cloudflare-auth [<rule>]` / `no auth [<rule>]` | Removes Cloudflare Tunnel publishing, Zero-Trust Access rules, or HTTP Basic Auth rules. |
+| **Service (`config-service`)** | `no cloudflare-dns` / `no cloudflare-auth [<rule>]` | Removes Cloudflare Tunnel publishing or Zero-Trust Access rules. |
 | **Service / Gateway API** | `no key [<token_or_scope>]` | Removes a specific API key token, all keys of a scope (`no key ro`), or all API keys (`no key`). |
 | **Service (`config-service`)** | `no allow [<entry>]` | Removes `<entry>` from the service allow-list (or clears all service allow entries). |
 | **Service (`config-service`)** | `no to [<ip_or_host:port>]` | Removes a specific backend (or clears all backends if omitted). |
 | **Gateway (`config-gateway`)** | `no killswitch` / `no check` / `no hostname` / `no vlan` | Disables the kill-switch, tunnel health check, mDNS hostname, or VLAN tag on the gateway. |
-| **Gateway (`config-gateway`)** | `no privoxy` / `no socks5` / `no ssh` / `no dns` / `no api` | Removes the specified local service from the gateway. |
+| **Gateway (`config-gateway`)** | `no ssh` / `no dns` / `no api` | Removes the specified local service from the gateway. |
 | **Gateway (`config-gateway`)** | `no forward [<port>]` | Removes an inbound WireGuard port forward rule (or all forwards). |
 | **Gateway (`config-gateway`)** | `no tunnel [<name>]` | Detaches a specific WireGuard tunnel (or all tunnels) from the gateway. |
 | **DNS (`config-dns`)** | `no upstream [<ip>]` | Removes a specific upstream DNS server (or clears all upstreams so `no upstream` is set). |

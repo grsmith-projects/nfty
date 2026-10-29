@@ -302,7 +302,7 @@ pub fn parse_vip_header(tokens: &[&str]) -> Result<(String, Option<Ipv4Addr>, Vi
                 if idx + 1 < tokens.len()
                     && !matches!(
                         tokens[idx + 1].to_ascii_lowercase().as_str(),
-                        "vlan" | "service" | "services" | "ssh" | "dns" | "api" | "web"
+                        "vlan" | "service" | "ssh" | "dns" | "api" | "web"
                     )
                     && !tokens[idx + 1].starts_with("ssh:")
                     && !tokens[idx + 1].starts_with("dns:")
@@ -324,7 +324,7 @@ pub fn parse_vip_header(tokens: &[&str]) -> Result<(String, Option<Ipv4Addr>, Vi
                 }
                 vip_cfg.vlan = Some(parse_vlan_id(tokens[idx])?);
             }
-            "dev" | "interface" | "vip" => {
+            "interface" | "vip" => {
                 idx += 1;
                 if idx >= tokens.len() {
                     bail!("Expected interface name after '{}'", tokens[idx - 1]);
@@ -915,8 +915,6 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         ParseContext::Root
                     } else if stmt == "service {"
                         || stmt == "service"
-                        || stmt == "services {"
-                        || stmt == "services"
                     {
                         ParseContext::VipServices(vip_key)
                     } else {
@@ -924,7 +922,7 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         let tokens: Vec<&str> = without_brace.split_whitespace().collect();
                         if tokens.is_empty() {
                             ParseContext::Vip(vip_key)
-                        } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "vip" | "interface" | "dev") {
+                        } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "vip" | "interface") {
                             if tokens.len() < 2 {
                                 bail!("Line {}: expected interface[/cidr] after '{}'", line_no, tokens[0]);
                             }
@@ -983,11 +981,8 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                             || tokens[0].to_ascii_lowercase().starts_with("dns:")
                             || tokens[0].to_ascii_lowercase().starts_with("api:")
                             || tokens[0].to_ascii_lowercase().starts_with("web:")
-                            || (tokens[0].eq_ignore_ascii_case("local") && tokens.len() >= 2)
                         {
-                            let spec_owned: String = if tokens[0].eq_ignore_ascii_case("local") {
-                                tokens[1].to_string()
-                            } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api" | "web")
+                            let spec_owned: String = if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api" | "web")
                                 && tokens.len() >= 2
                                 && tokens[1].parse::<u16>().is_ok()
                             {
@@ -1159,8 +1154,6 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         ParseContext::GatewayTunnels(gw)
                     } else if stmt == "service {"
                         || stmt == "service"
-                        || stmt == "services {"
-                        || stmt == "services"
                     {
                         ParseContext::GatewayService(gw)
                     } else if stmt == "allow {" || stmt == "allow" {
@@ -1171,7 +1164,7 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                         let svc_tok = if !tokens.is_empty()
                             && matches!(
                                 tokens[0].to_ascii_lowercase().as_str(),
-                                "service" | "services" | "local"
+                                "service"
                             )
                             && tokens.len() >= 2
                         {
@@ -1725,7 +1718,7 @@ pub fn apply_service_directive(svc: &mut Service, stmt: &str) -> Result<()> {
                 other => bail!("Unknown mode '{}' (expected 'nat' or 'transparent')", other),
             };
         }
-        "vip" | "interface" | "dev" => {
+        "vip" | "interface" => {
             if tokens.len() < 2 {
                 bail!("Expected interface name after 'vip' / 'interface' (e.g. 'interface eth0/21')");
             }
@@ -1767,13 +1760,13 @@ pub fn apply_service_directive(svc: &mut Service, stmt: &str) -> Result<()> {
                 .get_or_insert_with(VipConfig::default_eth0)
                 .vlan = Some(vid);
         }
-        "hostname" | "host" | "domain" | "mdns" => {
+        "hostname" => {
             if tokens.len() < 2 {
                 bail!("Expected hostname (e.g. 'hostname plex.local')");
             }
             svc.hostname = Some(tokens[1].trim().to_ascii_lowercase());
         }
-        "cloudflare-dns" | "cloudflare" | "cf" | "tunnel-dns" => {
+        "cloudflare-dns" => {
             if tokens.len() < 2 {
                 bail!("Expected public FQDN after 'cloudflare-dns' (e.g. 'cloudflare-dns sonarr.example.com')");
             }
@@ -1792,7 +1785,7 @@ pub fn apply_service_directive(svc: &mut Service, stmt: &str) -> Result<()> {
             }
             svc.cloudflare = Some(fqdn);
         }
-        "cloudflare-auth" | "cf-auth" | "tunnel-auth" => {
+        "cloudflare-auth" => {
             if tokens.len() < 2 {
                 bail!(
                     "Expected email rule after '{}' (e.g. 'cloudflare-auth you@example.com' or 'cloudflare-auth *@example.com')",
@@ -1800,31 +1793,15 @@ pub fn apply_service_directive(svc: &mut Service, stmt: &str) -> Result<()> {
                 );
             }
             for tok in &tokens[1..] {
-                let entry = tok.trim().to_string();
-                if !entry.is_empty() && !svc.cloudflare_auth.contains(&entry) {
+                let entry = validate_cloudflare_access_rule(tok)?;
+                if !svc.cloudflare_auth.contains(&entry) {
                     svc.cloudflare_auth.push(entry);
                 }
             }
         }
-        "auth" | "basic-auth" => {
-            if tokens.len() < 2 {
-                bail!(
-                    "Expected username:password or 'nfty' after '{}' (e.g. 'auth gsmith:secret' or 'auth nfty')",
-                    tokens[0]
-                );
-            }
-            let start_idx = if tokens[1].eq_ignore_ascii_case("basic") && tokens.len() >= 3 {
-                2
-            } else {
-                1
-            };
-            for tok in &tokens[start_idx..] {
-                let entry = tok.trim().to_string();
-                if !entry.is_empty() && !svc.auth.contains(&entry) {
-                    svc.auth.push(entry);
-                }
-            }
-        }
+        "auth" => bail!(
+            "Service 'auth' (local HTTP Basic Auth) was removed in nfty 0.9.0; use 'allow' IP lists, or 'cloudflare-auth <email>' for Cloudflare Tunnel services"
+        ),
         "check" => {
             svc.check = Some(parse_health_check(&tokens[1..])?);
         }
@@ -1842,7 +1819,7 @@ pub fn apply_service_directive(svc: &mut Service, stmt: &str) -> Result<()> {
                 }
             }
         }
-        "key" | "api-key" | "apikey" => {
+        "key" => {
             let (api_key, _generated) = parse_api_key_directive(&tokens[1..])?;
             if let Some(existing) = svc.api_keys.iter_mut().find(|k| k.key == api_key.key) {
                 existing.scope = api_key.scope;
@@ -1850,20 +1827,40 @@ pub fn apply_service_directive(svc: &mut Service, stmt: &str) -> Result<()> {
                 svc.api_keys.push(api_key);
             }
         }
-        "no" | "delete" | "remove" => {
+        "no" => {
             apply_service_no_directive(svc, &tokens[1..])?;
         }
         other => bail!(
-            "Unknown service directive '{}'. Valid directives: port, proto, to, hostname, cloudflare-dns, cloudflare-auth, auth, key, balance, mode, vip, check, limit, allow, no",
+            "Unknown service directive '{}'. Valid directives: port, proto, to, hostname, cloudflare-dns, cloudflare-auth, key, balance, mode, vip, check, limit, allow, no",
             other
         ),
     }
     Ok(())
 }
 
+/// Cloudflare Access rules are email identities (`user@example.com`) or email domains (`*@example.com`).
+fn validate_cloudflare_access_rule(token: &str) -> Result<String> {
+    let entry = token.trim();
+    let valid = entry.split_once('@').is_some_and(|(local, domain)| {
+        !entry.contains(':')
+            && !local.contains('@')
+            && !domain.contains('@')
+            && domain.contains('.')
+            && !domain.starts_with('.')
+            && !domain.ends_with('.')
+    });
+    if !valid {
+        bail!(
+            "Invalid cloudflare-auth rule '{}': expected an email (user@example.com) or domain (*@example.com); local 'nfty' and user:pass rules were removed in nfty 0.9.0",
+            entry
+        );
+    }
+    Ok(entry.to_string())
+}
+
 pub fn apply_service_no_directive(svc: &mut Service, tokens: &[&str]) -> Result<()> {
     if tokens.is_empty() {
-        bail!("Expected item to remove after 'no' (e.g. 'no vip', 'no key <key>', 'no cloudflare-dns', 'no cloudflare-auth', 'no auth', 'no check', 'no limit', 'no allow <host>', 'no to <ip>')");
+        bail!("Expected item to remove after 'no' (e.g. 'no vip', 'no key <key>', 'no cloudflare-dns', 'no cloudflare-auth', 'no check', 'no limit', 'no allow <host>', 'no to <ip>')");
     }
     match tokens[0].to_ascii_lowercase().as_str() {
         "vip" => svc.vip = None,
@@ -1872,9 +1869,9 @@ pub fn apply_service_no_directive(svc: &mut Service, tokens: &[&str]) -> Result<
                 v.vlan = None;
             }
         }
-        "hostname" | "host" | "domain" | "mdns" => svc.hostname = None,
-        "cloudflare-dns" | "cloudflare" | "cf" | "tunnel-dns" => svc.cloudflare = None,
-        "cloudflare-auth" | "cf-auth" | "tunnel-auth" => {
+        "hostname" => svc.hostname = None,
+        "cloudflare-dns" => svc.cloudflare = None,
+        "cloudflare-auth" => {
             if tokens.len() == 1 {
                 svc.cloudflare_auth.clear();
             } else {
@@ -1882,15 +1879,7 @@ pub fn apply_service_no_directive(svc: &mut Service, tokens: &[&str]) -> Result<
                 svc.cloudflare_auth.retain(|x| !x.eq_ignore_ascii_case(target));
             }
         }
-        "auth" | "basic-auth" => {
-            if tokens.len() == 1 {
-                svc.auth.clear();
-            } else {
-                let target = tokens[1].trim();
-                svc.auth.retain(|x| !x.eq_ignore_ascii_case(target));
-            }
-        }
-        "key" | "api-key" | "apikey" => {
+        "key" => {
             if tokens.len() == 1 {
                 svc.api_keys.clear();
             } else {
@@ -2037,7 +2026,7 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
         return Ok(());
     }
     match tokens[0].to_ascii_lowercase().as_str() {
-        "vip" | "interface" | "dev" => {
+        "vip" | "interface" => {
             if tokens.len() < 2 {
                 bail!("Expected interface name after 'vip' / 'interface' (e.g. 'interface eth0/21')");
             }
@@ -2079,7 +2068,7 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                 .get_or_insert_with(VipConfig::default_eth0)
                 .vlan = Some(vid);
         }
-        "hostname" | "host" | "domain" | "mdns" => {
+        "hostname" => {
             if tokens.len() < 2 {
                 bail!("Expected hostname (e.g. 'hostname vpn.local')");
             }
@@ -2127,16 +2116,16 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                 gw.tunnels.push(t);
             }
         }
-        "service" | "services" | "local" => {
+        "service" => {
             if tokens.len() < 2 {
-                bail!("Expected gateway service (e.g. 'privoxy:8118', 'socks5:1080', 'ssh:22', 'dns:53', or 'api:9090')");
+                bail!("Expected gateway service (e.g. 'ssh:22', 'dns:53', 'api:9090', or 'web:8000')");
             }
             for tok in &tokens[1..] {
                 let gs = parse_gateway_service(tok)?;
                 upsert_gateway_service(gw, gs);
             }
         }
-        "key" | "api-key" | "apikey" => {
+        "key" => {
             let (api_key, _generated) = parse_api_key_directive(&tokens[1..])?;
             let gs = if let Some(existing) = gw
                 .services
@@ -2167,7 +2156,7 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                 gw.forwards.push(fwd);
             }
         }
-        "no" | "delete" | "remove" => {
+        "no" => {
             apply_gateway_no_directive(gw, &tokens[1..])?;
         }
         other => {
@@ -2197,7 +2186,7 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                     let _ = apply_wg_ingress_directive(wg_in, &gw_key, &rest_stmt)?;
                 }
             } else if let Ok(mut gs) = parse_gateway_service(other) {
-                if tokens.len() >= 2 && matches!(tokens[1].to_ascii_lowercase().as_str(), "key" | "api-key" | "apikey") {
+                if tokens.len() >= 2 && matches!(tokens[1].to_ascii_lowercase().as_str(), "key") {
                     let (api_key, _gen) = parse_api_key_directive(&tokens[2..])?;
                     gs.api_keys.push(api_key);
                 }
@@ -2207,7 +2196,7 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                 && parse_gateway_service(&format!("{}:{}", other, tokens[1])).is_ok()
             {
                 let mut gs = parse_gateway_service(&format!("{}:{}", other, tokens[1]))?;
-                if tokens.len() >= 3 && matches!(tokens[2].to_ascii_lowercase().as_str(), "key" | "api-key" | "apikey") {
+                if tokens.len() >= 3 && matches!(tokens[2].to_ascii_lowercase().as_str(), "key") {
                     let (api_key, _gen) = parse_api_key_directive(&tokens[3..])?;
                     gs.api_keys.push(api_key);
                 }
@@ -2224,7 +2213,7 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                 }
             } else {
                 bail!(
-                    "Unknown gateway directive '{}'. Valid directives: vip, hostname, balance, killswitch, check, forward, wg-in:51820, privoxy:8118, socks5:1080, ssh:22, dns:53, api:9090, key, tunnel, allow, no",
+                    "Unknown gateway directive '{}'. Valid directives: vip, hostname, balance, killswitch, check, forward, wg-in:51820, ssh:22, dns:53, api:9090, web:8000, key, tunnel, allow, no",
                     other
                 );
             }
@@ -2270,7 +2259,7 @@ pub fn apply_gateway_service_directive(
             gs.port = p;
             Ok(None)
         }
-        "key" | "api-key" | "apikey" => {
+        "key" => {
             let (api_key, generated) = parse_api_key_directive(&tokens[1..])?;
             if let Some(existing) = gs.api_keys.iter_mut().find(|k| k.key == api_key.key) {
                 existing.scope = api_key.scope;
@@ -2279,12 +2268,12 @@ pub fn apply_gateway_service_directive(
             }
             Ok(Some((api_key, generated)))
         }
-        "no" | "delete" | "remove" => {
+        "no" => {
             if tokens.len() < 2 {
                 bail!("Expected 'key [<token>]' after 'no'");
             }
             match tokens[1].to_ascii_lowercase().as_str() {
-                "key" | "api-key" | "apikey" => {
+                "key" => {
                     if tokens.len() == 2 {
                         gs.api_keys.clear();
                     } else {
@@ -2365,19 +2354,15 @@ pub fn parse_gateway_service(raw: &str) -> Result<GatewayService> {
     };
 
     match name_part {
-        "privoxy" | "http-proxy" | "proxy" => Ok(GatewayService::new(
-            GatewayServiceKind::Privoxy,
-            port_opt.unwrap_or(8118),
-        )),
-        "socks5" | "socks" => Ok(GatewayService::new(
-            GatewayServiceKind::Socks5,
-            port_opt.unwrap_or(1080),
-        )),
+        "privoxy" | "http-proxy" | "proxy" | "socks5" | "socks" => bail!(
+            "Gateway service '{}' was removed in nfty 0.9.0; run a dedicated proxy behind the gateway instead",
+            name_part
+        ),
         "ssh" => Ok(GatewayService::new(
             GatewayServiceKind::Ssh,
             port_opt.unwrap_or(22),
         )),
-        "dns" | "dnsmasq" => Ok(GatewayService::new(
+        "dns" => Ok(GatewayService::new(
             GatewayServiceKind::Dns,
             port_opt.unwrap_or(53),
         )),
@@ -2385,12 +2370,12 @@ pub fn parse_gateway_service(raw: &str) -> Result<GatewayService> {
             GatewayServiceKind::Api,
             port_opt.unwrap_or(9090),
         )),
-        "web" | "webui" | "ui" => Ok(GatewayService::new(
+        "web" => Ok(GatewayService::new(
             GatewayServiceKind::Web,
             port_opt.unwrap_or(8000),
         )),
         other => bail!(
-            "Unknown gateway service '{}' (valid gateway services: 'privoxy[:8118]', 'socks5[:1080]', 'ssh[:22]', 'dns[:53]', 'api[:9090]', 'web[:8000]')",
+            "Unknown gateway service '{}' (valid gateway services: 'ssh[:22]', 'dns[:53]', 'api[:9090]', 'web[:8000]')",
             other
         ),
     }
@@ -2398,7 +2383,7 @@ pub fn parse_gateway_service(raw: &str) -> Result<GatewayService> {
 
 pub fn apply_gateway_no_directive(gw: &mut Gateway, tokens: &[&str]) -> Result<()> {
     if tokens.is_empty() {
-        bail!("Expected item after 'no' (e.g. 'no vip', 'no killswitch', 'no service privoxy', 'no api', 'no key <key>', 'no tunnel <name>')");
+        bail!("Expected item after 'no' (e.g. 'no vip', 'no killswitch', 'no service ssh', 'no api', 'no key <key>', 'no tunnel <name>')");
     }
     match tokens[0].to_ascii_lowercase().as_str() {
         "vip" => gw.vip = None,
@@ -2407,10 +2392,10 @@ pub fn apply_gateway_no_directive(gw: &mut Gateway, tokens: &[&str]) -> Result<(
                 v.vlan = None;
             }
         }
-        "hostname" | "host" | "domain" | "mdns" => gw.hostname = None,
+        "hostname" => gw.hostname = None,
         "killswitch" | "kill-switch" => gw.killswitch = false,
         "check" => gw.check = None,
-        "key" | "api-key" | "apikey" => {
+        "key" => {
             for gs in gw.services.iter_mut() {
                 if tokens.len() == 1 {
                     gs.api_keys.clear();
@@ -2421,7 +2406,7 @@ pub fn apply_gateway_no_directive(gw: &mut Gateway, tokens: &[&str]) -> Result<(
                 }
             }
         }
-        "service" | "services" => {
+        "service" => {
             if tokens.len() == 1 {
                 gw.services.clear();
             } else if let Ok(gs) = parse_gateway_service(tokens[1]) {
@@ -2460,7 +2445,7 @@ pub fn apply_gateway_no_directive(gw: &mut Gateway, tokens: &[&str]) -> Result<(
                 gw.tunnels.retain(|t| t.name != name && t.iface != name);
             }
         }
-        "wg-in" | "wg-server" | "wireguard" => {
+        "wg-in" => {
             gw.wg_ingress = None;
         }
         other => {
@@ -2485,7 +2470,7 @@ pub enum WgPeerAction {
     Removed(String),
 }
 
-/// Parses `wg-in[:<port>]`, `wg-server[:<port>]`, or `wireguard[:<port>]` (default port 51820).
+/// Parses `wg-in[:<port>]` (default port 51820).
 /// Returns `None` if `raw` does not refer to a WireGuard ingress endpoint.
 pub fn parse_wg_ingress_spec(raw: &str) -> Option<Result<u16>> {
     let trimmed = raw.trim().to_ascii_lowercase();
@@ -2494,7 +2479,7 @@ pub fn parse_wg_ingress_spec(raw: &str) -> Option<Result<u16>> {
     } else {
         (trimmed.as_str(), None)
     };
-    if !matches!(name_part, "wg-in" | "wg-server" | "wireguard" | "wgin") {
+    if !matches!(name_part, "wg-in") {
         return None;
     }
     if let Some(p_str) = port_opt {
@@ -2606,10 +2591,10 @@ pub fn apply_wg_ingress_directive(
             }
             Ok(None)
         }
-        "peer" | "peers" | "client" => {
+        "peer" => {
             parse_wg_peer_subcommand(wg_in, gw_key, &tokens[1..])
         }
-        "no" | "delete" | "remove" => {
+        "no" => {
             if tokens.len() < 2 {
                 bail!("Expected 'endpoint', 'dns', 'split-tunnel', or 'peer <name>' after 'no'");
             }
@@ -2626,7 +2611,7 @@ pub fn apply_wg_ingress_directive(
                     wg_in.split_tunnel = WgSplitTunnelMode::Full;
                     Ok(None)
                 }
-                "peer" | "peers" | "client" => {
+                "peer" => {
                     if tokens.len() == 2 {
                         wg_in.peers.clear();
                         Ok(None)
@@ -2671,19 +2656,19 @@ fn parse_wg_peer_subcommand(
     }
     let first_lower = tokens[0].to_ascii_lowercase();
     match first_lower.as_str() {
-        "show" | "conf" | "config" | "cat" => {
+        "show" => {
             if tokens.len() < 2 {
                 bail!("Usage: peer show <name>");
             }
             return Ok(Some(WgPeerAction::Show(tokens[1].to_string())));
         }
-        "qr" | "qrcode" => {
+        "qr" => {
             if tokens.len() < 2 {
                 bail!("Usage: peer qr <name>");
             }
             return Ok(Some(WgPeerAction::Qr(tokens[1].to_string())));
         }
-        "rm" | "del" | "delete" | "remove" => {
+        "rm" => {
             if tokens.len() < 2 {
                 bail!("Usage: peer rm <name>");
             }
@@ -2884,7 +2869,7 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
                 }
             }
         }
-        "domain" | "local-domain" | "suffix" => {
+        "domain" => {
             if tokens.len() < 2 {
                 bail!("Expected domain suffix after 'domain' (e.g. 'domain lan')");
             }
@@ -3267,7 +3252,7 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
                 dns.blocklists.push(DnsBlocklist { name, url });
             }
         }
-        "raw" | "dnsmasq" => {
+        "raw" => {
             if tokens.len() < 2 {
                 bail!("Expected raw dnsmasq option after 'raw' (e.g. 'raw localise-queries')");
             }
@@ -3316,7 +3301,7 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
                 dns.raw_options.push(opt);
             }
         }
-        "no" | "delete" | "remove" => {
+        "no" => {
             apply_dns_no_directive(dns, &tokens[1..])?;
         }
         other => bail!(
@@ -3424,7 +3409,7 @@ pub fn apply_dns_no_directive(dns: &mut DnsConfig, tokens: &[&str]) -> Result<()
                     .retain(|b| !b.name.eq_ignore_ascii_case(tokens[1]));
             }
         }
-        "raw" | "dnsmasq" => {
+        "raw" => {
             if tokens.len() == 1 {
                 dns.raw_options.clear();
             } else {

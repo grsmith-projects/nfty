@@ -1,6 +1,6 @@
-# Interactive CLI & Live TUI Guide
+# Interactive CLI Guide
 
-`nfty` includes a hierarchical command-line interface (CLI) and a real-time terminal user interface (TUI). Access it locally, through the embedded SSH server on an appliance, or through one-shot commands. There is no UNIX control socket.
+`nfty` includes a hierarchical command-line interface (CLI). Access it locally, through the embedded SSH server on an appliance, or through one-shot commands. Secondary sessions talk to the long-running controller over a root-only Unix socket (`/run/nfty/ctl.sock`).
 
 ---
 
@@ -12,13 +12,12 @@
 4. [Configuration Context Drill-Down](#4-configuration-context-drill-down)
 5. [Candidate vs. Running Configuration Workflow](#5-candidate-vs-running-configuration-workflow)
 6. [Operational Mode Commands](#6-operational-mode-commands)
-7. [Live Interactive TUI (`watch`)](#7-live-interactive-tui-watch)
 
 ---
 
 ## 1. Zero-Flag CLI & One-Shot Execution
 
-When running `nfty` directly on a Linux host or inside an appliance container, each CLI invocation maintains its own local state. Secondary sessions notify the controller over its configured HTTP API address after persisting changes; if notification fails, they report an error even though the local apply and save may already have completed:
+When running `nfty` directly on a Linux host or inside an appliance container, each CLI invocation maintains its own local state. Secondary sessions notify the controller over its Unix socket (falling back to `SIGHUP`) after persisting changes; if notification fails, they report an error even though the local apply and save may already have completed:
 
 | Command | Description |
 | :--- | :--- |
@@ -26,7 +25,6 @@ When running `nfty` directly on a Linux host or inside an appliance container, e
 | `nfty status` | Prints the current VIP, service, backend health, WireGuard gateway, and DNS status table and exits. |
 | `nfty diff` | Compares the candidate configuration with the active running configuration and prints a colorized unified diff. |
 | `nfty apply` | Applies the configured file and attempts to notify the controller. |
-| `nfty watch` | Launches the TUI (`250ms` display refresh); a secondary invocation maintains its own health snapshot. |
 | `nfty daemon` | Runs the background supervisor, health prober, and REST API server in the foreground (used by `systemd`). Appliance mode also starts the embedded SSH server. |
 | `nfty -c "<cli command>"` | Executes a one-shot CLI command sequence, including `;` command chaining. |
 
@@ -58,11 +56,11 @@ The interactive shell separates **Operational Mode** (`nfty>`), **Debug & Troubl
 ```mermaid
 stateDiagram-v2
     [*] --> Operational: Login / nfty
-    Operational --> DebugMode: debug / troubleshoot / diag
+    Operational --> DebugMode: debug
     DebugMode --> Operational: exit / .. / top / Ctrl-C
-    DebugMode --> ConfigRoot: configure / conf / edit
-    Operational --> ConfigRoot: configure / conf / edit
-    ConfigRoot --> Operational: exit / end / Ctrl-C
+    DebugMode --> ConfigRoot: configure
+    Operational --> ConfigRoot: configure
+    ConfigRoot --> Operational: exit / Ctrl-C
     
     state "Operational Mode (nfty>)" as Operational
     state "Debug Mode (nfty(debug)#)" as DebugMode
@@ -94,7 +92,7 @@ The shell prompt dynamically reflects your exact location in the configuration h
 
 | Prompt | Context Level | Description |
 | :--- | :--- | :--- |
-| `nfty>` | Operational Mode | Default starting mode for status, flows, scanning, `ping`, `traceroute`, and runtime operations. |
+| `nfty>` | Operational Mode | Default starting mode for status, flows, `ping`, `traceroute`, and runtime operations. |
 | `nfty(debug)#` | Debug & Troubleshooting | Dedicated troubleshooting mode (`ping`, `traceroute`, `tcp`, `dns`, `arping`, `interfaces`, `routes`, `arp`, `sockets`, `wg`, `nft`, `flows`, `dmesg`). |
 | `nfty(config)#` | Root Configuration | Top-level candidate configuration context. |
 | `nfty(config-allow)#` | Global Allowlist | Editing global `allow` subnets, hosts, and VLANs. |
@@ -120,10 +118,10 @@ The shell prompt dynamically reflects your exact location in the configuration h
 
 | Command / Shortcut | Action |
 | :--- | :--- |
-| `configure` / `conf` / `edit` | Enter `nfty(config)#` from `nfty>`. |
+| `configure` | Enter `nfty(config)#` from `nfty>`. |
 | `..` or `up` | Move up one level in the configuration hierarchy (e.g., from `service` back to `vip`). |
 | `top` | Jump directly from any nested sub-context back to `nfty(config)#`. |
-| `exit` or `end` | From a nested sub-context, step up one level; from `nfty(config)#`, return to `nfty>`; from `nfty>`, close the session. |
+| `exit` | From a nested sub-context, step up one level; from `nfty(config)#`, return to `nfty>`; from `nfty>`, close the session. |
 | `Ctrl-C` | Abort the current input line and immediately return to `nfty>` (or exit if already at `nfty>`). |
 | `;` (Semicolon) | Chain multiple commands on a single line (e.g., `vip 192.168.1.4; service web:80; to 192.168.1.20:8080; top`). |
 | `?` or `help` | Display context-sensitive help for the current hierarchy level. |
@@ -174,12 +172,12 @@ Generated new ro API key on vip 192.168.1.4 api:9090:
   nfty_ro_19c4e8b2a0f6d3157e8a9b0c1d2e3f4a
 nfty(config-vip:192.168.1.4-api:9090)# ..
 nfty(config-vip:192.168.1.4)# service https:443
-nfty(config-vip:192.168.1.4-service:https:443)# balance sticky 30m
-Set balance to sticky 30m.
-nfty(config-vip:192.168.1.4-service:https:443)# mode dnat
-Set forwarding mode to dnat.
-nfty(config-vip:192.168.1.4-service:https:443)# check https 5s /healthz host app.internal
-Set health check to https every 5s.
+nfty(config-vip:192.168.1.4-service:https:443)# balance sticky
+Set balance to sticky.
+nfty(config-vip:192.168.1.4-service:https:443)# mode nat
+Set forwarding mode to nat.
+nfty(config-vip:192.168.1.4-service:https:443)# check http /healthz 5s
+Set health check to http /healthz every 5s.
 nfty(config-vip:192.168.1.4-service:https:443)# to
 nfty(config-vip:192.168.1.4-service:https:443-to)# 192.168.1.21:443 weight 3
 Added backend 192.168.1.21:443.
@@ -197,15 +195,13 @@ nfty(config)#
 nfty(config)# gateway 192.168.1.10/24@eth0
 nfty(config-gateway:192.168.1.10)# balance round-robin
 nfty(config-gateway:192.168.1.10)# killswitch on
-nfty(config-gateway:192.168.1.10)# privoxy:8118
-nfty(config-gateway:192.168.1.10)# socks5:1080
 nfty(config-gateway:192.168.1.10)# forward 51413 to 192.168.20.15:51413
 nfty(config-gateway:192.168.1.10)# tunnels
 nfty(config-gateway:192.168.1.10-tunnels)# wg-mullvad-us1.conf weight 2
 nfty(config-gateway:192.168.1.10-tunnels)# wg-mullvad-us2.conf weight 1
 nfty(config-gateway:192.168.1.10-tunnels)# top
 nfty(config)# dns
-nfty(config-dns)# listen 192.168.1.4:53
+nfty(config-dns)# listen 192.168.1.4
 nfty(config-dns)# domain lan.internal
 nfty(config-dns)# upstream 1.1.1.1 9.9.9.9
 nfty(config-dns)# route ipinfo.io via 192.168.1.10
@@ -232,13 +228,13 @@ Reverted health check to default (tcp 3s).
 
 `nfty` uses a two-stage configuration model:
 1. **Running Configuration**: The active configuration currently compiled into the Linux kernel's `table ip nfty` / `table netdev nfty_ingress` ruleset and actively monitored by health probers.
-2. **Candidate Configuration**: Your staging buffer in `nfty(config)#`. Modifications made in `configure` mode only affect the candidate configuration until you explicitly `apply` (or `commit`) them.
+2. **Candidate Configuration**: Your staging buffer in `nfty(config)#`. Modifications made in `configure` mode only affect the candidate configuration until you explicitly `apply` them.
 
 ```mermaid
 flowchart LR
-    Edit["Edit Candidate<br/>(nfty(config)#)"] --> Diff["diff / compare<br/>(Inspect changes)"]
-    Diff --> Test["test / validate<br/>(nft -c -f dry-run)"]
-    Test --> Apply["apply / commit<br/>(Multi-subsystem apply)"]
+    Edit["Edit Candidate<br/>(nfty(config)#)"] --> Diff["diff<br/>(Inspect changes)"]
+    Diff --> Test["test<br/>(nft -c -f dry-run)"]
+    Test --> Apply["apply<br/>(Multi-subsystem apply)"]
     Test --> ApplyConfirm["apply confirm 60<br/>(Process-local timer)"]
     ApplyConfirm -->|"confirm within 60s"| Saved["Save configured Nftyfile"]
     ApplyConfirm -->|"timeout"| AutoRollback["Attempt rollback"]
@@ -247,21 +243,21 @@ flowchart LR
 
 ### Configuration Lifecycle Commands
 
-| Command | Aliases | Description |
-| :--- | :--- | :--- |
-| `show` | `show [section]` | Displays the configuration for the current context (or specific section: `all`, `running`, `candidate`, `nft`, `allow`, `vips`, `dns`). |
-| `diff` | `compare` | Shows a colorized line-by-line diff (`-` removed in red, `+` added in green) between the running config and candidate config. |
-| `test` | `validate` | Compiles the candidate config into `nftables` batch commands and runs `nft -c -f -` (kernel dry-run validation) without applying changes. |
-| `apply` | `commit` | Applies the candidate config, snapshots the previous running config, and saves the configured file. External operations are not one atomic transaction. |
-| `apply confirm [sec]` | `commit confirmed [sec]` | On a long-running controller, tentatively applies the candidate and starts a process-local rollback timer (default `60` seconds). |
-| `confirm` | — | Cancels an active `apply confirm` rollback countdown and persists the configured file. |
-| `discard` | `load` | Discards all uncommitted edits in the candidate configuration and reloads it from the active running configuration. |
-| `rollback [N]` | — | Reverts the running configuration to snapshot `N` (default `1`, up to the last 10 applied configurations in the rollback ring). |
-| `save [path]` | `write` | Writes the configuration to `/data/Nftyfile` (or a custom file path). |
+| Command | Description |
+| :--- | :--- |
+| `show [section]` | Displays the configuration for the current context (or specific section: `all`, `running`, `candidate`, `nft`, `allow`, `vips`, `dns`). |
+| `diff` | Shows a colorized line-by-line diff (`-` removed in red, `+` added in green) between the running config and candidate config. |
+| `test` | Compiles the candidate config into `nftables` batch commands and runs `nft -c -f -` (kernel dry-run validation) without applying changes. |
+| `apply` | Applies the candidate config, snapshots the previous running config, and saves the configured file. External operations are not one atomic transaction. |
+| `apply confirm [sec]` | On a long-running controller, tentatively applies the candidate and starts a process-local rollback timer (default `60` seconds). |
+| `confirm` | Cancels an active `apply confirm` rollback countdown and persists the configured file. |
+| `load` | Discards all uncommitted edits in the candidate configuration and reloads it from the active running configuration. |
+| `rollback [N]` | Reverts the running configuration to snapshot `N` (default `1`, up to the last 10 applied configurations in the rollback ring). |
+| `save [path]` | Writes the configuration to `/data/Nftyfile` (or a custom file path). |
 
 > [!WARNING]
 > Confirmed apply is unavailable in secondary SSH and one-shot sessions. Its timer is process-local, not durable: a controller crash can leave trial kernel state active until restart. Do not rely on it as the sole recovery mechanism for remote changes.
-> Secondary shells and `watch` do not start their own API or health supervisors; their local state is not a live copy of the controller's health or drain state. Secondary drain/enable commands are sent to the configured controller API and fail if it cannot be reached. A command matching multiple endpoints can partially succeed.
+> Secondary shells do not start their own API or health supervisors; their local state is not a live copy of the controller's health or drain state. Secondary drain/enable commands are sent to the controller socket and fail if it cannot be reached. A command matching multiple endpoints can partially succeed.
 
 ---
 
@@ -276,53 +272,34 @@ The following commands are available at `nfty>` (and from `nfty(config)#` when n
 | `status` | Displays a comprehensive dashboard of all VIPs, services, backend health states (`UP`, `DOWN`, `DRAINING`, `STANDBY`), RTT latencies, active failover state, WireGuard tunnels, and DNS status. |
 | `probe` | Triggers an immediate out-of-band health probe across all services and backends and prints the refreshed status table. |
 | `drain <ip:port>` | Marks a backend as `DRAINING` across all services referencing `<ip:port>` and immediately rebuilds the kernel `nftables` numgen verdict map to stop new connections while existing `conntrack` sessions finish gracefully. |
-| `undrain <ip:port>` / `enable <ip:port>` | Clears the `DRAINING` state on `<ip:port>`, returning it to active rotation (if healthy) and immediately updating the kernel verdict map. |
+| `enable <ip:port>` | Clears the `DRAINING` state on `<ip:port>`, returning it to active rotation (if healthy) and immediately updating the kernel verdict map. |
 
-### Flow Inspection & LAN Discovery
+### Flow Inspection & Host Mappings
 
 | Command | Description |
 | :--- | :--- |
-| `flows [filter]` / `conntrack [filter]` | Reads `/proc/net/nf_conntrack` and displays active NAT sessions (`proto`, `state`, `src -> dst`, `backend`, `packets`, `bytes`), optionally filtered by substring (IP, port, or protocol). |
-| `scan [subnet\|host]` | Scans known local targets, or a specified host or `/24`–`/32` CIDR, for TCP services, with neighbor and reverse-DNS discovery. Wider or invalid CIDRs are rejected. Scanning does not register allow-list host mappings. |
-| `adopt <idx\|name\|host:port> [vip <ip>] [port <p>] [vlan <id>]` | Creates a `service` in the candidate configuration from a discovered or specified target. |
+| `flows [filter]` | Reads `/proc/net/nf_conntrack` and displays active NAT sessions (`proto`, `state`, `src -> dst`, `backend`, `packets`, `bytes`), optionally filtered by substring (IP, port, or protocol). |
 | `host <hostname> <ip...>` | Adds or updates a mapping in `/data/hosts.json`, refreshes the active dataplane, and notifies the controller from a secondary session. |
-
-#### Example: Scanning and Adopting a Discovered LAN Host
-
-```text
-nfty> scan 192.168.1.0/24
-Scanning 254 hosts across 12 ports...
-  #  IP Address      MAC Address        Hostname       Open Ports
-  1  192.168.1.21    00:16:3e:a1:b2:c3  k8s-worker-01  22/ssh, 80/http, 443/https, 6443/k8s-api
-  2  192.168.1.22    00:16:3e:a1:b2:c4  k8s-worker-02  22/ssh, 80/http, 443/https, 6443/k8s-api
-
-nfty> adopt 1 vip 192.168.1.4
-Adopted 192.168.1.21 into candidate config under vip 192.168.1.4.
-Run 'configure; diff; apply' to activate.
-```
 
 ### WireGuard Profile Management (`wg`)
 
 | Command | Description |
 | :--- | :--- |
 | `wg` | Lists all WireGuard `.conf` profiles stored in `/data/wg/`, active `wg0..wgN` interfaces, endpoints, latest handshakes, and transfer counters. |
-| `wg add <name>` / `wg paste <name>` | Opens `nano` (with `wg add`) or enters interactive paste mode (with `wg paste`) to upload a WireGuard `.conf` profile into `/data/wg/<name>.conf` (finish with `EOF` or `.`). Newly written profiles use owner-only permissions. |
-| `wg vi <name>` / `wg edit <name>` | Opens the built-in terminal editor for `/data/wg/<name>.conf`. |
+| `wg add <name>` | Enters interactive paste mode to upload a WireGuard `.conf` profile into `/data/wg/<name>.conf` (finish with `EOF` or `.`). Newly written profiles use owner-only permissions. Use `POST /api/v1/wg` for non-interactive uploads. |
 | `wg show <name>` | Displays the contents of `/data/wg/<name>.conf` (with private keys visible to authenticated CLI administrators). |
 | `wg rm <name>` | Deletes `/data/wg/<name>.conf` from disk. |
 | `peer list` | Lists all configured WireGuard ingress (`wg-in`) client peers across all gateways. |
 | `peer show <name>` | Renders the copy/paste client `.conf` AND terminal UTF-8 QR code for `<name>`. |
 | `peer qr <name>` | Renders the scannable terminal UTF-8 QR code for `<name>`. |
 
-### Global SSH Authorized Key Management (`ssh` / `ssh key`)
+### Global SSH Authorized Key Management (`ssh`)
 
 | Command | Description |
 | :--- | :--- |
-| `ssh` / `ssh list` / `show ssh` | Lists all authorized OpenSSH public keys stored in `/data/ssh/*.pub` with their algorithm (`ssh-ed25519`, `ecdsa-sha2-*`, `ssh-rsa`), `SHA256:...` fingerprint, and comment. |
+| `ssh` / `ssh list` | Lists all authorized OpenSSH public keys stored in `/data/ssh/*.pub` with their algorithm (`ssh-ed25519`, `ecdsa-sha2-*`, `ssh-rsa`), `SHA256:...` fingerprint, and comment. |
 | `ssh add <name> <pubkey>` | Validates and saves an inline OpenSSH public key directly to `/data/ssh/<name>.pub` (e.g. `ssh add workstation ssh-ed25519 AAAA... user@host`). |
-| `ssh add <name>` / `ssh edit <name>` | Opens `nano` on `/data/ssh/<name>.pub` to paste/edit an OpenSSH public key and validates it on save. |
-| `ssh paste <name>` | Enters interactive paste mode in the CLI and saves `/data/ssh/<name>.pub` immediately once a valid OpenSSH public key line is pasted. |
-| `ssh vi <name>` | Opens `vi` on `/data/ssh/<name>.pub`. |
+| `ssh add <name>` | Enters interactive paste mode and saves `/data/ssh/<name>.pub` once a valid OpenSSH public key line is pasted. |
 | `ssh show <name>` | Displays the algorithm, `SHA256:...` fingerprint, and raw OpenSSH public key line in `/data/ssh/<name>.pub`. |
 | `ssh rm <name>` | Deletes `/data/ssh/<name>.pub` from `/data/ssh/`. |
 
@@ -335,7 +312,7 @@ Run 'configure; diff; apply' to activate.
 | `dns config` | Displays the generated `/run/nfty-dnsmasq.conf` and `/run/nfty-dnsmasq.hosts` files. |
 | `dns reload` | Regenerates the `dnsmasq` configuration and sends `SIGHUP` to reload records and blocklists with zero downtime. |
 
-### Cloudflare Zero-Trust Operations (`cf` / `cloudflare`)
+### Cloudflare Zero-Trust Operations (`cf`)
 
 | Command | Description |
 | :--- | :--- |
@@ -359,13 +336,13 @@ Run 'configure; diff; apply' to activate.
 | `debug` (or `debug <cmd>`) | Global (`nfty>`) | Enters `nfty(debug)#` mode, or executes `<cmd>` directly as a one-shot diagnostic command. |
 | `tcp <host:port>` | `nfty(debug)#` | Tests TCP 3-way handshake connectivity to `<host:port>`, measures connection RTT in milliseconds, and reads any initial protocol banner. |
 | `dns <host> [server]` | `nfty(debug)#` | Resolves `<host>` via `dnsmasq` / system DNS or a specific upstream DNS server. |
-| `interfaces` (or `ip`, `addr`) | `nfty(debug)#` | Displays live kernel network interfaces, link states, MAC addresses, and assigned IPv4/IPv6 addresses (`ip -br link` & `ip -br addr`). |
-| `routes` (or `route`) | `nfty(debug)#` | Displays the main routing table (`ip route`), policy routing rules (`ip rule`), and per-tunnel WireGuard routing tables (`table 100..`). |
-| `arp` (or `neigh`) | `nfty(debug)#` | Displays the kernel ARP / L2 neighbor table (`ip neigh`). |
-| `sockets` (or `ports`, `netstat`) | `nfty(debug)#` | Displays active listening TCP and UDP sockets (`netstat -tulnp`). |
+| `interfaces` | `nfty(debug)#` | Displays live kernel network interfaces, link states, MAC addresses, and assigned IPv4/IPv6 addresses (`ip -br link` & `ip -br addr`). |
+| `routes` | `nfty(debug)#` | Displays the main routing table (`ip route`), policy routing rules (`ip rule`), and per-tunnel WireGuard routing tables (`table 100..`). |
+| `arp` | `nfty(debug)#` | Displays the kernel ARP / L2 neighbor table (`ip neigh`). |
+| `sockets` | `nfty(debug)#` | Displays active listening TCP and UDP sockets (`netstat -tulnp`). |
 | `wg [iface]` | `nfty(debug)#` | Displays live kernel WireGuard interface status, peer endpoints, latest handshakes, and transfer counters (`wg show`). |
-| `nft` (or `ruleset`) | `nfty(debug)#` | Displays the live kernel `nftables` ruleset and packet/byte counters (`nft list ruleset`). |
-| `flows` (or `conntrack`) | `nfty(debug)#` | Displays active NAT conntrack sessions from `/proc/net/nf_conntrack`. |
+| `nft` | `nfty(debug)#` | Displays the live kernel `nftables` ruleset and packet/byte counters (`nft list ruleset`). |
+| `flows` | `nfty(debug)#` | Displays active NAT conntrack sessions from `/proc/net/nf_conntrack`. |
 | `dmesg` | `nfty(debug)#` | Displays the last 40 lines of the kernel ring buffer (`dmesg`). |
 
 ### Appliance Administration
@@ -375,40 +352,3 @@ Run 'configure; diff; apply' to activate.
 | `password` | Interactively changes the SSH `nfty` login password (persisted as a salted hash in `/data/auth.json`). |
 | `bootstrap` | Bootstraps a static VIP and SSH service in `/data/Nftyfile`. |
 
----
-
-## 7. Live Interactive TUI (`watch`)
-
-Running `watch` inside the CLI (or `nfty watch` directly from your shell) launches a full-screen `crossterm`-powered terminal dashboard that refreshes every `250ms`. A secondary dashboard performs its own periodic probes and reads kernel counters, but does not synchronize the controller's health or drain state. Its drain/enable actions are forwarded to the controller.
-
-```text
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ nfty v0.8.0 — Kernel-Native L4 Load Balancer               Uptime: 14d 06:22 │
-│ VIPs: 2 | Services: 4 | Backends: 7 UP / 1 DRAIN / 0 DOWN | Active Flows: 84 │
-├──────────────────────────────────────────────────────────────────────────────┤
-│   VIP / Service         Mode   Balance       Backend            State    RTT │
-│ ▸ 192.168.1.4/24@eth0   dnat   sticky 30m    192.168.1.21:443   UP     0.8ms │
-│   └─ https:443          dnat   sticky 30m    192.168.1.22:443   DRAIN  1.1ms │
-│   └─ https:443          dnat   sticky 30m    192.168.1.99:443   STDBY  0.9ms │
-│   192.168.1.4/24@eth0   dnat   round-robin   192.168.1.31:53    UP     0.4ms │
-│   └─ dns:53/udp         dnat   round-robin   192.168.1.32:53    UP     0.5ms │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ Kernel nftables Verdict Map Preview (Press 'n' to toggle)                    │
-│   ip daddr 192.168.1.4 tcp dport 443 dnat to numgen inc mod 3 map {          │
-│     0 : 192.168.1.21 . 443, 1 : 192.168.1.21 . 443, 2 : 192.168.1.21 . 443   │
-│   }                                                                          │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ [↑/↓ or j/k] Select  [d] Drain  [e] Enable  [p] Probe  [n] Toggle NFT  [q] Quit│
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-### TUI Keyboard Shortcuts
-
-| Key | Action |
-| :--- | :--- |
-| `↑` / `↓` or `k` / `j` | Move the selection cursor (`▸`) up or down through the list of backends. |
-| `d` | Immediately **drain** the currently highlighted backend (`DRAINING`), removing it from the kernel `nftables` verdict map for new connections. |
-| `e` | Immediately **enable / undrain** the currently highlighted backend (`UP`), restoring it to the kernel `nftables` verdict map. |
-| `p` | Trigger an immediate out-of-band health probe across all backends and refresh RTT latencies. |
-| `n` | Toggle the bottom **Kernel `nftables` Verdict Map Preview** pane on or off. |
-| `q` or `Esc` | Exit the live TUI and return to the `nfty>` prompt (or shell). |

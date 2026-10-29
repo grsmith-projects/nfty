@@ -6,14 +6,6 @@ pub fn print_context_help(level: &ShellLevel) {
         ShellLevel::Operational => {
             println!("{}", "Operational Mode Commands:".bold().cyan());
             println!(
-                "  {:<26} Discover live LXD/LAN containers & open ports",
-                "scan [host|subnet]".yellow()
-            );
-            println!(
-                "  {:<26} Adopt discovered service into a DHCP or static VIP",
-                "adopt <# | name> [vip X]".yellow()
-            );
-            println!(
                 "  {:<26} Bootstrap VIP + base SSH service config",
                 "bootstrap <ip[/24]>...".yellow()
             );
@@ -47,32 +39,20 @@ pub fn print_context_help(level: &ShellLevel) {
                 "wg".yellow()
             );
             println!(
-                "  {:<26} Open nano to paste/edit a WireGuard .conf",
+                "  {:<26} Paste a WireGuard .conf (terminal only)",
                 "wg add <name>".yellow()
-            );
-            println!(
-                "  {:<26} Paste a WireGuard .conf directly in CLI",
-                "wg paste <name>".yellow()
             );
             println!(
                 "  {:<26} List saved SSH authorized keys (/data/ssh)",
                 "ssh".yellow()
             );
             println!(
-                "  {:<26} Add/edit an SSH public key (inline or nano)",
+                "  {:<26} Add an SSH public key (inline, or paste on a terminal)",
                 "ssh add <name> [pubkey]".yellow()
-            );
-            println!(
-                "  {:<26} Paste an SSH public key directly in CLI",
-                "ssh paste <name>".yellow()
             );
             println!(
                 "  {:<26} Cloudflare Tunnel & DNS status / API token setup",
                 "cf [status|token <KEY>]".yellow()
-            );
-            println!(
-                "  {:<26} Open live interactive TUI dashboard",
-                "watch".yellow()
             );
             println!(
                 "  {:<26} Run active health probes right now",
@@ -127,19 +107,19 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!(
                 "  {:<32} Show live kernel network interfaces & IPs",
-                "interfaces (or 'ip')".yellow()
+                "interfaces".yellow()
             );
             println!(
                 "  {:<32} Show main, policy rules & WireGuard routing tables",
-                "routes (or 'route')".yellow()
+                "routes".yellow()
             );
             println!(
                 "  {:<32} Show kernel ARP / L2 neighbor cache",
-                "arp (or 'neigh')".yellow()
+                "arp".yellow()
             );
             println!(
                 "  {:<32} Show active listening TCP/UDP sockets",
-                "sockets (or 'ports')".yellow()
+                "sockets".yellow()
             );
             println!(
                 "  {:<32} Show live WireGuard tunnel handshakes & transfer",
@@ -151,7 +131,7 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!(
                 "  {:<32} Show active conntrack flows & NAT translations",
-                "flows (or 'conntrack')".yellow()
+                "flows".yellow()
             );
             println!(
                 "  {:<32} Show recent kernel ring buffer messages",
@@ -168,14 +148,6 @@ pub fn print_context_help(level: &ShellLevel) {
         }
         ShellLevel::ConfigRoot => {
             println!("{}", "Config Root Commands (nfty(config)#):".bold().cyan());
-            println!(
-                "  {:<32} Discover live LXD/LAN containers & open ports",
-                "scan [host|subnet]".yellow()
-            );
-            println!(
-                "  {:<32} Adopt discovered service (e.g. 'adopt 1' or 'adopt sonarr vip 192.168.1.4')",
-                "adopt <# | name> [vip <vip>]".yellow()
-            );
             println!(
                 "  {:<32} Create/enter a static or DHCP VIP container (e.g. 'vip 192.168.1.4' or 'vip sonarr')",
                 "vip <ipv4[/cidr]|name>".yellow()
@@ -214,24 +186,16 @@ pub fn print_context_help(level: &ShellLevel) {
                 "wg".yellow()
             );
             println!(
-                "  {:<32} Open nano to paste/edit a WireGuard .conf",
+                "  {:<32} Paste a WireGuard .conf (terminal only)",
                 "wg add <name>".yellow()
-            );
-            println!(
-                "  {:<32} Paste a WireGuard .conf directly in CLI",
-                "wg paste <name>".yellow()
             );
             println!(
                 "  {:<32} List saved SSH authorized keys (/data/ssh)",
                 "ssh".yellow()
             );
             println!(
-                "  {:<32} Add/edit an SSH public key (inline or nano)",
+                "  {:<32} Add an SSH public key (inline, or paste on a terminal)",
                 "ssh add <name> [pubkey]".yellow()
-            );
-            println!(
-                "  {:<32} Paste an SSH public key directly in CLI",
-                "ssh paste <name>".yellow()
             );
             println!(
                 "  {:<32} Cloudflare Tunnel & DNS setup (e.g. 'cf token <API_TOKEN>')",
@@ -255,7 +219,7 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!(
                 "  {:<32} Apply candidate config to kernel",
-                "apply / commit".yellow()
+                "apply".yellow()
             );
             println!(
                 "  {:<32} Apply with auto-rollback timer (e.g. 60s)",
@@ -403,7 +367,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 "auto-vips <on|off>".yellow()
             );
             println!(
-                "  {:<36} Auto-synthesize A/PTR records from /etc/hosts & scan",
+                "  {:<36} Auto-synthesize A/PTR records from resolved backend hosts",
                 "auto-hosts <on|off>".yellow()
             );
             println!(
@@ -493,7 +457,7 @@ pub fn print_context_help(level: &ShellLevel) {
                 "cloudflare-dns <fqdn>".yellow()
             );
             println!(
-                "  {:<32} Require Auth on Cloudflare Tunnel ('nfty', 'user:pass', or 'you@email.com')",
+                "  {:<32} Require Cloudflare Access (you@example.com or *@example.com)",
                 "cloudflare-auth <rule...>".yellow()
             );
             println!(
@@ -596,14 +560,6 @@ pub fn print_context_help(level: &ShellLevel) {
                 .cyan()
             );
             println!(
-                "  {:<32} Enable local HTTP/HTTPS Privoxy on this gateway",
-                "privoxy:8118 (or 'privoxy')".yellow()
-            );
-            println!(
-                "  {:<32} Enable local SOCKS5 proxy on this gateway",
-                "socks5:1080 (or 'socks5')".yellow()
-            );
-            println!(
                 "  {:<32} Enable local nfty SSH shell on this gateway",
                 "ssh:22 (or 'ssh')".yellow()
             );
@@ -649,7 +605,7 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!(
                 "  {:<32} Remove a tunnel, service, or directive",
-                "no <privoxy|socks5|ssh|api|tunnel <name>|vip|killswitch>".yellow()
+                "no <ssh|dns|api|web|tunnel <name>|vip|killswitch>".yellow()
             );
             println!("  {:<32} Show this gateway block", "show".yellow());
             println!(
@@ -668,14 +624,6 @@ pub fn print_context_help(level: &ShellLevel) {
                 .cyan()
             );
             println!(
-                "  {:<32} Enable HTTP/HTTPS Privoxy on this gateway",
-                "privoxy:8118 (or 'privoxy')".yellow()
-            );
-            println!(
-                "  {:<32} Enable SOCKS5 proxy on this gateway",
-                "socks5:1080 (or 'socks5')".yellow()
-            );
-            println!(
                 "  {:<32} Enable nfty SSH shell on this gateway IP",
                 "ssh:22 (or 'ssh')".yellow()
             );
@@ -685,7 +633,7 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!(
                 "  {:<32} Disable a gateway service",
-                "no <privoxy|socks5|ssh|api>".yellow()
+                "no <ssh|dns|api|web>".yellow()
             );
             println!(
                 "  {:<32} Return to gateway {} prompt",
@@ -737,15 +685,11 @@ pub fn print_context_help(level: &ShellLevel) {
                 .cyan()
             );
             println!(
-                "  {:<32} Open nano to paste new WireGuard config & attach it",
-                "add <name> / nano <name>".yellow()
+                "  {:<32} Paste a new WireGuard config & attach it",
+                "add <name>".yellow()
             );
             println!(
-                "  {:<32} Paste WireGuard config inline & attach it",
-                "paste <name>".yellow()
-            );
-            println!(
-                "  {:<32} Add tunnel from /data/wg/<file> (opens nano if new)",
+                "  {:<32} Attach an existing /data/wg/<file> tunnel",
                 "<mullvad-us-sea-001.conf> [weight N]".yellow()
             );
             println!(

@@ -9,29 +9,29 @@
 
 ## Architecture and Capabilities
 
-- **Declarative `Nftyfile` and Router CLI**: Configure services via `/data/Nftyfile`, a hierarchical CLI (`configure`, `diff`, `test`, `commit`, `apply confirm <secs>`, `rollback`), or the HTTP/JSON control API.
+- **Declarative `Nftyfile` and Router CLI**: Configure services via `/data/Nftyfile`, a hierarchical CLI (`configure`, `diff`, `test`, `apply`, `apply confirm <secs>`, `rollback`), or the HTTP/JSON control API.
 - **Kernel `nftables` Dataplane + Userspace L7 Proxy**:
   - Compiles L4 TCP/UDP port forwarding and weighted `numgen inc mod` (`round-robin`) or `ip saddr` (`sticky`) load balancing into atomic `nft -f` transactions.
-  - Provides a userspace L7 reverse proxy for HTTP `Host` and TLS `SNI` routing (`hostname <name>.local`) paired with a multicast mDNS responder (`224.0.0.251:5353`).
+  - Provides a userspace L7 reverse proxy for HTTP `Host` and TLS `SNI` routing (`hostname <name>.local`) paired with a multicast mDNS responder (`224.0.0.251:5353`). These listeners are bound only while a configured service needs them.
 - **Static, VLAN, and DHCP Virtual IPs**:
   - Binds static VIPs (`vip 192.168.10.10/24`) to host interfaces or 802.1Q VLAN sub-interfaces (`vlan 20`).
   - Provisions dedicated `macvlan` interfaces with deterministic MAC addresses and `udhcpc` leases for hostname-based DHCP VIPs (`vip web-frontend { dhcp eth0 }`), registering the hostname directly with upstream router DNS.
 - **Internet NAT, WireGuard Egress, and WireGuard Ingress Gateways**:
   - Binds static or DHCP virtual gateway IPs (`gateway 169.254.10.20` or `gateway lan-exit dhcp eth0`) that LAN machines or containers can use as their default IPv4 gateway (`ip route replace default via ...`).
-  - **Direct Internet Gateway Mode**: When configured without WireGuard tunnels, `nfty` masquerades forwarded LAN traffic directly out the primary WAN/LAN interface (`eth0`), enforces optional source `allow` ACLs, and exposes built-in `privoxy:<port>` (HTTP/HTTPS `CONNECT`) and `socks5:<port>` proxies.
+  - **Direct Internet Gateway Mode**: When configured without WireGuard tunnels, `nfty` masquerades forwarded LAN traffic directly out the primary WAN/LAN interface (`eth0`) and enforces optional source `allow` ACLs.
   - **WireGuard Multi-Tunnel Egress Mode**: Aggregates one or more WireGuard `.conf` tunnels under the gateway IP using kernel `fwmark` policy routing (`ip rule` + per-tunnel routing tables), `ct mark` connection pinning, `killswitch on`, and inbound tunnel port forwarding (`forward <port> to <host:port>`).
   - **WireGuard Ingress Server Mode (`wg-in:<port>`)**: Turns any gateway into a WireGuard VPN server (`ig0..igN`) supporting both **split-tunnel LAN access** (`split-tunnel lan`) and **full-tunnel exit routing** (`split-tunnel full`, chaining remote clients into direct WAN NAT or the gateway's outbound WireGuard `tunnels` pool). Includes built-in Curve25519 keypair + PSK generation, automatic `/32` client IP allocation, copy/paste client `.conf` output, and scannable terminal UTF-8 half-block QR codes (`peer add <name>`, `peer show <name>`, `peer qr <name>`).
 - **Programmable DNS Endpoint (`dnsmasq` + `nftset`)**:
-  - Supervises a native `dnsmasq` endpoint (`dns:53` on VIPs/gateways or global `dns { ... }`) that synthesizes records from configured VIPs, gateways, and registered or resolved hosts, and dynamically removes unhealthy backends from DNS responses (`health-aware on`). Scans do not register hosts.
+  - Supervises a native `dnsmasq` endpoint (`dns:53` on VIPs/gateways or global `dns { ... }`) that synthesizes records from configured VIPs, gateways, and registered or resolved hosts, and dynamically removes unhealthy backends from DNS responses (`health-aware on`).
   - Supports authoritative `a`, `aaaa`, wildcard `address`, `cname`, `txt`, `srv`, `mx`, and `ptr` records, split-horizon conditional zone forwarding (`forward <domain> <server> [via <gateway>]`), and domain sinkholing (`block` / `blocklist`).
   - Integrates `dnsmasq`'s native `nftset=` engine with `table ip nfty` dynamic timeout sets (`@dns_route_<gw>` and `@dns_bypass_<gw>`) for zero-latency domain-based policy routing (`route <domain...> via <gateway>` and `bypass <domain...> from <gateway>`).
-- **Cloudflare Tunnel and Authentication**:
+- **Cloudflare Tunnel and Access**:
   - `cloudflare-dns <fqdn>` provisions a remotely-managed Cloudflare Tunnel, ingress rule, and proxied CNAME record via the Cloudflare API and supervises `cloudflared`.
-  - `cloudflare-auth <email...>` configures Cloudflare Zero Trust Access self-hosted applications and email/domain allow policies (`user@example.com`, `*@example.com`).
-  - `auth <user:pass | nfty>` enforces HTTP Basic Authentication directly in `nfty` across both Cloudflare Tunnel traffic and local TCP VIP requests (via the userspace L7 auth proxy).
+  - `cloudflare-auth <email...>` configures Cloudflare Zero Trust Access self-hosted applications and email/domain allow policies (`user@example.com`, `*@example.com`). Until the Access policy is verified, the tunnel answers that hostname with `403`.
+  - Local access control is IP allow-lists (`allow`) only; `nfty` does not run its own HTTP authentication proxy.
 - **PID-1 Appliance Runtime & 100% Config-Driven IP Assignment**:
   - Runs as `/sbin/init` (PID 1): mounts `/proc`, `/sys`, `/dev`, and `/data` (auto-formatting blank VM block devices as `ext4` labeled `NFTY_DATA`), brings up link layer on `eth0` without grabbing an unconfigured base OS IP, starts an embedded post-quantum SSH2 server (`russh` with `mlkem768x25519-sha256` and `/data/ssh/*.pub` public key auth) on port 22, and persists configuration atomically to `/data`. Every IP address on the appliance (static or DHCP) is strictly declared in `/data/Nftyfile`.
-  - No default `:9090` Control API listener is bound unless explicitly configured via `api:<port>` / `web:<port>` on a VIP/Gateway (or `--api-bind`).
+  - No default `:9090` Control API listener is bound unless explicitly configured via `api:<port>` / `web:<port>` on a VIP/Gateway. Local CLI and SSH sessions reach the controller over a root-only Unix socket (`/run/nfty/ctl.sock`).
   - Includes a dedicated **`debug` mode (`nfty(debug)#`)** and top-level `ping` (capped at `-c 5`) and `traceroute` commands for live network diagnostics (`ping`, `traceroute`, `tcp`, `dns`, `arping`, `interfaces`, `routes`, `arp`, `sockets`, `wg`, `nft`, `flows`, `dmesg`).
 
 ---
@@ -89,8 +89,7 @@ ssh nfty@192.168.10.10
 - **Global SSH Authorized Keys (`/data/ssh/*.pub`)**: Add OpenSSH public keys (`ssh-ed25519`, `ecdsa-sha2-*`, `ssh-rsa`) for passwordless SSH login across all `ssh:22` listeners using the same workflow as `wg`:
   ```text
   nfty> ssh add workstation ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... admin@workstation
-  nfty> ssh paste laptop
-  nfty> ssh add yubikey          # opens nano on /data/ssh/yubikey.pub
+  nfty> ssh add laptop           # paste the key, finish with EOF or "."
   nfty> ssh list                 # lists all saved keys and SHA256 fingerprints
   nfty> ssh rm laptop
   ```
@@ -120,13 +119,13 @@ vip 192.168.10.10/24 {
 Equivalent interactive CLI commands:
 
 ```text
-nfty# conf
+nfty# configure
 nfty(config)# vip 192.168.10.10/24
 nfty(config-vip:192.168.10.10)# ssh:22
 nfty(config-vip:192.168.10.10)# service app-server:3000
 nfty(config-service:192.168.10.10:3000)# hostname grafana.local
 nfty(config-service:192.168.10.10:3000)# check tcp 5s
-nfty(config-service:192.168.10.10:3000)# commit
+nfty(config-service:192.168.10.10:3000)# apply
 ```
 
 ### 2. Dedicated DHCP `macvlan` VIPs and 802.1Q VLANs
@@ -148,7 +147,7 @@ Equivalent interactive CLI commands:
 ```text
 nfty(config)# vip web-app dhcp eth0 vlan 20
 nfty(config-vip:web-app)# 80 to backend-container:8080
-nfty(config-vip:web-app)# commit
+nfty(config-vip:web-app)# apply
 ```
 
 ### 3. Multi-Backend Load Balancing, Weights, and Failover
@@ -176,17 +175,15 @@ vip 192.168.10.15/24 {
 
 ### 4. Internet NAT and WireGuard Egress Gateways
 
-A `gateway` block binds a virtual gateway IP (`192.168.10.20` or a DHCP `macvlan` hostname) that other machines, VMs, or containers on the LAN can set as their default IPv4 gateway or reach via the built-in `privoxy` (HTTP/CONNECT) and `socks5` proxies.
+A `gateway` block binds a virtual gateway IP (`192.168.10.20` or a DHCP `macvlan` hostname) that other machines, VMs, or containers on the LAN can set as their default IPv4 gateway.
 
 **Direct Internet / LAN NAT Gateway (no VPN tunnels):**
 
-When no `tunnels` block is configured, `nfty` enables IPv4 forwarding and kernel `nftables` masquerading (`oifname "eth0" masquerade`) so isolated containers, VLANs, or lab hosts can route outbound Internet traffic or proxy connections through `nfty`:
+When no `tunnels` block is configured, `nfty` enables IPv4 forwarding and kernel `nftables` masquerading (`oifname "eth0" masquerade`) so isolated containers, VLANs, or lab hosts can route outbound Internet traffic through `nfty`:
 
 ```hcl
 gateway 192.168.10.19 {
     check ping 5s
-    privoxy:8118
-    socks5:1080
     allow {
         192.168.0.0/16
     }
@@ -202,8 +199,6 @@ gateway 192.168.10.20 {
     balance round-robin
     killswitch on
     check ping 5s
-    privoxy:8118
-    socks5:1080
     forward 51413 to 192.168.20.15:51413
     tunnels {
         wg-exit-01.conf weight 2
@@ -215,16 +210,14 @@ gateway 192.168.10.20 {
 Configuring a gateway from the CLI:
 
 ```text
-nfty# wg paste wg-exit-01
-nfty# conf
+nfty# wg add wg-exit-01
+nfty# configure
 nfty(config)# gateway 169.254.10.20
 nfty(config-gw:169.254.10.20)# killswitch on
-nfty(config-gw:169.254.10.20)# privoxy:8118
-nfty(config-gw:169.254.10.20)# socks5:1080
 nfty(config-gw:169.254.10.20)# forward 51413 to 169.254.20.15:51413
 nfty(config-gw:169.254.10.20)# tunnels
 nfty(config-gw-tunnels:169.254.10.20)# wg-exit-01.conf
-nfty(config-gw-tunnels:169.254.10.20)# commit
+nfty(config-gw-tunnels:169.254.10.20)# apply
 ```
 
 **WireGuard Ingress Server (`wg-in:51820`) with Client `.conf` & Terminal QR Code Generator:**
@@ -250,14 +243,14 @@ gateway 169.254.10.20 {
 Adding a client peer from the CLI automatically generates its Curve25519 keypair + PresharedKey (or accepts a user-supplied `pubkey <base64>`), allocates the next available `/32` IP, and prints both the copy/paste `.conf` and a scannable UTF-8 QR code:
 
 ```text
-nfty# conf
+nfty# configure
 nfty(config)# gateway 169.254.10.20
 nfty(config-gateway:169.254.10.20)# wg-in:51820
 nfty(config-gateway:169.254.10.20-wg:51820)# endpoint vpn.example.com:51820
 nfty(config-gateway:169.254.10.20-wg:51820)# split-tunnel full
 nfty(config-gateway:169.254.10.20-wg:51820)# peer add phone
 nfty(config-gateway:169.254.10.20-wg:51820)# peer add workstation pubkey <client-base64-pubkey>
-nfty(config-gateway:169.254.10.20-wg:51820)# commit
+nfty(config-gateway:169.254.10.20-wg:51820)# apply
 nfty# peer show phone
 nfty# peer qr phone
 ```
@@ -333,26 +326,27 @@ dns {
 Interactive CLI configuration and operational diagnostics:
 
 ```text
-nfty# conf
+nfty# configure
 nfty(config)# dns
 nfty(config-dns)# domain lan
 nfty(config-dns)# a nas.lan 192.168.1.50
 nfty(config-dns)# address *.k8s.lan 192.168.1.100
 nfty(config-dns)# route linuxisos.org via 192.168.10.20
 nfty(config-dns)# bypass plex.tv from 192.168.10.20
-nfty(config-dns)# commit
+nfty(config-dns)# apply
 nfty# dns status
 nfty# dns test sonarr.lan
 ```
 
-### 7. Service Discovery (`scan` / `adopt`), Troubleshooting (`debug`), and Safe Rollbacks
+### 7. Troubleshooting (`debug`) and Safe Rollbacks
 
 From the long-running controller's local console (not a secondary SSH or
-one-shot session), scan for services and adopt one into a VIP:
+one-shot session), apply with an automatic rollback timer:
 
 ```text
-nfty# scan
-nfty# adopt 1 vip 192.168.10.10
+nfty# configure
+nfty(config)# vip 192.168.10.10
+nfty(config-vip:192.168.10.10)# 80 to 192.168.20.10:8080
 nfty(config-vip:192.168.10.10)# apply confirm 60
   ✔ Applied ruleset to kernel nftables
   Safety rollback timer active for 60s! Type 'confirm' to keep changes.
@@ -483,6 +477,16 @@ zcat dist/rk3588s/nfty-rk3588s.img.gz | sudo dd of=/dev/sdX bs=4M status=progres
 
 ---
 
+## Upgrading to 0.9.0
+
+0.9.0 removes features to shrink the attack surface. Delete these from `/data/Nftyfile` before upgrading; otherwise the appliance boots with an empty config and saves the original as `/data/Nftyfile.invalid`:
+
+- Service `auth` / `basic-auth` (use `allow` lists, or `cloudflare-auth` for tunnel hostnames).
+- Gateway `privoxy:<port>` and `socks5:<port>`.
+- Directive aliases: use `key` (not `api-key`), `hostname` (not `host`/`domain`/`mdns`), `cloudflare-dns`/`cloudflare-auth` (not `cloudflare`/`cf`/`cf-auth`/`tunnel-*`), `wg-in` (not `wg-server`/`wireguard`), `web` (not `ui`/`webui`), `dns` (not `dnsmasq`), `service` (not `services`/`local`), `interface`/`vip` (not `dev`), and `no` (not `delete`/`remove`).
+
+Also removed: the `watch` TUI, `scan`/`adopt`, the web username/password login (`/api/v1/auth/login`; use API keys), the `--api-bind` flag, the `wg`/`ssh` built-in editors (`add` now pastes), shell aliases such as `conf`, `commit`, `passwd`, and `validate` (use `test`; the `nfty validate` subcommand is unchanged), and the `/status` and `/api/v1/cf` routes. Loopback clients no longer bypass web/API allow-lists.
+
 ## Codebase Layout
 
 ```text
@@ -494,18 +498,17 @@ src/
 ├── compiler.rs              # nftables ruleset generator, DHCP macvlan & VLAN setup
 ├── unikernel.rs             # PID-1 mount/network init and /data persistence
 ├── health.rs                # TCP/HTTP/ICMP/WireGuard health prober and DNS refresher
-├── api.rs                   # HTTP/JSON control API and embedded status UI
+├── api.rs                   # HTTP/JSON control API, controller Unix socket, web console server
 ├── ssh.rs                   # Built-in SSH2 server (russh) and credential store
-├── tui.rs                   # Terminal dashboard (ratatui)
 ├── features/
 │   ├── mod.rs               # Background daemon supervisor and module re-exports
 │   ├── dns.rs               # dnsmasq config/hosts compiler, supervisor, nftset & DNS CLI
 │   ├── wireguard.rs         # WireGuard config parser, kernel wg/ip-rule sync, wg CLI
 │   ├── vhost_mdns.rs        # Multicast mDNS responder and L7 Host/SNI reverse proxy
-│   ├── gateway_proxy.rs     # Gateway-bound Privoxy (HTTP/CONNECT) and SOCKS5 proxies
-│   ├── cloudflare.rs        # cloudflared supervisor, Cloudflare API sync, Basic Auth gate
-│   ├── scanner.rs           # LAN/LXD service discovery and banner probing
+│   ├── cloudflare.rs        # cloudflared supervisor, Cloudflare API and Access sync
 │   └── flows.rs             # Kernel conntrack (/proc/net/nf_conntrack) flow viewer
+├── web/
+│   └── index.html           # Web console (embedded with include_str!)
 └── repl/
     ├── mod.rs               # Interactive shell loop, drill-down contexts, command handlers
     ├── debug.rs             # Troubleshooting & diagnostics mode (nfty(debug)#, ping, traceroute)
@@ -534,7 +537,7 @@ src/
      cargo check --release --target x86_64-unknown-linux-musl
      ```
 4. **Commit messages**:
-   - Use clear, imperative commit subjects describing the subsystem and behavior change (e.g., `cloudflare: strip Basic Authorization header before upstream proxy`).
+   - Use clear, imperative commit subjects describing the subsystem and behavior change (e.g., `cloudflare: fail closed until the Access policy is verified`).
 
 ## License
 

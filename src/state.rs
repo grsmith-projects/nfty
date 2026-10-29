@@ -61,41 +61,6 @@ pub struct PendingConfirm {
     pub deadline: Instant,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveredService {
-    pub index: usize,
-    pub host: Option<String>,
-    pub ip: Ipv4Addr,
-    pub port: u16,
-    pub service_name: String,
-    pub banner: String,
-    pub latency_ms: f64,
-}
-
-impl DiscoveredService {
-    pub fn target_spec(&self) -> String {
-        match &self.host {
-            Some(h) => format!("{}:{}", h, self.port),
-            None => format!("{}:{}", self.ip, self.port),
-        }
-    }
-
-    pub fn suggested_vip_name(&self) -> String {
-        let lower_svc = self.service_name.to_ascii_lowercase();
-        if !matches!(lower_svc.as_str(), "http" | "https" | "tcp" | "ssh" | "dns" | "unknown") {
-            return lower_svc
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-                .collect();
-        }
-        if let Some(h) = &self.host {
-            let base = h.split('.').next().unwrap_or(h);
-            return format!("{}-{}", base, self.port);
-        }
-        format!("svc-{}", self.port)
-    }
-}
-
 #[derive(Debug)]
 pub struct AppState {
     pub running: Config,
@@ -107,13 +72,12 @@ pub struct AppState {
     /// Live DNS & Host cache mapping hostname -> resolved IPv4 addresses.
     /// Automatically kept updated by background DNS/hosts resolver + API registrations.
     pub resolved_hosts: BTreeMap<String, Vec<Ipv4Addr>>,
-    /// Discovered LAN/LXD container services from the most recent `scan`
-    pub discovered_services: Vec<DiscoveredService>,
     pub pending_confirm: Option<PendingConfirm>,
     pub last_applied_nft: String,
     pub last_disk_nftyfile: String,
     pub kernel_applied: bool,
-    pub api_bind: Option<String>,
+    /// Unix socket of the authoritative controller (`/run/nfty/ctl.sock`).
+    pub controller_socket: PathBuf,
     pub controller_is_authoritative: bool,
 }
 
@@ -129,30 +93,15 @@ impl AppState {
             config_path,
             runtime: BTreeMap::new(),
             resolved_hosts: BTreeMap::new(),
-            discovered_services: Vec::new(),
             pending_confirm: None,
             last_applied_nft: String::new(),
             last_disk_nftyfile: initial_txt,
             kernel_applied: false,
-            api_bind: None,
+            controller_socket: crate::unikernel::controller_socket_path(),
             controller_is_authoritative: false,
         };
         s.sync_runtime_entries();
         s
-    }
-
-    pub fn controller_ipc_addr(&self) -> Option<String> {
-        if let Some(ref bind) = self.api_bind {
-            if !bind.trim().is_empty() {
-                return Some(bind.clone());
-            }
-        }
-        self.running
-            .api_ports()
-            .into_iter()
-            .chain(self.candidate.api_ports())
-            .next()
-            .map(|p| format!("127.0.0.1:{}", p))
     }
 
     /// Returns the committed configuration, including when it is empty.

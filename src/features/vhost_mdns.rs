@@ -1,4 +1,3 @@
-use super::cloudflare::{check_http_basic_auth, sanitize_authenticated_http_request};
 use super::list_vlan_iface_ips;
 use crate::state::SharedState;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -148,10 +147,38 @@ fn build_mdns_a_response(tx_id: u16, qname: &str, ip: Ipv4Addr) -> Vec<u8> {
     resp
 }
 
+/// mDNS only answers for hostnames and named VIPs, so the socket is bound only while one exists.
+fn mdns_needed(shared: &SharedState) -> bool {
+    let st = shared.read().unwrap();
+    let cfg = st.active_config();
+    cfg.vips.keys().any(|k| k.parse::<Ipv4Addr>().is_err())
+        || cfg.services.values().any(|s| s.hostname.is_some())
+        || cfg.gateways.values().any(|g| g.hostname.is_some())
+}
+
+fn l7_vhost_needed(shared: &SharedState, port: u16) -> bool {
+    let st = shared.read().unwrap();
+    st.active_config().services.values().any(|s| {
+        s.port == port
+            && s.hostname.is_some()
+            && matches!(s.proto, crate::ast::Proto::Tcp | crate::ast::Proto::Both)
+    })
+}
+
 pub(crate) fn run_mdns_responder_loop(shared: SharedState) {
+    loop {
+        if mdns_needed(&shared) {
+            serve_mdns(&shared);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn serve_mdns(shared: &SharedState) {
     let Ok(sock) = UdpSocket::bind("0.0.0.0:5353") else {
         return;
     };
+    let _ = sock.set_read_timeout(Some(Duration::from_secs(1)));
     let mcast_group = Ipv4Addr::new(224, 0, 0, 251);
     let _ = sock.join_multicast_v4(&mcast_group, &Ipv4Addr::UNSPECIFIED);
     let _ = sock.set_multicast_loop_v4(false);
@@ -163,6 +190,9 @@ pub(crate) fn run_mdns_responder_loop(shared: SharedState) {
     loop {
         if last_join_check.elapsed() >= Duration::from_secs(15) {
             last_join_check = std::time::Instant::now();
+            if !mdns_needed(shared) {
+                return;
+            }
             for ip in list_vlan_iface_ips() {
                 if !joined_ips.contains(&ip) {
                     let _ = sock.join_multicast_v4(&mcast_group, &ip);
@@ -215,7 +245,7 @@ pub(crate) fn run_mdns_responder_loop(shared: SharedState) {
             offset = next_off;
             // Type 1 = A, Type 255 = ANY
             if qtype == 1 || qtype == 255 {
-                if let Some(ip) = find_hostname_ip(&shared, &qname) {
+                if let Some(ip) = find_hostname_ip(shared, &qname) {
                     let pkt = build_mdns_a_response(tx_id, &qname, ip);
                     let _ = sock.send_to(&pkt, peer);
                     let _ = sock.send_to(&pkt, mcast_dest);
@@ -330,137 +360,137 @@ async fn read_l7_prefix(client: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     .map_err(|_| anyhow::anyhow!("timed out reading virtual-host request"))?
 }
 
+/// Binds `0.0.0.0:<listen_port>` only while a hostname service needs Host/SNI routing on that port.
 pub(crate) async fn run_l7_virtual_host_listener(shared: SharedState, listen_port: u16) {
     let bind_addr = format!("0.0.0.0:{}", listen_port);
-    let listener = loop {
-        match TcpListener::bind(&bind_addr).await {
-            Ok(l) => break l,
-            Err(_) => {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    };
-
     loop {
-        let Ok((mut client, peer)) = listener.accept().await else {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if !l7_vhost_needed(&shared, listen_port) {
+            continue;
+        }
+        let Ok(listener) = TcpListener::bind(&bind_addr).await else {
             continue;
         };
-        let local_dst_ip = client.local_addr().ok().and_then(|a| match a.ip() {
-            std::net::IpAddr::V4(v4) => Some(v4),
-            _ => None,
-        });
-        let shared_conn = shared.clone();
-        tokio::spawn(async move {
-            let Ok(peek_buf) = read_l7_prefix(&mut client).await else {
-                return;
-            };
-            let Some(host) = extract_host_or_sni(&peek_buf) else {
-                return;
-            };
-
-            let target_info: Option<(String, String, Vec<String>)> = {
-                let st = shared_conn.read().unwrap();
-                let cfg = st.active_config();
-                // Prefer a service whose listen_ip matches the destination VIP IP, falling back to any service with that hostname
-                let mut candidates: Vec<&crate::ast::Service> = cfg
-                    .services
-                    .values()
-                    .filter(|svc| {
-                        if svc.port != listen_port
-                            || !matches!(svc.proto, crate::ast::Proto::Tcp | crate::ast::Proto::Both)
-                        {
-                            return false;
-                        }
-                        if let Some(svc_host) = &svc.hostname {
-                            let sh = svc_host.trim_end_matches('.').to_ascii_lowercase();
-                            let sh_short = sh.strip_suffix(".local").unwrap_or(&sh);
-                            let req_short = host.strip_suffix(".local").unwrap_or(&host);
-                            host == sh || req_short == sh_short
-                        } else {
-                            false
-                        }
-                    })
-                    .collect();
-
-                candidates.sort_by_key(|svc| {
-                    let ip_match = match (local_dst_ip, svc.listen_ip) {
-                        (Some(dst), Some(lip)) if dst == lip => 0,
-                        _ => 1,
-                    };
-                    ip_match
-                });
-
-                let mut found = None;
-                let peer_ip = match peer.ip() {
-                    std::net::IpAddr::V4(v4) => v4,
-                    std::net::IpAddr::V6(_) => return,
-                };
-                if let Some(svc) = candidates.first() {
-                    if !st.is_ip_allowed(peer_ip, &svc.allow, &cfg.global_allow) {
-                        return;
-                    }
-                    let active = st.active_backends_for_service(&svc.backends);
-                    if !active.is_empty() {
-                        let mut weighted_slots = Vec::new();
-                        for b in &active {
-                            for _ in 0..b.weight.max(1) {
-                                weighted_slots.push(*b);
-                            }
-                        }
-                        let idx = match svc.balance {
-                            crate::ast::BalanceStrategy::RoundRobin => {
-                                L7_VHOST_RR_COUNTER.fetch_add(1, Ordering::Relaxed)
-                                    % weighted_slots.len()
-                            }
-                            crate::ast::BalanceStrategy::Sticky => {
-                                let hash = match peer.ip() {
-                                    std::net::IpAddr::V4(v4) => u32::from(v4) as usize,
-                                    std::net::IpAddr::V6(_) => 0usize,
-                                };
-                                hash % weighted_slots.len()
-                            }
-                        };
-                        let chosen = weighted_slots[idx];
-                        let addr = format!("{}:{}", chosen.ip, chosen.port);
-                        found = Some((addr, chosen.endpoint(), svc.auth.clone()));
+        let mut recheck = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    if let Ok((client, peer)) = accepted {
+                        tokio::spawn(handle_l7_connection(shared.clone(), client, peer, listen_port));
                     }
                 }
-                found
-            };
-
-            if let Some((addr, ep_key, auth_rules)) = target_info {
-                let first_line_http = peek_buf.first() != Some(&0x16);
-                if !auth_rules.is_empty()
-                    && (!first_line_http || !check_http_basic_auth(&peek_buf, &auth_rules))
-                {
-                    let resp = format!(
-                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"nfty ({})\"\r\nContent-Type: text/plain\r\nContent-Length: 26\r\nConnection: close\r\n\r\n401 Authentication Needed\n",
-                        host
-                    );
-                    let _ = client.write_all(resp.as_bytes()).await;
-                    return;
-                }
-                let forward_buf = if !auth_rules.is_empty() {
-                    sanitize_authenticated_http_request(&peek_buf)
-                } else {
-                    peek_buf
-                };
-                if let Ok(Ok(mut upstream)) =
-                    tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await
-                {
-                    if upstream.write_all(&forward_buf).await.is_ok() {
-                        if let Ok((up_b, down_b)) =
-                            tokio::io::copy_bidirectional(&mut client, &mut upstream).await
-                        {
-                            if let Ok(mut st) = shared_conn.write() {
-                                let rt = st.runtime.entry(ep_key).or_default();
-                                rt.packets += 2;
-                                rt.bytes += (forward_buf.len() as u64) + up_b + down_b;
-                            }
-                        }
+                _ = recheck.tick() => {
+                    if !l7_vhost_needed(&shared, listen_port) {
+                        break;
                     }
                 }
             }
+        }
+    }
+}
+
+async fn handle_l7_connection(
+    shared_conn: SharedState,
+    mut client: TcpStream,
+    peer: SocketAddr,
+    listen_port: u16,
+) {
+    let local_dst_ip = client.local_addr().ok().and_then(|a| match a.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        _ => None,
+    });
+    let Ok(peek_buf) = read_l7_prefix(&mut client).await else {
+        return;
+    };
+    let Some(host) = extract_host_or_sni(&peek_buf) else {
+        return;
+    };
+
+    let target_info: Option<(String, String)> = {
+        let st = shared_conn.read().unwrap();
+        let cfg = st.active_config();
+        // Prefer a service whose listen_ip matches the destination VIP IP, falling back to any service with that hostname
+        let mut candidates: Vec<&crate::ast::Service> = cfg
+            .services
+            .values()
+            .filter(|svc| {
+                if svc.port != listen_port
+                    || !matches!(svc.proto, crate::ast::Proto::Tcp | crate::ast::Proto::Both)
+                {
+                    return false;
+                }
+                if let Some(svc_host) = &svc.hostname {
+                    let sh = svc_host.trim_end_matches('.').to_ascii_lowercase();
+                    let sh_short = sh.strip_suffix(".local").unwrap_or(&sh);
+                    let req_short = host.strip_suffix(".local").unwrap_or(&host);
+                    host == sh || req_short == sh_short
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        candidates.sort_by_key(|svc| {
+            let ip_match = match (local_dst_ip, svc.listen_ip) {
+                (Some(dst), Some(lip)) if dst == lip => 0,
+                _ => 1,
+            };
+            ip_match
         });
+
+        let mut found = None;
+        let peer_ip = match peer.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(_) => return,
+        };
+        if let Some(svc) = candidates.first() {
+            if !st.is_ip_allowed(peer_ip, &svc.allow, &cfg.global_allow) {
+                return;
+            }
+            let active = st.active_backends_for_service(&svc.backends);
+            if !active.is_empty() {
+                let mut weighted_slots = Vec::new();
+                for b in &active {
+                    for _ in 0..b.weight.max(1) {
+                        weighted_slots.push(*b);
+                    }
+                }
+                let idx = match svc.balance {
+                    crate::ast::BalanceStrategy::RoundRobin => {
+                        L7_VHOST_RR_COUNTER.fetch_add(1, Ordering::Relaxed) % weighted_slots.len()
+                    }
+                    crate::ast::BalanceStrategy::Sticky => {
+                        let hash = match peer.ip() {
+                            std::net::IpAddr::V4(v4) => u32::from(v4) as usize,
+                            std::net::IpAddr::V6(_) => 0usize,
+                        };
+                        hash % weighted_slots.len()
+                    }
+                };
+                let chosen = weighted_slots[idx];
+                let addr = format!("{}:{}", chosen.ip, chosen.port);
+                found = Some((addr, chosen.endpoint()));
+            }
+        }
+        found
+    };
+
+    if let Some((addr, ep_key)) = target_info {
+        let forward_buf = peek_buf;
+        if let Ok(Ok(mut upstream)) =
+            tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await
+        {
+            if upstream.write_all(&forward_buf).await.is_ok() {
+                if let Ok((up_b, down_b)) =
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await
+                {
+                    if let Ok(mut st) = shared_conn.write() {
+                        let rt = st.runtime.entry(ep_key).or_default();
+                        rt.packets += 2;
+                        rt.bytes += (forward_buf.len() as u64) + up_b + down_b;
+                    }
+                }
+            }
+        }
     }
 }

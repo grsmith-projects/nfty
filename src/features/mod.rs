@@ -1,31 +1,23 @@
 pub mod cloudflare;
 pub mod dns;
 pub mod flows;
-pub mod gateway_proxy;
-pub mod scanner;
 pub mod vhost_mdns;
 pub mod wireguard;
 
 pub use cloudflare::{
-    check_http_basic_auth, cloudflared_running_pid, collect_cloudflare_routes,
-    handle_cf_cli_command, load_cloudflare_config, reconcile_cloudflare_tunnel,
-    sanitize_authenticated_http_request, save_cloudflare_config, service_uses_local_cf_auth_proxy,
+    cloudflared_running_pid, collect_cloudflare_routes, handle_cf_cli_command,
+    load_cloudflare_config, reconcile_cloudflare_tunnel, save_cloudflare_config,
     start_or_ensure_cloudflared_daemon, stop_cloudflared_daemon, CloudflareConfig,
-    CF_LOCAL_AUTH_PORT,
 };
 pub use dns::{
     compile_dnsmasq_config, dnsmasq_running_pid, handle_dns_cli_command, print_dns_status,
     reconcile_dnsmasq, run_dns_lookup_test, run_dns_supervisor, stop_dnsmasq_daemon,
 };
 pub use flows::{print_flows_table, read_active_flows, ConntrackFlow};
-pub use gateway_proxy::{is_forbidden_proxy_destination, run_gateway_proxy_supervisor};
-pub use scanner::{
-    print_scan_table, scan_network_services_async, COMMON_CONTAINER_HOSTNAMES, SCAN_PORTS,
-};
 pub use vhost_mdns::extract_host_or_sni;
 pub use wireguard::{
     apply_wireguard_gateways, build_client_wg_conf, delete_stored_client_peer,
-    edit_wg_config_interactive, ensure_gateway_server_keys, generate_wg_keypair, generate_wg_psk,
+    ensure_gateway_server_keys, generate_wg_keypair, generate_wg_psk,
     handle_wg_cli_command, list_saved_wg_configs, load_stored_client_peer, normalize_wg_filename,
     parse_wg_conf_str, paste_wg_config_interactive, probe_wg_tunnel, render_qr_unicode,
     resolve_tunnel_config, save_stored_client_peer, save_wg_config_file, validate_wg_key_base64,
@@ -65,8 +57,8 @@ pub(crate) async fn read_http_headers(stream: &mut TcpStream, deadline: Duration
     .context("HTTP header deadline exceeded")?
 }
 
-/// Spawns background network daemons for mDNS responder, L7 HTTP/SNI virtual host proxy,
-/// Cloudflare local Basic-Auth gate, and WireGuard gateway Privoxy/SOCKS5 listeners.
+/// Spawns background daemons: mDNS responder, L7 HTTP/SNI virtual host proxy,
+/// Cloudflare tunnel supervisor, and DNS supervisor.
 pub fn spawn_advanced_feature_daemons(shared: SharedState) {
     let shared_mdns = shared.clone();
     tokio::task::spawn_blocking(move || {
@@ -83,19 +75,9 @@ pub fn spawn_advanced_feature_daemons(shared: SharedState) {
         vhost_mdns::run_l7_virtual_host_listener(shared_tls, 443).await;
     });
 
-    let shared_cf_auth = shared.clone();
-    tokio::spawn(async move {
-        cloudflare::run_cf_auth_proxy_listener(shared_cf_auth).await;
-    });
-
     let shared_cloudflare = shared.clone();
     tokio::spawn(async move {
         cloudflare::run_cloudflare_supervisor(shared_cloudflare).await;
-    });
-
-    let shared_gw_proxies = shared.clone();
-    tokio::spawn(async move {
-        gateway_proxy::run_gateway_proxy_supervisor(shared_gw_proxies).await;
     });
 
     let shared_dns = shared;
