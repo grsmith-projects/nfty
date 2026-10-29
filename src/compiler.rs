@@ -467,12 +467,24 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                             "\n        # --- gateway {} service ssh:{} ---\n        ip daddr {} tcp dport {}{} counter redirect to :22 comment \"nfty:gw-ssh={}\"\n",
                             gw.key, gs.port, gw.listen_ip, gs.port, gw_allow_guard, gw.key
                         ));
+                        if has_gw_allow {
+                            out.push_str(&format!(
+                                "        ip daddr {} tcp dport {} counter drop comment \"nfty:gw-policy-drop={}:{}\"\n",
+                                gw.listen_ip, gs.port, gw.key, gs.port
+                            ));
+                        }
                     }
                     GatewayServiceKind::Api | GatewayServiceKind::Web => {
                         out.push_str(&format!(
                             "\n        # --- gateway {} service {}:{} ---\n        ip daddr {} tcp dport {}{} counter redirect to :{} comment \"nfty:gw-api={}\"\n",
                             gw.key, gs.kind, gs.port, gw.listen_ip, gs.port, gw_allow_guard, gs.port, gw.key
                         ));
+                        if has_gw_allow {
+                            out.push_str(&format!(
+                                "        ip daddr {} tcp dport {} counter drop comment \"nfty:gw-policy-drop={}:{}\"\n",
+                                gw.listen_ip, gs.port, gw.key, gs.port
+                            ));
+                        }
                     }
                     GatewayServiceKind::Privoxy
                     | GatewayServiceKind::Socks5
@@ -1625,6 +1637,14 @@ fn configuration_safety_errors(config: &Config) -> Vec<String> {
                         "gateway '{}' peer '{}': {}",
                         gw.key, peer.name, e
                     ));
+                }
+                if let Some(psk) = &peer.preshared_key {
+                    if let Err(e) = crate::features::validate_wg_key_base64(psk) {
+                        errors.push(format!(
+                            "gateway '{}' peer '{}' preshared key: {}",
+                            gw.key, peer.name, e
+                        ));
+                    }
                 }
             }
         }

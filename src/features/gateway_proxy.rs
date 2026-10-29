@@ -170,6 +170,43 @@ async fn resolve_target_ipv4(target_host: &str, target_port: u16) -> Option<Ipv4
     crate::parser::resolve_hostname_sync(target_host)
 }
 
+pub fn is_forbidden_proxy_destination(shared: &SharedState, ip: Ipv4Addr) -> bool {
+    if ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+    {
+        return true;
+    }
+    if let Ok(st) = shared.read() {
+        let cfg = st.active_config();
+        for (k, vip) in &cfg.vips {
+            if k.parse::<Ipv4Addr>().ok() == Some(ip) || vip.leased_ip == Some(ip) {
+                return true;
+            }
+        }
+        for svc in cfg.services.values() {
+            if svc.listen_ip == Some(ip)
+                || svc.vip.as_ref().and_then(|v| v.leased_ip) == Some(ip)
+            {
+                return true;
+            }
+        }
+        for gw in cfg.gateways.values() {
+            if gw.listen_ip == ip || gw.vip.as_ref().and_then(|v| v.leased_ip) == Some(ip) {
+                return true;
+            }
+            if let Some(wg_in) = &gw.wg_ingress {
+                if wg_in.address == ip {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 async fn connect_via_gateway_tunnel(
     shared: &SharedState,
     gw_key: &str,
@@ -197,6 +234,12 @@ async fn connect_via_gateway_tunnel(
             .await
             .ok_or_else(|| anyhow::anyhow!("Could not resolve '{}'", target_host))?,
     };
+    if is_forbidden_proxy_destination(shared, resolved_ip) {
+        bail!(
+            "Gateway proxy refuses connections to local or appliance-owned address {}",
+            resolved_ip
+        );
+    }
     let target_addr = SocketAddr::new(std::net::IpAddr::V4(resolved_ip), target_port);
 
     let sock = TcpSocket::new_v4()?;
@@ -415,7 +458,8 @@ async fn handle_privoxy_client(
             if matches!(
                 kl.as_str(),
                 "connection" | "proxy-connection" | "proxy-authorization" | "x-forwarded-for" | "via"
-            ) {
+            ) || kl.starts_with("x-nfty-")
+            {
                 continue;
             }
         }

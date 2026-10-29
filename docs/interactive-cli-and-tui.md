@@ -383,7 +383,7 @@ Running `watch` inside the CLI (or `nfty watch` directly from your shell) launch
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ nfty v0.6.0 — Kernel-Native L4 Load Balancer               Uptime: 14d 06:22 │
+│ nfty v0.8.0 — Kernel-Native L4 Load Balancer               Uptime: 14d 06:22 │
 │ VIPs: 2 | Services: 4 | Backends: 7 UP / 1 DRAIN / 0 DOWN | Active Flows: 84 │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │   VIP / Service         Mode   Balance       Backend            State    RTT │

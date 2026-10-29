@@ -2975,18 +2975,112 @@ fn handle_rollback(args: &[&str], shared: &SharedState) -> Result<()> {
     Ok(())
 }
 
+fn normalize_and_validate_config_path(
+    requested: Option<&str>,
+    default_path: &std::path::Path,
+) -> Result<(std::path::PathBuf, bool)> {
+    let default_norm = canonicalize_with_parent(default_path);
+    let Some(raw_arg) = requested else {
+        return Ok((default_path.to_path_buf(), true));
+    };
+    let trimmed = raw_arg.trim();
+    if trimmed.is_empty() {
+        return Ok((default_path.to_path_buf(), true));
+    }
+    let candidate = std::path::PathBuf::from(trimmed);
+    if candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("Config file path cannot contain '..' traversal components");
+    }
+    let resolved = if candidate.is_relative() {
+        default_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(&candidate)
+    } else {
+        candidate
+    };
+    let norm = canonicalize_with_parent(&resolved);
+    let file_name = norm
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if file_name.is_empty()
+        || matches!(
+            file_name.to_ascii_lowercase().as_str(),
+            "auth.json"
+                | "nfty-auth.json"
+                | "hosts.json"
+                | "cloudflare.json"
+                | "default_gw"
+                | "ssh_host_ed25519_key"
+                | "init"
+                | "nfty"
+        )
+        || file_name.ends_with(".json")
+        || file_name.ends_with(".pub")
+        || file_name.ends_with(".key")
+        || file_name.ends_with(".token")
+    {
+        bail!(
+            "Refusing to read or write protected file '{}' as an Nftyfile",
+            norm.display()
+        );
+    }
+    let allowed_dir = default_norm
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/data"));
+    let in_allowed_dir = norm.starts_with(allowed_dir)
+        || norm.starts_with("/data")
+        || norm.starts_with("/etc/nfty");
+    if !in_allowed_dir {
+        bail!(
+            "Config path '{}' must reside within {} or /data",
+            norm.display(),
+            allowed_dir.display()
+        );
+    }
+    let is_active_config = norm == default_norm;
+    Ok((norm, is_active_config))
+}
+
+fn canonicalize_with_parent(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let mut cleaned = std::path::PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            other => cleaned.push(other.as_os_str()),
+        }
+    }
+    if let (Some(parent), Some(name)) = (cleaned.parent(), cleaned.file_name()) {
+        let base = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(canon_parent) = std::fs::canonicalize(base) {
+            return canon_parent.join(name);
+        }
+    }
+    cleaned
+}
+
 fn handle_save(args: &[&str], shared: &SharedState) -> Result<()> {
     let mut st = shared.write().unwrap();
-    let path = args
-        .first()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| st.config_path.clone());
+    let (path, is_active_config) =
+        normalize_and_validate_config_path(args.first().copied(), &st.config_path)?;
     let content = st.candidate.format_nftyfile();
-    if st.pending_confirm.is_some() && path == st.config_path {
+    if st.pending_confirm.is_some() && is_active_config {
         bail!("Confirm or roll back the pending trial before saving the active configuration");
     }
     crate::unikernel::write_atomic(&path, content.as_bytes())?;
-    if path == st.config_path {
+    if is_active_config {
         st.last_disk_nftyfile = content;
     }
     println!(
@@ -3000,14 +3094,14 @@ fn handle_save(args: &[&str], shared: &SharedState) -> Result<()> {
 fn handle_load(args: &[&str], shared: &SharedState) -> Result<()> {
     let path = {
         let st = shared.read().unwrap();
-        args.first()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| st.config_path.clone())
+        let (path, _) =
+            normalize_and_validate_config_path(args.first().copied(), &st.config_path)?;
+        path
     };
     let raw = fs::read_to_string(&path)
-        .with_context(|| format!("Could not read {}", path.display()))?;
+        .with_context(|| "Could not read requested configuration file")?;
     let cfg = parse_nftyfile(&raw)
-        .with_context(|| format!("Parse error in {}", path.display()))?;
+        .with_context(|| "Requested file is not a valid Nftyfile")?;
     let mut st = shared.write().unwrap();
     st.candidate = cfg;
     st.sync_runtime_entries();

@@ -28,9 +28,17 @@ DEBIAN_POOL="https://deb.debian.org/debian/pool/main"
 fetch_cached() {
     local name="$1"
     local url="$2"
+    local expected_sha="${3:-}"
     if [[ ! -s "$CACHE_DIR/$name" ]]; then
         echo "  -> Downloading $name..."
         curl -fSL "$url" -o "$CACHE_DIR/$name.tmp"
+        if [[ -n "$expected_sha" ]]; then
+            echo "$expected_sha  $CACHE_DIR/$name.tmp" | sha256sum -c - >/dev/null
+        elif [[ "$name" == *.apk ]]; then
+            gzip -t "$CACHE_DIR/$name.tmp"
+        elif [[ "$name" == *.deb ]]; then
+            head -c 8 "$CACHE_DIR/$name.tmp" | grep -q '!<arch>'
+        fi
         mv "$CACHE_DIR/$name.tmp" "$CACHE_DIR/$name"
     fi
 }
@@ -98,11 +106,12 @@ SHIM_HELPERS_DEB="shim-helpers-amd64-signed_1+16.1+2~deb13u1_amd64.deb"
 GRUB_SIGNED_DEB="grub-efi-amd64-signed_1+2.12+9+deb13u2_amd64.deb"
 SIGNED_KERNEL_DEB="linux-image-6.12.107+deb13-amd64_6.12.107-1_amd64.deb"
 
+CLOUDFLARED_VERSION="2025.2.1"
 fetch_cached "$SHIM_DEB" "$DEBIAN_POOL/s/shim-signed/$SHIM_DEB"
 fetch_cached "$SHIM_HELPERS_DEB" "$DEBIAN_POOL/s/shim-helpers-amd64-signed/$SHIM_HELPERS_DEB"
 fetch_cached "$GRUB_SIGNED_DEB" "$DEBIAN_POOL/g/grub-efi-amd64-signed/$GRUB_SIGNED_DEB"
 fetch_cached "$SIGNED_KERNEL_DEB" "$DEBIAN_POOL/l/linux-signed-amd64/$SIGNED_KERNEL_DEB"
-fetch_cached "cloudflared-linux-amd64" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+fetch_cached "cloudflared-linux-amd64" "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
 
 echo "==> [3/6] Assembling x86_64 Unikernel rootfs & signed kernel modules (PID-1 = /bin/nfty)..."
 rm -rf "$STAGE_DIR" "$WORK_DIR"
@@ -198,7 +207,7 @@ properties:
   architecture: x86_64
   description: nfty Static Rust Appliance Container
   os: nfty-unikernel
-  release: 0.6.0
+  release: 0.8.0
 EOF
 tar -czf "$ROOT_DIR/dist/lxd-container/lxd.tar.gz" -C "$WORK_DIR/meta-ct" metadata.yaml
 tar -czf "$ROOT_DIR/dist/lxd-container/rootfs.tar.gz" -C "$STAGE_DIR" .
@@ -455,7 +464,7 @@ properties:
   architecture: x86_64
   description: nfty Rust Unikernel L4 Load Balancer (with 128MB persistent /data partition)
   os: nfty-unikernel
-  release: 0.6.0
+  release: 0.8.0
 EOF
     tar -czf "$ROOT_DIR/dist/lxd-vm/lxd.tar.gz" -C "$WORK_DIR/meta-vm" metadata.yaml
 fi

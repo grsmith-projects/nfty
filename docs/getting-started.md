@@ -333,12 +333,12 @@ nfty>
 
 #### How `/data/auth.json` Persists Credentials
 
-Credentials are stored in `/data/auth.json` with `0600` permissions using a salted SHA-256 digest (`nfty-salt-v1:`):
+Credentials are stored in `/data/auth.json` with `0600` permissions using a per-password random 128-bit salt and 60,000-round iterated SHA-256 digest (`nfty-pbkdf-v2$<salt>$<digest>`):
 
 ```json
 {
   "username": "nfty",
-  "password_sha256": "a94c8fe5ccb19ba61c4c0873d391e987982fbbd3...",
+  "password_sha256": "nfty-pbkdf-v2$8f4c12a091b3e7f1c20944a1d782301b$a94c8fe5ccb19ba61c4c0873d391e987982fbbd3...",
   "must_change_password": false
 }
 ```

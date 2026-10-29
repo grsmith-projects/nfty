@@ -1,23 +1,18 @@
-use crate::ast::{Backend, BalanceStrategy, Proto};
 use crate::state::{AppState, SharedState};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::copy_bidirectional;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use std::time::Duration;
 
 fn sys_mount(source: &str, target: &str, fstype: &str, flags: libc::c_ulong) -> bool {
     let Ok(src_c) = CString::new(source) else {
@@ -702,9 +697,10 @@ fn send_controller_request(bind: &str, method: &str, path: &str, body: &str) -> 
         .with_context(|| format!("Failed to connect to controller {}", addr))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
+    let ipc_token = read_or_create_ipc_token();
     let req = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nX-Nfty-Internal-IPC: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        method, path, addr, body.len(), body
+        "{} {} HTTP/1.1\r\nHost: {}\r\nX-Nfty-Internal-IPC: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        method, path, addr, ipc_token, body.len(), body
     );
     stream.write_all(req.as_bytes())?;
     let mut status_line = String::new();
@@ -713,6 +709,57 @@ fn send_controller_request(bind: &str, method: &str, path: &str, body: &str) -> 
         anyhow::bail!("Controller rejected request: {}", status_line.trim());
     }
     Ok(())
+}
+
+static PROCESS_IPC_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn ipc_token_file_path() -> PathBuf {
+    if unsafe { libc::geteuid() == 0 } && Path::new("/run").is_dir() {
+        PathBuf::from("/run/nfty-ipc.token")
+    } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(xdg).join("nfty-ipc.token")
+    } else {
+        let uid = unsafe { libc::geteuid() };
+        PathBuf::from(format!("/tmp/nfty-ipc-{}.token", uid))
+    }
+}
+
+fn generate_random_hex_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+pub fn read_or_create_ipc_token() -> String {
+    let path = ipc_token_file_path();
+    if let Ok(raw) = fs::read_to_string(&path) {
+        let tok = raw.trim().to_string();
+        if tok.len() >= 32 {
+            let _ = PROCESS_IPC_TOKEN.set(tok.clone());
+            return tok;
+        }
+    }
+    PROCESS_IPC_TOKEN
+        .get_or_init(|| {
+            let tok = generate_random_hex_token();
+            let _ = write_atomic(&path, format!("{}\n", tok).as_bytes());
+            tok
+        })
+        .clone()
+}
+
+pub fn verify_ipc_token(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
+    if trimmed.len() < 32 {
+        return false;
+    }
+    let expected = read_or_create_ipc_token();
+    crate::ssh::constant_time_eq(trimmed.as_bytes(), expected.as_bytes())
 }
 
 fn notify_controller(shared: &SharedState) -> Result<()> {
@@ -868,209 +915,4 @@ pub fn persist_and_notify_controller(shared: &SharedState) -> Result<()> {
         .context("Configuration was applied locally but could not be persisted")?;
     notify_controller(shared)
         .context("Configuration was applied and saved, but controller synchronization failed")
-}
-
-/// Spawns the native Rust L4 Load-Balancer Dataplane for Unikernel / Standalone Userspace mode.
-pub fn spawn_unikernel_dataplane(shared: SharedState) {
-    tokio::spawn(async move {
-        let mut active_listeners: HashMap<(String, Option<Ipv4Addr>, u16, Proto), tokio::task::JoinHandle<()>> = HashMap::new();
-
-        loop {
-            let services_snapshot = {
-                let st = shared.read().unwrap();
-                st.active_config().services.clone()
-            };
-
-            active_listeners.retain(|(k, lip, port, proto), handle| {
-                let keep = !handle.is_finished() && services_snapshot.get(k).map(|svc| {
-                    let is_local_loopback =
-                        svc.backends.is_empty() || svc.backends.iter().all(|b| b.ip.is_loopback());
-                    let is_unleased_dhcp =
-                        svc.listen_ip.is_none() && svc.vip.as_ref().map(|v| v.dhcp).unwrap_or(false);
-                    matches!(svc.proto, Proto::Tcp | Proto::Both)
-                        && !is_local_loopback
-                        && !is_unleased_dhcp
-                        && svc.port != 22
-                        && svc.listen_ip == *lip
-                        && svc.port == *port
-                        && svc.proto == *proto
-                }).unwrap_or(false);
-                if !keep {
-                    handle.abort();
-                }
-                keep
-            });
-
-            for (key, svc) in services_snapshot {
-                let is_local_loopback =
-                    svc.backends.is_empty() || svc.backends.iter().all(|b| b.ip.is_loopback());
-                let is_unleased_dhcp =
-                    svc.listen_ip.is_none() && svc.vip.as_ref().map(|v| v.dhcp).unwrap_or(false);
-                let listener_key = (key.clone(), svc.listen_ip, svc.port, svc.proto);
-                if matches!(svc.proto, Proto::Tcp | Proto::Both)
-                    && !is_local_loopback
-                    && !is_unleased_dhcp
-                    && svc.port != 22
-                    && !active_listeners.contains_key(&listener_key)
-                {
-                    let st_clone = shared.clone();
-                    let svc_key = key.clone();
-                    let bind_ip = svc.listen_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
-                    let bind_addr = SocketAddr::new(IpAddr::V4(bind_ip), svc.port);
-
-                    let handle = tokio::spawn(async move {
-                        let listener = match TcpListener::bind(bind_addr).await {
-                            Ok(listener) => listener,
-                            Err(e) => {
-                                eprintln!("nfty: userspace listener {} failed: {}", bind_addr, e);
-                                return;
-                            }
-                        };
-                        let rr_counter = Arc::new(AtomicUsize::new(0));
-                        let rate_buckets: Arc<Mutex<HashMap<Ipv4Addr, (Instant, u32)>>> =
-                            Arc::new(Mutex::new(HashMap::new()));
-
-                        while let Ok((mut client_stream, peer_addr)) = listener.accept().await {
-                            let client_ip = match peer_addr.ip() {
-                                IpAddr::V4(ip4) => ip4,
-                                IpAddr::V6(_) => continue,
-                            };
-
-                            let selection = {
-                                let st = st_clone.read().unwrap();
-                                let cfg = st.active_config();
-                                let Some(cur_svc) = cfg.services.get(&svc_key) else {
-                                    continue;
-                                };
-
-                                if !st.is_ip_allowed(
-                                    client_ip,
-                                    &cur_svc.allow,
-                                    &cfg.global_allow,
-                                ) {
-                                    None
-                                } else {
-                                    let active = st.active_backends_for_service(&cur_svc.backends);
-                                    let chosen = select_weighted_backend(
-                                        &active,
-                                        cur_svc.balance,
-                                        client_ip,
-                                        &rr_counter,
-                                    );
-                                    chosen.map(|b| (b.clone(), cur_svc.limit.clone(), cur_svc.auth.clone(), cur_svc.display_name()))
-                                }
-                            };
-
-                            let Some((target_backend, rate_limit, auth_rules, svc_label)) = selection else {
-                                continue;
-                            };
-
-                            if let Some(lim) = rate_limit {
-                                let mut buckets = rate_buckets.lock().await;
-                                let window = match lim.unit {
-                                    crate::ast::RateUnit::Second => Duration::from_secs(1),
-                                    crate::ast::RateUnit::Minute => Duration::from_secs(60),
-                                };
-                                if buckets.len() > 4096 {
-                                    buckets.retain(|_, (ts, _)| ts.elapsed() < window);
-                                }
-                                let max_allowed = lim.rate + lim.burst.unwrap_or(0);
-                                let bucket_key = if lim.per_ip {
-                                    client_ip
-                                } else {
-                                    Ipv4Addr::UNSPECIFIED
-                                };
-                                let entry = buckets
-                                    .entry(bucket_key)
-                                    .or_insert_with(|| (Instant::now(), 0));
-                                if entry.0.elapsed() >= window {
-                                    *entry = (Instant::now(), 1);
-                                } else {
-                                    entry.1 += 1;
-                                    if entry.1 > max_allowed {
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            let st_for_conn = st_clone.clone();
-                            tokio::spawn(async move {
-                                let mut initial_buf = Vec::new();
-                                if !auth_rules.is_empty() {
-                                    use tokio::io::AsyncWriteExt;
-                                    let Ok(peek_buf) = crate::features::read_http_headers(
-                                        &mut client_stream, Duration::from_secs(5),
-                                    ).await else {
-                                        return;
-                                    };
-                                    if !crate::features::check_http_basic_auth(&peek_buf, &auth_rules) {
-                                        let resp = format!(
-                                            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"nfty ({})\"\r\nContent-Type: text/plain\r\nContent-Length: 26\r\nConnection: close\r\n\r\n401 Authentication Needed\n",
-                                            svc_label
-                                        );
-                                        let _ = client_stream.write_all(resp.as_bytes()).await;
-                                        return;
-                                    }
-                                    initial_buf = crate::features::sanitize_authenticated_http_request(&peek_buf);
-                                }
-
-                                let target_addr = SocketAddr::new(
-                                    IpAddr::V4(target_backend.ip),
-                                    target_backend.port,
-                                );
-                                if let Ok(mut upstream) = TcpStream::connect(target_addr).await {
-                                    if !initial_buf.is_empty() {
-                                        use tokio::io::AsyncWriteExt;
-                                        if upstream.write_all(&initial_buf).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                    if let Ok((from_client, from_server)) =
-                                        copy_bidirectional(&mut client_stream, &mut upstream).await
-                                    {
-                                        let mut st = st_for_conn.write().unwrap();
-                                        let rt = st
-                                            .runtime
-                                            .entry(target_backend.endpoint())
-                                            .or_default();
-                                        rt.packets += 2;
-                                        rt.bytes += (initial_buf.len() as u64) + from_client + from_server;
-                                    }
-                                }
-                            });
-                        }
-                    });
-                    active_listeners.insert(listener_key, handle);
-                }
-            }
-
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
-}
-
-fn select_weighted_backend<'a>(
-    active: &[&'a Backend],
-    strategy: BalanceStrategy,
-    client_ip: Ipv4Addr,
-    rr_counter: &AtomicUsize,
-) -> Option<&'a Backend> {
-    if active.is_empty() {
-        return None;
-    }
-    let mut slots: Vec<&'a Backend> = Vec::new();
-    for b in active {
-        for _ in 0..b.weight.max(1) {
-            slots.push(*b);
-        }
-    }
-    let idx = match strategy {
-        BalanceStrategy::RoundRobin => rr_counter.fetch_add(1, Ordering::Relaxed) % slots.len(),
-        BalanceStrategy::Sticky => {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            client_ip.hash(&mut hasher);
-            (hasher.finish() as usize) % slots.len()
-        }
-    };
-    slots.get(idx).copied()
 }

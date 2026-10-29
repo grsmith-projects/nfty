@@ -1247,7 +1247,7 @@ vip 192.168.1.4 {
         crate::api::authenticate_api_request_with_context(
             shared,
             peer.is_loopback(),
-            false,
+            peer.is_loopback(),
             None,
             Some(peer),
             Some(port),
@@ -1635,5 +1635,98 @@ gateway 192.168.1.10 {
 
         let reparsed = parse_nftyfile(&formatted).expect("round-trip parse");
         assert_eq!(reparsed.format_nftyfile(), formatted);
+    }
+
+    #[tokio::test]
+    async fn test_security_review_hardening_regressions() {
+        // 1. Loopback without valid IPC token is subject to the listener IP allow-list
+        let shared = shared_from("vip 192.168.1.4 {\n    web:8000 {\n        allow 192.168.1.0/24\n    }\n}\n");
+        assert_eq!(
+            crate::api::authenticate_api_request_with_context(
+                &shared,
+                true,
+                false,
+                None,
+                Some(Ipv4Addr::LOCALHOST),
+                Some(8000),
+            )
+            .unwrap_err()
+            .0,
+            403
+        );
+        assert!(!crate::unikernel::verify_ipc_token("1"));
+        let real_tok = crate::unikernel::read_or_create_ipc_token();
+        assert!(crate::unikernel::verify_ipc_token(&real_tok));
+
+        // 2. Gateway allow emits nfty:gw-policy-drop for ssh:22 and web:8000
+        let gw_cfg = parse_nftyfile(
+            "gateway 192.168.1.10 {\n    allow 192.168.1.0/24\n    ssh:22\n    web:8000\n}\n",
+        )
+        .unwrap();
+        let gw_nft = compile_nft_ruleset(&gw_cfg, None);
+        assert!(gw_nft.contains("nfty:gw-policy-drop=192.168.1.10:22"));
+        assert!(gw_nft.contains("nfty:gw-policy-drop=192.168.1.10:8000"));
+
+        // 3. cloudflare-dns on web:/api: control listeners is rejected
+        let cf_web = parse_nftyfile(
+            "vip 192.168.1.4 {\n    web:8000 {\n        allow 192.168.1.0/24\n        cloudflare-dns nfty.example.com\n    }\n}\n",
+        )
+        .unwrap();
+        assert!(cf_web
+            .control_allow_list_errors()
+            .iter()
+            .any(|e| e.contains("cloudflare-dns cannot be used on a web:/api: control listener")));
+
+        // 4. Gateway proxy destination filter blocks loopback, link-local, and appliance IPs
+        assert!(crate::features::is_forbidden_proxy_destination(
+            &shared,
+            Ipv4Addr::new(127, 0, 0, 1)
+        ));
+        assert!(crate::features::is_forbidden_proxy_destination(
+            &shared,
+            Ipv4Addr::new(169, 254, 1, 1)
+        ));
+        assert!(crate::features::is_forbidden_proxy_destination(
+            &shared,
+            Ipv4Addr::new(192, 168, 1, 4)
+        ));
+        assert!(!crate::features::is_forbidden_proxy_destination(
+            &shared,
+            Ipv4Addr::new(1, 1, 1, 1)
+        ));
+
+        // 5. Host / Origin authority validation blocks DNS rebinding domains
+        let st = shared.read().unwrap();
+        assert!(st
+            .active_config()
+            .is_trusted_control_authority("192.168.1.4:8000", &st.resolved_hosts));
+        assert!(st
+            .active_config()
+            .is_trusted_control_authority("nfty.local:8000", &st.resolved_hosts));
+        assert!(!st
+            .active_config()
+            .is_trusted_control_authority("evil.attacker.example:8000", &st.resolved_hosts));
+        drop(st);
+
+        // 6. /api/v1/cli blocks custom save/load paths and interactive ssh key commands
+        for blocked_cmd in [
+            r#"{"command":"save /data/auth.json"}"#,
+            r#"{"command":"load /etc/passwd"}"#,
+            r#"{"command":"ssh paste workstation"}"#,
+            r#"{"command":"ssh add workstation"}"#,
+            r#"{"command":"ssh vi workstation"}"#,
+        ] {
+            let (status, _) =
+                crate::api::route_api_request("POST", "/api/v1/cli", blocked_cmd, &shared).await;
+            assert_eq!(status, 400, "expected 400 for {blocked_cmd}");
+        }
+
+        // 7. Iterated salted PBKDF-v2 password hashing and legacy v1 verification
+        let h1 = crate::ssh::hash_password("hunter2");
+        let h2 = crate::ssh::hash_password("hunter2");
+        assert!(h1.starts_with("nfty-pbkdf-v2$"));
+        assert_ne!(h1, h2, "random salt should produce distinct hashes");
+        assert!(crate::ssh::verify_password_hash("hunter2", &h1));
+        assert!(!crate::ssh::verify_password_hash("wrong", &h1));
     }
 }

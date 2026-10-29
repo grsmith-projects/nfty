@@ -80,10 +80,45 @@ pub struct AuthLoginRequest {
     pub key: Option<String>,
 }
 
-fn current_session_token() -> String {
-    let auth = crate::ssh::load_auth_config();
-    let short = auth.password_sha256.chars().take(32).collect::<String>();
-    format!("nfty_session_{}", short)
+const SESSION_TTL_SECS: u64 = 12 * 3600;
+
+static ACTIVE_SESSIONS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+fn session_store() -> &'static std::sync::Mutex<HashMap<String, std::time::Instant>> {
+    ACTIVE_SESSIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn issue_session_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    let token = format!("nfty_session_{}", hex);
+    let now = std::time::Instant::now();
+    if let Ok(mut map) = session_store().lock() {
+        map.retain(|_, created| now.duration_since(*created).as_secs() < SESSION_TTL_SECS);
+        map.insert(token.clone(), now);
+    }
+    token
+}
+
+fn verify_session_token(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
+    if !trimmed.starts_with("nfty_session_") || trimmed.len() < 45 {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    let Ok(mut map) = session_store().lock() else {
+        return false;
+    };
+    map.retain(|_, created| now.duration_since(*created).as_secs() < SESSION_TTL_SECS);
+    map.keys()
+        .any(|tok| crate::ssh::constant_time_eq(tok.as_bytes(), trimmed.as_bytes()))
 }
 
 fn verify_appliance_credential(candidate: &str) -> bool {
@@ -91,16 +126,16 @@ fn verify_appliance_credential(candidate: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    if trimmed == current_session_token() {
+    if verify_session_token(trimmed) {
         return true;
     }
     if let Some((user, pass)) = trimmed.split_once(':') {
-        if crate::ssh::verify_login(user.trim(), pass) {
+        if crate::ssh::verify_http_login(user.trim(), pass) {
             return true;
         }
     }
     let auth = crate::ssh::load_auth_config();
-    crate::ssh::verify_login(&auth.username, trimmed)
+    crate::ssh::verify_http_login(&auth.username, trimmed)
 }
 
 #[derive(Debug, Serialize)]
@@ -193,7 +228,7 @@ fn extract_api_key_from_request(header_part: &str, query: &str) -> (Option<Strin
         let name_lower = name.trim().to_ascii_lowercase();
         let val_trimmed = val.trim();
         match name_lower.as_str() {
-            "x-nfty-internal-ipc" if val_trimmed == "1" => {
+            "x-nfty-internal-ipc" if crate::unikernel::verify_ipc_token(val_trimmed) => {
                 is_internal_ipc = true;
             }
             "x-api-key" | "x-nfty-key" => {
@@ -329,7 +364,7 @@ fn decode_path_component(encoded: &str) -> Result<String> {
     Ok(String::from_utf8(decoded)?)
 }
 
-/// Remote clients must first pass the listener's IP allow-list; loopback clients (local CLI/IPC) skip it.
+/// Remote clients (and loopback requests without the root-only IPC token) must pass the listener's IP allow-list.
 pub fn authenticate_api_request_with_context(
     shared: &SharedState,
     peer_is_loopback: bool,
@@ -344,13 +379,9 @@ pub fn authenticate_api_request_with_context(
 
     let st = shared.read().unwrap();
     let cfg = st.active_config();
-    let remote_access = if peer_is_loopback {
-        None
-    } else {
-        match cfg.control_access(peer_ip, local_port) {
-            ControlAccess::Denied(message) => return Err((403, message)),
-            access => Some(access),
-        }
+    let remote_access = match cfg.control_access(peer_ip, local_port) {
+        ControlAccess::Denied(message) => return Err((403, message)),
+        access => Some(access),
     };
 
     if let Some(key_str) = candidate_key {
@@ -562,13 +593,111 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
     let full_path = parts[1];
     let (path, query) = full_path.split_once('?').unwrap_or((full_path, ""));
 
+    let (candidate_key, is_internal_ipc) = extract_api_key_from_request(header_part, query);
+    let trusted_ipc = peer_is_loopback && is_internal_ipc;
+
+    if !trusted_ipc {
+        let mut host_hdr: Option<&str> = None;
+        let mut origin_hdr: Option<&str> = None;
+        let mut sec_fetch_site: Option<&str> = None;
+        let mut content_type: Option<&str> = None;
+        for line in header_part.lines().skip(1) {
+            if let Some((k, v)) = line.split_once(':') {
+                let kl = k.trim().to_ascii_lowercase();
+                let vt = v.trim();
+                match kl.as_str() {
+                    "host" => host_hdr = Some(vt),
+                    "origin" => origin_hdr = Some(vt),
+                    "sec-fetch-site" => sec_fetch_site = Some(vt),
+                    "content-type" => content_type = Some(vt),
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(sfs) = sec_fetch_site {
+            if sfs.eq_ignore_ascii_case("cross-site") {
+                send_json(
+                    &mut stream,
+                    403,
+                    &json!({"ok": false, "error": "Forbidden: cross-site browser requests are not permitted"}),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
+        let (host_ok, orig_ok) = {
+            let st = shared.read().unwrap();
+            let cfg = st.active_config();
+            let h_ok = host_hdr
+                .map(|h| cfg.is_trusted_control_authority(h, &st.resolved_hosts))
+                .unwrap_or(true);
+            let o_ok = origin_hdr
+                .map(|orig| {
+                    let orig_auth = orig
+                        .strip_prefix("http://")
+                        .or_else(|| orig.strip_prefix("https://"))
+                        .unwrap_or("");
+                    !orig_auth.is_empty()
+                        && cfg.is_trusted_control_authority(orig_auth, &st.resolved_hosts)
+                        && host_hdr
+                            .map(|h| {
+                                let h_host = h.split(':').next().unwrap_or(h);
+                                let o_host = orig_auth.split(':').next().unwrap_or(orig_auth);
+                                h_host.eq_ignore_ascii_case(o_host)
+                            })
+                            .unwrap_or(true)
+                })
+                .unwrap_or(true);
+            (h_ok, o_ok)
+        };
+        if !host_ok {
+            send_json(
+                &mut stream,
+                403,
+                &json!({"ok": false, "error": "Forbidden: untrusted Host header (DNS rebinding protection)"}),
+            )
+            .await?;
+            return Ok(());
+        }
+        if !orig_ok {
+            send_json(
+                &mut stream,
+                403,
+                &json!({"ok": false, "error": "Forbidden: cross-origin requests are not permitted"}),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if matches!(method.as_str(), "POST" | "PUT" | "DELETE")
+            && (origin_hdr.is_some() || sec_fetch_site.is_some())
+            && !body_part.trim().is_empty()
+            && !(method == "PUT" && path == "/api/v1/config")
+        {
+            let is_json = content_type
+                .map(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
+                .unwrap_or(false);
+            if !is_json {
+                send_json(
+                    &mut stream,
+                    400,
+                    &json!({"ok": false, "error": "Content-Type: application/json is required for state-changing requests"}),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
     if method == "OPTIONS" {
-        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, X-API-Key, X-Nfty-Key, Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, X-API-Key, X-Nfty-Key, Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         stream.write_all(resp.as_bytes()).await?;
         return Ok(());
     }
 
-    if !peer_is_loopback {
+    if !trusted_ipc {
         let access = {
             let st = shared.read().unwrap();
             st.active_config().control_access(peer_ip, local_port)
@@ -620,7 +749,7 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
                         Some(port) if cfg.control_listeners().iter().any(|listener| listener.port == port) => {
                             cfg.verify_api_key_for_port(trimmed, port)
                         }
-                        _ if peer_is_loopback => cfg.verify_api_key(trimmed),
+                        _ if trusted_ipc => cfg.verify_api_key(trimmed),
                         _ => None,
                     }
                 };
@@ -644,7 +773,7 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
                         200,
                         &json!({
                             "ok": true,
-                            "token": current_session_token(),
+                            "token": issue_session_token(),
                             "scope": "rw",
                             "mode": "appliance_login",
                         }),
@@ -663,13 +792,13 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
         }
         let user = req.username.as_deref().unwrap_or("nfty").trim();
         let pass = req.password.as_deref().unwrap_or("");
-        if crate::ssh::verify_login(user, pass) {
+        if crate::ssh::verify_http_login(user, pass) {
             send_json(
                 &mut stream,
                 200,
                 &json!({
                     "ok": true,
-                    "token": current_session_token(),
+                    "token": issue_session_token(),
                     "scope": "rw",
                     "username": user,
                     "mode": "appliance_login",
@@ -680,14 +809,13 @@ async fn handle_http_connection(mut stream: TcpStream, shared: SharedState) -> R
             send_json(
                 &mut stream,
                 401,
-                &json!({"ok": false, "error": "Invalid username or password"}),
+                &json!({"ok": false, "error": "Invalid username or password (or initial password must be rotated via SSH first)"}),
             )
             .await?;
         }
         return Ok(());
     }
 
-    let (candidate_key, is_internal_ipc) = extract_api_key_from_request(header_part, query);
     let scope = match authenticate_api_request_with_context(
         &shared,
         peer_is_loopback,
@@ -1199,12 +1327,60 @@ pub async fn route_api_request_scoped(
                 if !trimmed.is_empty() {
                     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
                     let command = tokens[0].to_ascii_lowercase();
+                    if matches!(command.as_str(), "save" | "load") && tokens.len() > 1 {
+                        return (
+                            400,
+                            json!({"ok": false, "error": "Custom file paths for save/load are not permitted over the HTTP API"}),
+                        );
+                    }
                     let interactive_wg = matches!(command.as_str(), "wg" | "wireguard")
                         && tokens.get(1).map(|sub| {
                             !matches!(sub.to_ascii_lowercase().as_str(),
                                 "list" | "ls" | "show" | "cat" | "view" | "rm" | "del" | "delete" | "remove")
                         }).unwrap_or(false);
-                    if matches!(command.as_str(), "password" | "passwd" | "watch") || interactive_wg {
+                    let interactive_ssh = {
+                        let cur_lvl = level.lock().unwrap().clone();
+                        let is_ssh_key_cmd = matches!(
+                            command.as_str(),
+                            "ssh-key" | "ssh-keys" | "authorized-keys"
+                        ) || (command == "ssh"
+                            && (matches!(
+                                cur_lvl,
+                                ShellLevel::Operational
+                                    | ShellLevel::ConfigRoot
+                                    | ShellLevel::GlobalAllow
+                                    | ShellLevel::Dns
+                            ) || (tokens.len() >= 2
+                                && !tokens[1].starts_with(':')
+                                && tokens[1].parse::<u16>().is_err())));
+                        if is_ssh_key_cmd {
+                            let args = if tokens.len() >= 2
+                                && matches!(
+                                    tokens[1].to_ascii_lowercase().as_str(),
+                                    "key" | "keys"
+                                )
+                            {
+                                &tokens[2..]
+                            } else {
+                                &tokens[1..]
+                            };
+                            match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                                None | Some("list") | Some("ls") | Some("status") => false,
+                                Some("show") | Some("cat") | Some("view") | Some("rm")
+                                | Some("del") | Some("delete") | Some("remove") => args.len() < 2,
+                                Some("add") | Some("new") | Some("create") | Some("set") => {
+                                    args.len() < 3
+                                }
+                                _ => true,
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if matches!(command.as_str(), "password" | "passwd" | "watch")
+                        || interactive_wg
+                        || interactive_ssh
+                    {
                         return (400, json!({"ok": false, "error": "Interactive commands are not available over the API"}));
                     }
                     match handle_line_checked(trimmed, &level, shared).await {
@@ -1354,7 +1530,7 @@ async fn send_json(
     };
     let body = serde_json::to_string_pretty(val)?;
     let resp = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
         status,
         status_text,
         body.len(),

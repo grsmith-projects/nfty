@@ -3285,6 +3285,8 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
                 opt_key.as_str(),
                 "dhcp-script"
                     | "dhcp-luascript"
+                    | "script-arp"
+                    | "script-on-renewal"
                     | "conf-file"
                     | "conf-dir"
                     | "servers-file"
@@ -3293,6 +3295,17 @@ pub fn apply_dns_directive(dns: &mut DnsConfig, stmt: &str) -> Result<()> {
                     | "user"
                     | "group"
                     | "pid-file"
+                    | "log-facility"
+                    | "dhcp-leasefile"
+                    | "dhcp-hostsfile"
+                    | "dhcp-optsfile"
+                    | "dhcp-hostsdir"
+                    | "dhcp-optsdir"
+                    | "enable-tftp"
+                    | "tftp-root"
+                    | "dhcp-boot"
+                    | "pxe-prompt"
+                    | "pxe-service"
             ) {
                 bail!(
                     "Raw dnsmasq option '{}' is restricted for security reasons",

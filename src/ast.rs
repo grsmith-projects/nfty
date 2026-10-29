@@ -1550,9 +1550,18 @@ impl Config {
     }
 
     /// Reasons this config must not be applied: every `web:`/`api:` listener needs an IP allow-list
-    /// (its own or global), and its own allow entries must be addresses rather than hostnames.
+    /// (its own or global), its own allow entries must be addresses rather than hostnames, and
+    /// `cloudflare-dns` is disallowed on control listeners.
     pub fn control_allow_list_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
+        for svc in self.services.values() {
+            if svc.is_local_api_or_web() && svc.cloudflare.is_some() {
+                errors.push(format!(
+                    "service '{}': cloudflare-dns cannot be used on a web:/api: control listener because tunnel traffic originates from loopback and bypasses IP allow-lists",
+                    svc.key
+                ));
+            }
+        }
         for listener in self.control_listeners() {
             for entry in listener.allow {
                 if parse_ip_allow_entry(entry).is_none() {
@@ -1570,6 +1579,61 @@ impl Config {
             }
         }
         errors
+    }
+
+    /// Validates that an HTTP `Host` or `Origin` authority refers to this appliance rather than
+    /// an external domain attempting a DNS-rebinding or cross-origin attack.
+    pub fn is_trusted_control_authority(
+        &self,
+        authority: &str,
+        resolved_hosts: &BTreeMap<String, Vec<Ipv4Addr>>,
+    ) -> bool {
+        let trimmed = authority.trim().trim_end_matches('.');
+        if trimmed.is_empty() {
+            return false;
+        }
+        let host = if let Some(rest) = trimmed.strip_prefix('[') {
+            rest.split(']').next().unwrap_or("")
+        } else {
+            trimmed.split(':').next().unwrap_or(trimmed)
+        }
+        .trim()
+        .to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        if host == "localhost"
+            || host == "::1"
+            || host.parse::<Ipv4Addr>().is_ok()
+            || host.ends_with(".local")
+            || host.ends_with(".lan")
+        {
+            return true;
+        }
+        if let Some(dom) = self.dns.as_ref().and_then(|d| d.domain.as_deref()) {
+            let dom_lower = dom.trim().trim_start_matches('.').to_ascii_lowercase();
+            if !dom_lower.is_empty()
+                && (host == dom_lower || host.ends_with(&format!(".{}", dom_lower)))
+            {
+                return true;
+            }
+        }
+        if self.vips.keys().any(|k| k.eq_ignore_ascii_case(&host))
+            || self.gateways.keys().any(|k| k.eq_ignore_ascii_case(&host))
+            || resolved_hosts.keys().any(|k| k.eq_ignore_ascii_case(&host))
+        {
+            return true;
+        }
+        for svc in self.services.values() {
+            if let Some(h) = &svc.hostname {
+                let h_clean = h.trim().trim_end_matches('.').to_ascii_lowercase();
+                let h_short = h_clean.strip_suffix(".local").unwrap_or(&h_clean);
+                if host == h_clean || host == h_short {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn control_allow_list_warnings(&self) -> Vec<String> {

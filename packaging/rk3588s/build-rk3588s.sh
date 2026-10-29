@@ -31,9 +31,15 @@ ALPINE_EDGE="https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64"
 fetch_cached() {
     local name="$1"
     local url="$2"
+    local expected_sha="${3:-}"
     if [[ ! -s "$CACHE_DIR/$name" ]]; then
         echo "  -> Downloading $name..."
         curl -fSL "$url" -o "$CACHE_DIR/$name.tmp"
+        if [[ -n "$expected_sha" ]]; then
+            echo "$expected_sha  $CACHE_DIR/$name.tmp" | sha256sum -c - >/dev/null
+        elif [[ "$name" == *.apk ]]; then
+            gzip -t "$CACHE_DIR/$name.tmp"
+        fi
         mv "$CACHE_DIR/$name.tmp" "$CACHE_DIR/$name"
     fi
 }

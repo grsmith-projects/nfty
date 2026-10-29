@@ -640,6 +640,7 @@ pub fn start_or_ensure_cloudflared_daemon(tunnel_token: &str) -> Result<u32> {
     let log_err = log_file.try_clone()?;
 
     let mut child = Command::new(bin)
+        .env("TUNNEL_TOKEN", tunnel_token.trim())
         .args([
             "tunnel",
             "--metrics",
@@ -650,8 +651,6 @@ pub fn start_or_ensure_cloudflared_daemon(tunnel_token: &str) -> Result<u32> {
             "--protocol",
             "http2",
             "run",
-            "--token",
-            tunnel_token.trim(),
         ])
         .stdout(std::process::Stdio::from(log_file))
         .stderr(std::process::Stdio::from(log_err))

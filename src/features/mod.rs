@@ -18,7 +18,7 @@ pub use dns::{
     reconcile_dnsmasq, run_dns_lookup_test, run_dns_supervisor, stop_dnsmasq_daemon,
 };
 pub use flows::{print_flows_table, read_active_flows, ConntrackFlow};
-pub use gateway_proxy::run_gateway_proxy_supervisor;
+pub use gateway_proxy::{is_forbidden_proxy_destination, run_gateway_proxy_supervisor};
 pub use scanner::{
     print_scan_table, scan_network_services_async, COMMON_CONTAINER_HOSTNAMES, SCAN_PORTS,
 };
@@ -102,10 +102,6 @@ pub fn spawn_advanced_feature_daemons(shared: SharedState) {
     tokio::spawn(async move {
         dns::run_dns_supervisor(shared_dns).await;
     });
-}
-
-pub fn spawn_mdns_and_sni_router(shared: SharedState) {
-    spawn_advanced_feature_daemons(shared);
 }
 
 /// Lists non-loopback IPv4 addresses bound to `eth0`, VLAN subinterfaces (`eth0.*`), and macvlan interfaces (`mv-*`).

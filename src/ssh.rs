@@ -40,11 +40,65 @@ impl Default for AuthConfig {
     }
 }
 
-pub fn hash_password(pw: &str) -> String {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn hash_password_v1(pw: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"nfty-salt-v1:");
     hasher.update(pw.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn hash_password_pbkdf_v2_with_salt(pw: &str, salt_hex: &str) -> String {
+    let mut digest = {
+        let mut h = Sha256::new();
+        h.update(b"nfty-pbkdf-v2:");
+        h.update(salt_hex.as_bytes());
+        h.update(b":");
+        h.update(pw.as_bytes());
+        h.finalize()
+    };
+    for round in 0..60_000u32 {
+        let mut h = Sha256::new();
+        h.update(digest);
+        h.update(salt_hex.as_bytes());
+        h.update(round.to_le_bytes());
+        h.update(pw.as_bytes());
+        digest = h.finalize();
+    }
+    format!("nfty-pbkdf-v2${}${:x}", salt_hex, digest)
+}
+
+pub fn hash_password(pw: &str) -> String {
+    use rand::RngCore;
+    let mut salt = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt);
+    let mut salt_hex = String::with_capacity(32);
+    for b in salt {
+        salt_hex.push_str(&format!("{:02x}", b));
+    }
+    hash_password_pbkdf_v2_with_salt(pw, &salt_hex)
+}
+
+pub fn verify_password_hash(password: &str, stored_hash: &str) -> bool {
+    if let Some(rest) = stored_hash.strip_prefix("nfty-pbkdf-v2$") {
+        if let Some((salt_hex, _)) = rest.split_once('$') {
+            let expected = hash_password_pbkdf_v2_with_salt(password, salt_hex);
+            return constant_time_eq(stored_hash.as_bytes(), expected.as_bytes());
+        }
+        return false;
+    }
+    let v1 = hash_password_v1(password);
+    constant_time_eq(stored_hash.as_bytes(), v1.as_bytes())
 }
 
 fn auth_path() -> &'static str {
@@ -93,7 +147,19 @@ pub fn save_auth_config(cfg: &AuthConfig) -> Result<()> {
 
 pub fn verify_login(user: &str, password: &str) -> bool {
     let cfg = load_auth_config();
-    cfg.username == user && cfg.password_sha256 == hash_password(password)
+    constant_time_eq(cfg.username.as_bytes(), user.as_bytes())
+        && verify_password_hash(password, &cfg.password_sha256)
+}
+
+/// Verifies appliance credentials for HTTP / Basic Auth endpoints.
+/// Refuses login while the initial default password (`must_change_password: true`) has not been rotated.
+pub fn verify_http_login(user: &str, password: &str) -> bool {
+    let cfg = load_auth_config();
+    if cfg.must_change_password {
+        return false;
+    }
+    constant_time_eq(cfg.username.as_bytes(), user.as_bytes())
+        && verify_password_hash(password, &cfg.password_sha256)
 }
 
 /// Reads a password from stdin with terminal echo disabled
@@ -400,6 +466,9 @@ pub fn edit_ssh_key_interactive(
     name: &str,
     preferred_editor: Option<&str>,
 ) -> Result<Option<String>> {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) != 1 } {
+        bail!("Interactive SSH key editor requires a terminal; provide the public key inline: ssh add <name> <pubkey>");
+    }
     let dir = ssh_keys_dir();
     let _ = fs::create_dir_all(&dir);
     let filename = normalize_ssh_key_filename(name)?;
@@ -478,6 +547,9 @@ pub fn edit_ssh_key_interactive(
 
 /// Interactive paste mode for an OpenSSH public key (`ssh paste <name>` / `ssh key paste <name>`).
 pub fn paste_ssh_key_interactive(name: &str) -> Result<Option<String>> {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) != 1 } {
+        bail!("Interactive SSH key paste requires a terminal; provide the public key inline: ssh add <name> <pubkey>");
+    }
     let filename = normalize_ssh_key_filename(name)?;
     let dir = ssh_keys_dir();
     println!(
@@ -764,6 +836,7 @@ struct NftySshServer {
     pending_dims: Arc<Mutex<HashMap<ChannelId, (u32, u32)>>>,
     config_path: PathBuf,
     api_bind: Option<String>,
+    peer_addr: Option<std::net::SocketAddr>,
     used_publickey: bool,
 }
 
@@ -774,15 +847,75 @@ impl NftySshServer {
             pending_dims: Arc::new(Mutex::new(HashMap::new())),
             config_path,
             api_bind,
+            peer_addr: None,
             used_publickey: false,
         }
+    }
+
+    fn is_peer_allowed_by_config(&self) -> bool {
+        let Some(addr) = self.peer_addr else {
+            return true;
+        };
+        if addr.ip().is_loopback() {
+            return true;
+        }
+        let peer_ip = match addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => v4,
+                None => return false,
+            },
+        };
+        let Ok(raw) = fs::read_to_string(&self.config_path) else {
+            return true;
+        };
+        let Ok(cfg) = crate::parser::parse_nftyfile(&raw) else {
+            return true;
+        };
+        let st = crate::state::AppState::new(cfg.clone(), self.config_path.clone());
+        let mut any_ssh_configured = false;
+        let mut any_restricted_ssh = false;
+        for svc in cfg.services.values() {
+            if svc.is_local_ssh() {
+                any_ssh_configured = true;
+                if svc.allow.is_empty() && cfg.global_allow.is_empty() {
+                    return true;
+                }
+                any_restricted_ssh = true;
+                if st.is_ip_allowed(peer_ip, &svc.allow, &cfg.global_allow) {
+                    return true;
+                }
+            }
+        }
+        for gw in cfg.gateways.values() {
+            if gw
+                .services
+                .iter()
+                .any(|gs| gs.kind == crate::ast::GatewayServiceKind::Ssh)
+            {
+                any_ssh_configured = true;
+                if gw.allow.is_empty() && cfg.global_allow.is_empty() {
+                    return true;
+                }
+                any_restricted_ssh = true;
+                if st.is_ip_allowed(peer_ip, &gw.allow, &cfg.global_allow) {
+                    return true;
+                }
+            }
+        }
+        if !any_ssh_configured {
+            return true;
+        }
+        !any_restricted_ssh
     }
 }
 
 impl russh::server::Server for NftySshServer {
     type Handler = Self;
-    fn new_client(&mut self, _peer_addr: Option<std::net::SocketAddr>) -> Self {
-        Self::new(self.config_path.clone(), self.api_bind.clone())
+    fn new_client(&mut self, peer_addr: Option<std::net::SocketAddr>) -> Self {
+        let mut handler = Self::new(self.config_path.clone(), self.api_bind.clone());
+        handler.peer_addr = peer_addr;
+        handler
     }
 }
 
@@ -790,6 +923,9 @@ impl Handler for NftySshServer {
     type Error = anyhow::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        if !self.is_peer_allowed_by_config() {
+            return Ok(Auth::reject());
+        }
         if verify_login(user, password) {
             self.used_publickey = false;
             Ok(Auth::Accept)
@@ -803,6 +939,9 @@ impl Handler for NftySshServer {
         _user: &str,
         offer: PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
+        if !self.is_peer_allowed_by_config() {
+            return Ok(Auth::reject());
+        }
         if verify_ssh_public_key(offer.public_key).is_some() {
             Ok(Auth::Accept)
         } else {
@@ -815,6 +954,9 @@ impl Handler for NftySshServer {
         _user: &str,
         key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
+        if !self.is_peer_allowed_by_config() {
+            return Ok(Auth::reject());
+        }
         if verify_ssh_public_key(key.public_key).is_some() {
             self.used_publickey = true;
             Ok(Auth::Accept)
