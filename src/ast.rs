@@ -375,6 +375,9 @@ impl Service {
         if self.is_local_api() {
             return format!("api:{}", self.port);
         }
+        if self.is_local_proxy() {
+            return format!("proxy:{}", self.port);
+        }
         if let Some(n) = &self.name {
             return n.clone();
         }
@@ -451,6 +454,15 @@ impl Service {
             .unwrap_or(false)
     }
 
+    pub fn is_local_proxy(&self) -> bool {
+        self.name
+            .as_deref()
+            .map(|n| {
+                n.eq_ignore_ascii_case("proxy") || n.to_ascii_lowercase().starts_with("proxy:")
+            })
+            .unwrap_or(false)
+    }
+
     pub fn is_local_api_or_web(&self) -> bool {
         self.is_local_api() || self.is_local_web()
     }
@@ -458,6 +470,7 @@ impl Service {
     pub fn format_in_vip(&self) -> String {
         let is_web = self.is_local_web();
         let is_api = self.is_local_api();
+        let is_proxy = self.is_local_proxy();
         let is_ssh = self.is_local_ssh();
         let is_dns = self.is_local_dns();
         let single_simple_backend =
@@ -472,6 +485,8 @@ impl Service {
             (format!("web:{}", self.port), true, true)
         } else if is_api {
             (format!("api:{}", self.port), true, true)
+        } else if is_proxy {
+            (format!("proxy:{}", self.port), true, true)
         } else if is_ssh {
             (format!("ssh:{}", self.port), true, true)
         } else if is_dns {
@@ -502,6 +517,7 @@ impl Service {
             && !is_ssh
             && !is_api
             && !is_web
+            && !is_proxy
             && self.proto != Proto::Tcp
             && !hdr.contains('/')
         {
@@ -595,7 +611,7 @@ impl Service {
             }
             out.push_str("    }\n");
         }
-        if !self.backends.is_empty() && !self.is_local_api_or_web() {
+        if !self.backends.is_empty() && !self.is_local_api_or_web() && !self.is_local_proxy() {
             out.push_str("    to {\n");
             for b in &self.backends {
                 out.push_str(&format!("        {}\n", b));
@@ -672,6 +688,7 @@ impl fmt::Display for WgTunnel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GatewayServiceKind {
+    Proxy,
     Ssh,
     Dns,
     Api,
@@ -681,6 +698,7 @@ pub enum GatewayServiceKind {
 impl fmt::Display for GatewayServiceKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            GatewayServiceKind::Proxy => write!(f, "proxy"),
             GatewayServiceKind::Ssh => write!(f, "ssh"),
             GatewayServiceKind::Dns => write!(f, "dns"),
             GatewayServiceKind::Api => write!(f, "api"),

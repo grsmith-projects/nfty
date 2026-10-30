@@ -1286,6 +1286,23 @@ fn handle_vip_level_command(
             );
             return Ok(());
         }
+        "proxy" => {
+            let spec = if tokens.len() >= 2 && tokens[1].parse::<u16>().is_ok() {
+                format!("proxy:{}", tokens[1])
+            } else {
+                "proxy:8118".to_string()
+            };
+            let mut st = shared.write().unwrap();
+            let _ = create_or_find_vip_service_by_key(&mut st.candidate, vip_key, &spec)?;
+            st.sync_runtime_entries();
+            println!(
+                "  {} [vip {}] + {}",
+                "✔".green().bold(),
+                vip_key.cyan(),
+                spec.bold()
+            );
+            return Ok(());
+        }
         "api" | "web" => {
             let prefix = if first_lower == "web" { "web" } else { "api" };
             let default_port = if first_lower == "web" { 8000 } else { 9090 };
@@ -1337,7 +1354,10 @@ fn handle_vip_level_command(
             }
             return Ok(());
         }
-        _ if first_lower.starts_with("ssh:") || first_lower.starts_with("dns:") => {
+        _ if first_lower.starts_with("ssh:")
+            || first_lower.starts_with("dns:")
+            || first_lower.starts_with("proxy:") =>
+        {
             let mut st = shared.write().unwrap();
             let _ = create_or_find_vip_service_by_key(&mut st.candidate, vip_key, tokens[0])?;
             st.sync_runtime_entries();
@@ -2014,8 +2034,10 @@ fn handle_gateway_api_command(
             | "forward"
             | "ssh"
             | "dns"
+            | "proxy"
     ) || first_lower.starts_with("ssh:")
         || first_lower.starts_with("dns:")
+        || first_lower.starts_with("proxy:")
     {
         *level.lock().unwrap() = ShellLevel::Gateway(gw_key.to_string());
         return handle_gateway_level_command(gw_key, trimmed, level, shared);
@@ -2098,9 +2120,11 @@ fn handle_gateway_wg_ingress_command(
             | "ssh"
             | "api"
             | "web"
+            | "proxy"
     ) || first_lower.starts_with("ssh:")
         || first_lower.starts_with("api:")
         || first_lower.starts_with("web:")
+        || first_lower.starts_with("proxy:")
     {
         *level.lock().unwrap() = ShellLevel::Gateway(gw_key.to_string());
         return handle_gateway_level_command(gw_key, trimmed, level, shared);
@@ -2411,7 +2435,7 @@ fn handle_gateway_service_command(
 
     if matches!(first_lower.as_str(), "no") {
         if tokens.len() < 2 {
-            bail!("Usage: no <ssh|dns|api|web>");
+            bail!("Usage: no <ssh|dns|api|web|proxy>");
         }
         let gs = parse_gateway_service(tokens[1])?;
         let before = gw.services.len();

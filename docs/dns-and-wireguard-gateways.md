@@ -345,6 +345,12 @@ When `forward 51413 to 192.168.20.15:51413` is configured on a gateway:
 2. **Masquerade**: `chain postrouting` masquerades the forwarded packet to the `nfty` appliance's LAN address so `192.168.20.15` always sends replies back to `nfty` regardless of its own default gateway.
 3. **Symmetric Tunnel Return**: When `192.168.20.15` replies, `chain mangle_prerouting` restores `meta mark set ct mark` (`0x101`), ensuring return packets are routed back out the exact same WireGuard tunnel (`wg0`) they entered on.
 
+### Native Privoxy-Compatible HTTP/HTTPS Forward Proxy (`proxy:8118`)
+
+Both `gateway` and `vip` blocks support `proxy:8118` (or `proxy:<port>`), which binds `nfty`'s built-in Rust HTTP/HTTPS (`CONNECT`) forward proxy to that IP:
+- **Gateway Tunnel Routing & Killswitch**: On a `gateway` with WireGuard `tunnels { ... }`, outbound TCP sockets and UDP DNS `A`-record queries are bound to the selected healthy tunnel (`SO_MARK` + `SO_BINDTODEVICE`). If `killswitch on` is set and all tunnels are down, the proxy refuses outbound connections (`502 Bad Gateway — Gateway killswitch active`).
+- **Privacy Header Sanitization & Adblock Enforcement**: Strips `Proxy-Connection`, `Proxy-Authorization`, `X-Forwarded-For`, `X-Real-IP`, `Client-IP`, `From`, and `Via`, enforces `dns { block ... }` domain blocklists (`403 Forbidden`), and blocks SSRF to loopback, link-local, or appliance-owned VIP/Gateway IPs.
+
 ---
 
 ## 10. Cloudflare DNS & Zero-Trust Tunnels (`cloudflare-dns` & `cloudflare-auth`)

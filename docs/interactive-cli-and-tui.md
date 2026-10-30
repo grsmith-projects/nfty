@@ -195,6 +195,7 @@ nfty(config)#
 nfty(config)# gateway 192.168.1.10/24@eth0
 nfty(config-gateway:192.168.1.10)# balance round-robin
 nfty(config-gateway:192.168.1.10)# killswitch on
+nfty(config-gateway:192.168.1.10)# proxy:8118
 nfty(config-gateway:192.168.1.10)# forward 51413 to 192.168.20.15:51413
 nfty(config-gateway:192.168.1.10)# tunnels
 nfty(config-gateway:192.168.1.10-tunnels)# wg-mullvad-us1.conf weight 2

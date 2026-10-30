@@ -485,6 +485,18 @@ pub fn compile_nft_ruleset(config: &Config, state: Option<&AppState>) -> String 
                             ));
                         }
                     }
+                    GatewayServiceKind::Proxy => {
+                        out.push_str(&format!(
+                            "\n        # --- gateway {} service proxy:{} ---\n        ip daddr {} tcp dport {}{} counter accept comment \"nfty:gw-svc={}:proxy:{}\"\n",
+                            gw.key, gs.port, gw.listen_ip, gs.port, gw_allow_guard, gw.key, gs.port
+                        ));
+                        if has_gw_allow {
+                            out.push_str(&format!(
+                                "        ip daddr {} tcp dport {} counter drop comment \"nfty:gw-policy-drop={}:{}\"\n",
+                                gw.listen_ip, gs.port, gw.key, gs.port
+                            ));
+                        }
+                    }
                     GatewayServiceKind::Dns => {}
                 }
             }
@@ -827,7 +839,12 @@ fn emit_service_prerouting(
 
     if slots.len() == 1 {
         let b = slots[0];
-        if b.ip.is_loopback() {
+        if svc.is_local_proxy() {
+            out.push_str(&format!(
+                "        {}{}{} counter accept comment \"nfty:svc={}\"\n",
+                match_prefix, allow_guard, rate_guard, svc.key
+            ));
+        } else if b.ip.is_loopback() {
             let redirect_port = if svc.is_local_api_or_web() {
                 svc.port
             } else {

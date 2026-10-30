@@ -302,12 +302,13 @@ pub fn parse_vip_header(tokens: &[&str]) -> Result<(String, Option<Ipv4Addr>, Vi
                 if idx + 1 < tokens.len()
                     && !matches!(
                         tokens[idx + 1].to_ascii_lowercase().as_str(),
-                        "vlan" | "service" | "ssh" | "dns" | "api" | "web"
+                        "vlan" | "service" | "ssh" | "dns" | "api" | "web" | "proxy"
                     )
                     && !tokens[idx + 1].starts_with("ssh:")
                     && !tokens[idx + 1].starts_with("dns:")
                     && !tokens[idx + 1].starts_with("api:")
                     && !tokens[idx + 1].starts_with("web:")
+                    && !tokens[idx + 1].starts_with("proxy:")
                 {
                     idx += 1;
                     let (base, vid) = split_iface_and_vlan(tokens[idx]);
@@ -976,13 +977,14 @@ pub fn parse_nftyfile(input: &str) -> Result<Config> {
                                 s.vip = Some(updated.clone());
                             }
                             ParseContext::Vip(vip_key)
-                        } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api" | "web")
+                        } else if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api" | "web" | "proxy")
                             || tokens[0].to_ascii_lowercase().starts_with("ssh:")
                             || tokens[0].to_ascii_lowercase().starts_with("dns:")
                             || tokens[0].to_ascii_lowercase().starts_with("api:")
                             || tokens[0].to_ascii_lowercase().starts_with("web:")
+                            || tokens[0].to_ascii_lowercase().starts_with("proxy:")
                         {
-                            let spec_owned: String = if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api" | "web")
+                            let spec_owned: String = if matches!(tokens[0].to_ascii_lowercase().as_str(), "ssh" | "dns" | "api" | "web" | "proxy")
                                 && tokens.len() >= 2
                                 && tokens[1].parse::<u16>().is_ok()
                             {
@@ -1623,6 +1625,36 @@ pub fn create_or_find_vip_service_by_key(
         config.services.insert(key.clone(), svc);
         return Ok(key);
     }
+    if lower == "proxy" || lower.starts_with("proxy:") {
+        let port = if let Some((_, p_str)) = lower.split_once(':') {
+            p_str
+                .parse::<u16>()
+                .with_context(|| format!("Invalid proxy port '{}'", p_str))?
+        } else {
+            8118
+        };
+        if port == 0 {
+            bail!("Proxy port cannot be 0");
+        }
+        let key = format!("{}:{}", vip_key, port);
+        if let Some(existing) = config.services.get_mut(&key) {
+            existing.name = Some(format!("proxy:{}", port));
+            return Ok(key);
+        }
+        let mut svc = Service::new(key.clone(), vip_ip_opt, port, Proto::Tcp);
+        svc.vip_id = Some(vip_key.to_string());
+        svc.name = Some(format!("proxy:{}", port));
+        svc.vip = vip_cfg;
+        svc.backends.push(Backend {
+            host: None,
+            ip: Ipv4Addr::new(127, 0, 0, 1),
+            port,
+            weight: 1,
+            backup: false,
+        });
+        config.services.insert(key.clone(), svc);
+        return Ok(key);
+    }
 
     // 3. Plain port or port/proto (e.g. `80`, `:80`, `53/udp`)
     let port_candidate = clean_spec.split('/').next().unwrap_or(clean_spec);
@@ -2118,7 +2150,7 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
         }
         "service" => {
             if tokens.len() < 2 {
-                bail!("Expected gateway service (e.g. 'ssh:22', 'dns:53', 'api:9090', or 'web:8000')");
+                bail!("Expected gateway service (e.g. 'ssh:22', 'dns:53', 'api:9090', 'web:8000', or 'proxy:8118')");
             }
             for tok in &tokens[1..] {
                 let gs = parse_gateway_service(tok)?;
@@ -2213,7 +2245,7 @@ pub fn apply_gateway_directive(gw: &mut Gateway, stmt: &str) -> Result<()> {
                 }
             } else {
                 bail!(
-                    "Unknown gateway directive '{}'. Valid directives: vip, hostname, balance, killswitch, check, forward, wg-in:51820, ssh:22, dns:53, api:9090, web:8000, key, tunnel, allow, no",
+                    "Unknown gateway directive '{}'. Valid directives: vip, hostname, balance, killswitch, check, forward, wg-in:51820, ssh:22, dns:53, api:9090, web:8000, proxy:8118, key, tunnel, allow, no",
                     other
                 );
             }
@@ -2354,8 +2386,17 @@ pub fn parse_gateway_service(raw: &str) -> Result<GatewayService> {
     };
 
     match name_part {
-        "privoxy" | "http-proxy" | "proxy" | "socks5" | "socks" => bail!(
-            "Gateway service '{}' was removed in nfty 0.9.0; run a dedicated proxy behind the gateway instead",
+        "proxy" => Ok(GatewayService::new(
+            GatewayServiceKind::Proxy,
+            port_opt.unwrap_or(8118),
+        )),
+        "privoxy" | "http-proxy" => bail!(
+            "Gateway service '{}' was renamed to 'proxy:{}'",
+            name_part,
+            port_opt.unwrap_or(8118)
+        ),
+        "socks5" | "socks" => bail!(
+            "Gateway service '{}' is not supported; use 'proxy:8118' (HTTP/HTTPS forward proxy) instead",
             name_part
         ),
         "ssh" => Ok(GatewayService::new(
@@ -2375,7 +2416,7 @@ pub fn parse_gateway_service(raw: &str) -> Result<GatewayService> {
             port_opt.unwrap_or(8000),
         )),
         other => bail!(
-            "Unknown gateway service '{}' (valid gateway services: 'ssh[:22]', 'dns[:53]', 'api[:9090]', 'web[:8000]')",
+            "Unknown gateway service '{}' (valid gateway services: 'ssh[:22]', 'dns[:53]', 'api[:9090]', 'web[:8000]', 'proxy[:8118]')",
             other
         ),
     }

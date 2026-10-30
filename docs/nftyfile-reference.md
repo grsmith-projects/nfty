@@ -181,6 +181,7 @@ vip 10.20.0.10/24 {
 | `dns` / `dns:<port>` | Optional port (default `53`) | Binds the supervised `dnsmasq` DNS server (UDP + TCP) to this VIP. |
 | `web` / `web:<port>` | Optional port (default `8000`) | Exposes the interactive JavaScript Web Console (`GET /`) and backing REST API on this VIP. Supports `allow { ... }` CIDR/hostname ACLs so allowed LAN clients get immediate access in the browser. |
 | `api` / `api:<port>` | Optional port (default `9090`) | Exposes the headless HTTP/JSON Control API on this VIP (`GET /` is disabled). Can be opened as a block (`api:8080 { ... }`) to configure scoped `ro` / `rw` API keys. |
+| `proxy` / `proxy:<port>` | Optional port (default `8118`) | Binds the native Privoxy-compatible HTTP/HTTPS (`CONNECT`) forward proxy on this VIP with privacy header sanitization, `dns.blocks` adblock enforcement, and SSRF protection. |
 | `<port[/proto]> to <host:port>` | Listen port & target backend | Maps external `<port>` (e.g., `80`, `443`, `53/udp`) on this VIP to `<host_or_ip>:<port>`. Can be followed by `{ ... }` for service options. |
 | `<host_or_ip>:<port>` | Target backend endpoint | Forwards the matching port on this VIP directly to `<host_or_ip>:<port>` (e.g., `plex:32400` or `192.168.20.15:32400`). |
 
@@ -335,6 +336,7 @@ A `gateway` block provisions a Virtual Gateway IP (either a static IPv4 like `ga
 | `ssh:<port>` | `ssh:22` (or `ssh`) | Disabled | Enables the `nfty` SSH shell on the gateway IP. |
 | `dns:<port>` | `dns:53` (or `dns`) | Disabled | Binds `dnsmasq` to the gateway IP and routes upstream DNS queries through the gateway's healthy WireGuard tunnel (`server=<ip>@wgN`). |
 | `api:<port>` | `api:9090 { key ... }` | Disabled | Enables the HTTP/JSON Control API on the gateway IP with optional scoped `ro`/`rw` keys. |
+| `proxy:<port>` | `proxy:8118` (or `proxy`) | Disabled | Binds the native Privoxy-compatible HTTP/HTTPS (`CONNECT`) forward proxy to the gateway IP, routing outbound connections and UDP DNS resolution (`SO_MARK` + `SO_BINDTODEVICE`) over the gateway's healthy WireGuard tunnels with `killswitch` and `dns.blocks` enforcement. |
 | `forward` | `forward <port[/proto]> to <ip_or_host:port>` | None | Forwards inbound traffic arriving on the gateway's `wg*` interfaces on `<port>` (`tcp`, `udp`, or `both`) to a LAN backend, pinning the connection's `ct mark` so reply traffic returns out the exact same WireGuard tunnel. |
 | `wg-in:<port>` | `wg-in:51820 { ... }` | Disabled | Configures a WireGuard Ingress VPN server (`ig0..igN`) on UDP `<port>` (default `51820`) for remote client dial-in or full-tunnel exit chaining. |
 | `allow` | `allow { <entry>... }` | None | Restricts which LAN client IPs/hosts are permitted to route through this gateway. |

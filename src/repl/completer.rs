@@ -545,6 +545,7 @@ impl Completer for NftyHelper {
                     "dns:53",
                     "api:9090",
                     "web:8000",
+                    "proxy:8118",
                     "dhcp",
                     "vlan",
                     "interface",
@@ -591,6 +592,7 @@ impl Completer for NftyHelper {
                 list.push("ssh:22".to_string());
                 list.push("api:9090".to_string());
                 list.push("web:8000".to_string());
+                list.push("proxy:8118".to_string());
                 list
             }
             (ShellLevel::Service(_), 0) => vec![
@@ -692,6 +694,7 @@ impl Completer for NftyHelper {
                 "dns:53",
                 "api:9090",
                 "web:8000",
+                "proxy:8118",
                 "key",
                 "forward",
                 "service",
@@ -804,6 +807,7 @@ impl Completer for NftyHelper {
                     "dns".to_string(),
                     "api".to_string(),
                     "web".to_string(),
+                    "proxy".to_string(),
                     "key".to_string(),
                     "forward".to_string(),
                     "killswitch".to_string(),
@@ -832,6 +836,7 @@ impl Completer for NftyHelper {
                 "dns:53",
                 "api:9090",
                 "web:8000",
+                "proxy:8118",
                 "no",
                 "show",
                 "top",

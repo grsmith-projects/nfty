@@ -268,6 +268,10 @@ pub fn print_context_help(level: &ShellLevel) {
                 "web:8000 (or 'web')".yellow()
             );
             println!(
+                "  {:<32} Enable Privoxy-style HTTP/HTTPS forward proxy on this VIP",
+                "proxy:8118 (or 'proxy')".yellow()
+            );
+            println!(
                 "  {:<32} Lease VIP via DHCP + register hostname with UDM DNS",
                 "dhcp [eth0|off]".yellow()
             );
@@ -572,6 +576,10 @@ pub fn print_context_help(level: &ShellLevel) {
                 "api:9090 (or 'api')".yellow()
             );
             println!(
+                "  {:<32} Enable Privoxy-style HTTP/HTTPS proxy routed over tunnels",
+                "proxy:8118 (or 'proxy')".yellow()
+            );
+            println!(
                 "  {:<32} Enable inbound WireGuard VPN server endpoint & manage peers",
                 "wg-in:51820 (or 'wg-in')".yellow()
             );
@@ -605,7 +613,7 @@ pub fn print_context_help(level: &ShellLevel) {
             );
             println!(
                 "  {:<32} Remove a tunnel, service, or directive",
-                "no <ssh|dns|api|web|tunnel <name>|vip|killswitch>".yellow()
+                "no <ssh|dns|api|web|proxy|tunnel <name>|vip|killswitch>".yellow()
             );
             println!("  {:<32} Show this gateway block", "show".yellow());
             println!(
@@ -632,8 +640,12 @@ pub fn print_context_help(level: &ShellLevel) {
                 "api:9090 (or 'api')".yellow()
             );
             println!(
+                "  {:<32} Enable Privoxy-style HTTP/HTTPS proxy on this gateway IP",
+                "proxy:8118 (or 'proxy')".yellow()
+            );
+            println!(
                 "  {:<32} Disable a gateway service",
-                "no <ssh|dns|api|web>".yellow()
+                "no <ssh|dns|api|web|proxy>".yellow()
             );
             println!(
                 "  {:<32} Return to gateway {} prompt",

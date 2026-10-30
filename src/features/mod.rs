@@ -1,6 +1,7 @@
 pub mod cloudflare;
 pub mod dns;
 pub mod flows;
+pub mod gateway_proxy;
 pub mod vhost_mdns;
 pub mod wireguard;
 
@@ -14,6 +15,7 @@ pub use dns::{
     reconcile_dnsmasq, run_dns_lookup_test, run_dns_supervisor, stop_dnsmasq_daemon,
 };
 pub use flows::{print_flows_table, read_active_flows, ConntrackFlow};
+pub use gateway_proxy::{is_forbidden_proxy_destination, run_gateway_proxy_supervisor};
 pub use vhost_mdns::extract_host_or_sni;
 pub use wireguard::{
     apply_wireguard_gateways, build_client_wg_conf, delete_stored_client_peer,
@@ -78,6 +80,11 @@ pub fn spawn_advanced_feature_daemons(shared: SharedState) {
     let shared_cloudflare = shared.clone();
     tokio::spawn(async move {
         cloudflare::run_cloudflare_supervisor(shared_cloudflare).await;
+    });
+
+    let shared_gw_proxies = shared.clone();
+    tokio::spawn(async move {
+        gateway_proxy::run_gateway_proxy_supervisor(shared_gw_proxies).await;
     });
 
     let shared_dns = shared;

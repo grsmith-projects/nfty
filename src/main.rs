@@ -1651,4 +1651,58 @@ gateway 192.168.1.10 {
         assert!(crate::ssh::verify_password_hash("hunter2", &h1));
         assert!(!crate::ssh::verify_password_hash("wrong", &h1));
     }
+
+    #[test]
+    fn test_vip_and_gateway_proxy_directive() {
+        let raw = r#"
+vip 192.168.1.4 {
+    proxy:8118
+}
+gateway 192.168.1.10 {
+    allow 192.168.1.0/24
+    proxy:8118
+}
+"#;
+        let cfg = parse_nftyfile(raw).unwrap();
+        let svc = cfg.services.get("192.168.1.4:8118").expect("vip proxy:8118 service");
+        assert!(svc.is_local_proxy());
+        assert_eq!(svc.display_name(), "proxy:8118");
+
+        let gw = cfg.gateways.get("192.168.1.10").expect("gateway 192.168.1.10");
+        assert!(gw
+            .services
+            .iter()
+            .any(|s| s.kind == crate::ast::GatewayServiceKind::Proxy && s.port == 8118));
+
+        let formatted = cfg.format_nftyfile();
+        assert!(formatted.contains("proxy:8118"));
+        let reparsed = parse_nftyfile(&formatted).unwrap();
+        assert_eq!(cfg, reparsed);
+
+        let nft = compile_nft_ruleset(&cfg, None);
+        assert!(nft.contains("ip daddr 192.168.1.4 tcp dport 8118"));
+        assert!(nft.contains("nfty:gw-svc=192.168.1.10:proxy:8118"));
+        assert!(nft.contains("nfty:gw-policy-drop=192.168.1.10:8118"));
+
+        let shared = Arc::new(RwLock::new(AppState::new(
+            cfg.clone(),
+            PathBuf::from("/tmp/nfty-test-proxy"),
+        )));
+        assert!(crate::features::gateway_proxy::is_forbidden_proxy_destination(
+            &shared,
+            Ipv4Addr::new(127, 0, 0, 1),
+        ));
+        assert!(crate::features::gateway_proxy::is_forbidden_proxy_destination(
+            &shared,
+            Ipv4Addr::new(192, 168, 1, 4),
+        ));
+        assert!(crate::features::gateway_proxy::is_forbidden_proxy_destination(
+            &shared,
+            Ipv4Addr::new(192, 168, 1, 10),
+        ));
+        assert!(!crate::features::gateway_proxy::is_forbidden_proxy_destination(
+            &shared,
+            Ipv4Addr::new(1, 1, 1, 1),
+        ));
+    }
 }

@@ -3,794 +3,1103 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>nfty — L4/L7 Load Balancer, Programmable DNS &amp; WireGuard Gateway Console</title>
+<title>nfty — Network &amp; Service Controller</title>
 <style>
   :root {
-    --bg: #080b12;
-    --panel: #111827;
-    --panel-alt: #1a2335;
-    --panel-hover: #212d42;
-    --border: #2a364b;
-    --text: #f3f4f6;
-    --muted: #9ca3af;
+    --bg: #0b0e14;
+    --bg-elevated: #11161f;
+    --bg-subtle: rgba(255, 255, 255, 0.03);
+    --bg-row-hover: #161d2a;
+    --bg-row-selected: #17233b;
+    --bg-input: #080b10;
+    --bg-code: #070a0f;
+    --btn-hover-bg: #1c2433;
+    --btn-hover-border: #2e3b52;
+    --border: #1e2636;
+    --border-subtle: #161c28;
+    --border-focus: #006fff;
+    --text-strong: #ffffff;
+    --text: #f0f4f8;
+    --text-secondary: #9fb0c7;
+    --text-code: #e2e8f0;
+    --text-nft: #6ee7b7;
+    --muted: #64748b;
+    --unifi-blue: #006fff;
+    --unifi-blue-hover: #1a7fff;
+    --unifi-blue-soft: rgba(0, 111, 255, 0.14);
+    --blue-text: #60a5fa;
     --cyan: #06b6d4;
-    --blue: #3b82f6;
-    --green: #10b981;
-    --red: #ef4444;
-    --amber: #f59e0b;
+    --green: #12b76a;
+    --green-soft: rgba(18, 183, 106, 0.14);
+    --green-text: #34d399;
+    --amber: #f79009;
+    --amber-soft: rgba(247, 144, 9, 0.14);
+    --amber-text: #fbbf24;
+    --red: #f04438;
+    --red-soft: rgba(240, 68, 56, 0.14);
+    --red-text: #f87171;
     --purple: #8b5cf6;
+    --purple-soft: rgba(139, 92, 246, 0.14);
+    --purple-text: #c084fc;
+    --tag-bg: rgba(255, 255, 255, 0.04);
+    --drawer-shadow: -12px 0 36px rgba(0, 0, 0, 0.55);
+    --toast-bg: #161f2e;
+  }
+  [data-theme="light"] {
+    --bg: #f4f6f9;
+    --bg-elevated: #ffffff;
+    --bg-subtle: #f8fafc;
+    --bg-row-hover: #f1f5f9;
+    --bg-row-selected: #e8f1ff;
+    --bg-input: #ffffff;
+    --bg-code: #f8fafc;
+    --btn-hover-bg: #f1f5f9;
+    --btn-hover-border: #cbd5e1;
+    --border: #e2e8f0;
+    --border-subtle: #edf2f7;
+    --border-focus: #006fff;
+    --text-strong: #0f172a;
+    --text: #1e293b;
+    --text-secondary: #475569;
+    --text-code: #0f172a;
+    --text-nft: #047857;
+    --muted: #64748b;
+    --unifi-blue: #006fff;
+    --unifi-blue-hover: #005ce6;
+    --unifi-blue-soft: rgba(0, 111, 255, 0.10);
+    --blue-text: #006fff;
+    --cyan: #0891b2;
+    --green: #059669;
+    --green-soft: rgba(16, 185, 129, 0.12);
+    --green-text: #047857;
+    --amber: #d97706;
+    --amber-soft: rgba(245, 158, 11, 0.14);
+    --amber-text: #b45309;
+    --red: #dc2626;
+    --red-soft: rgba(239, 68, 68, 0.12);
+    --red-text: #b91c1c;
+    --purple: #7c3aed;
+    --purple-soft: rgba(124, 58, 237, 0.12);
+    --purple-text: #6d28d9;
+    --tag-bg: #f1f5f9;
+    --drawer-shadow: -8px 0 28px rgba(15, 23, 42, 0.12);
+    --toast-bg: #ffffff;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     background: var(--bg);
     color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    font-size: 13px;
     line-height: 1.45;
     display: flex;
     height: 100vh;
     overflow: hidden;
+    -webkit-font-smoothing: antialiased;
   }
   code, pre, .mono {
-    font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, ui-monospace, Menlo, monospace;
   }
-  /* Sidebar */
-  .sidebar {
-    width: 245px;
-    background: var(--panel);
+
+  /* Left Navigation Rail (UniFi Style) */
+  .nav-rail {
+    width: 216px;
+    background: var(--bg-elevated);
     border-right: 1px solid var(--border);
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
+    user-select: none;
   }
-  .brand {
-    padding: 18px 20px;
+  .brand-bar {
+    height: 52px;
+    padding: 0 16px;
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
     justify-content: space-between;
   }
-  .brand-title {
+  .brand-logo {
     display: flex;
     align-items: center;
     gap: 10px;
-    font-size: 1.25rem;
-    font-weight: 800;
+    font-weight: 700;
+    font-size: 15px;
     letter-spacing: -0.02em;
+    color: var(--text-strong);
+  }
+  .brand-mark {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: linear-gradient(135deg, #006fff 0%, #06b6d4 100%);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 800;
+    font-size: 13px;
     color: #fff;
+    box-shadow: 0 2px 10px rgba(0, 111, 255, 0.35);
   }
-  .brand-dot {
-    width: 10px; height: 10px; border-radius: 50%;
-    background: var(--cyan);
-    box-shadow: 0 0 10px var(--cyan);
+  .brand-ver {
+    font-size: 11px;
+    color: var(--muted);
+    font-family: monospace;
   }
-  .nav-list {
-    padding: 12px 10px;
+  .nav-items {
+    padding: 10px 8px;
     flex: 1;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 2px;
+  }
+  .nav-section-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    padding: 10px 10px 4px;
   }
   .nav-btn {
     background: transparent;
-    border: 1px solid transparent;
-    color: var(--muted);
+    border: none;
+    color: var(--text-secondary);
     text-align: left;
-    padding: 10px 12px;
-    border-radius: 8px;
-    font-size: 0.87rem;
-    font-weight: 600;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    transition: all 0.12s ease;
+    transition: background 0.12s, color 0.12s;
   }
-  .nav-btn:hover {
-    background: var(--panel-alt);
-    color: var(--text);
-  }
-  .nav-btn.active {
-    background: rgba(6, 182, 212, 0.14);
-    border-color: rgba(6, 182, 212, 0.4);
-    color: var(--cyan);
-  }
-  .nav-count {
-    font-size: 0.72rem;
-    padding: 1px 7px;
-    border-radius: 99px;
-    background: var(--panel-alt);
-    color: var(--muted);
-    font-family: monospace;
-  }
-  .sidebar-footer {
-    padding: 14px;
-    border-top: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    font-size: 0.78rem;
-  }
-  /* Main Layout */
-  .main-wrap {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-  .topbar {
-    height: 60px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    padding: 0 24px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-shrink: 0;
-  }
-  .topbar-left {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-  }
-  .topbar-right {
+  .nav-btn-left {
     display: flex;
     align-items: center;
     gap: 10px;
   }
-  .content {
+  .nav-btn svg {
+    width: 16px;
+    height: 16px;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    fill: none;
+    flex-shrink: 0;
+    opacity: 0.85;
+  }
+  .nav-btn:hover {
+    background: var(--bg-row-hover);
+    color: var(--text-strong);
+  }
+  .nav-btn.active {
+    background: var(--unifi-blue-soft);
+    color: var(--text-strong);
+    font-weight: 600;
+  }
+  .nav-btn.active svg {
+    stroke: var(--unifi-blue);
+    opacity: 1;
+  }
+  .nav-count {
+    font-size: 11px;
+    color: var(--muted);
+    font-family: monospace;
+  }
+  .nav-btn.active .nav-count {
+    color: var(--blue-text);
+  }
+  .nav-footer {
+    padding: 12px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background: var(--bg-subtle);
+  }
+
+  /* Main Area */
+  .workspace {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  /* Top Telemetry & Action Strip */
+  .topbar {
+    height: 52px;
+    background: var(--bg-elevated);
+    border-bottom: 1px solid var(--border);
+    padding: 0 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    gap: 16px;
+  }
+  .telemetry-strip {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    overflow-x: auto;
+  }
+  .telemetry-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .telemetry-label {
+    color: var(--muted);
+  }
+  .telemetry-val {
+    font-weight: 600;
+    color: var(--text);
+    font-family: monospace;
+  }
+  .telemetry-divider {
+    width: 1px;
+    height: 18px;
+    background: var(--border);
+  }
+  .topbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  /* Uncommitted Candidate Banner */
+  .candidate-bar {
+    background: var(--amber-soft);
+    border-bottom: 1px solid rgba(247, 144, 9, 0.35);
+    padding: 8px 20px;
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--amber-text);
+  }
+  .candidate-bar.visible { display: flex; }
+
+  /* Sub-header / View Toolbar */
+  .view-toolbar {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .view-title-group {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .view-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-strong);
+  }
+  .view-subtitle {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .toolbar-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  /* Filter Chips */
+  .chip-group {
+    display: inline-flex;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px;
+    gap: 2px;
+  }
+  .chip {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .chip:hover { color: var(--text-strong); }
+  .chip.active {
+    background: var(--unifi-blue);
+    color: #fff;
+  }
+
+  /* Content Views */
+  .view-container {
     flex: 1;
     overflow-y: auto;
-    padding: 24px;
+    display: flex;
+    flex-direction: column;
   }
-  .tab-pane { display: none; }
-  .tab-pane.active { display: block; }
+  .tab-pane { display: none; flex-direction: column; flex: 1; }
+  .tab-pane.active { display: flex; }
 
-  /* Badges & Pills */
-  .badge {
+  /* High-Density UniFi Tables */
+  .table-wrap {
+    width: 100%;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--bg-elevated);
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 9px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+    vertical-align: middle;
+    color: var(--text);
+  }
+  tbody tr {
+    transition: background 0.08s;
+  }
+  tbody tr:hover {
+    background: var(--bg-row-hover);
+  }
+  tbody tr.clickable {
+    cursor: pointer;
+  }
+  tbody tr.selected {
+    background: var(--bg-row-selected);
+  }
+  .group-row td {
+    background: var(--bg-subtle);
+    font-weight: 600;
+    color: var(--text-secondary);
+    padding: 7px 16px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid var(--border);
+  }
+  .empty-state {
+    padding: 48px 20px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  /* Status Dots & Badges */
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+  .dot-up { background: var(--green); box-shadow: 0 0 6px rgba(18, 183, 106, 0.5); }
+  .dot-down { background: var(--red); box-shadow: 0 0 6px rgba(240, 68, 56, 0.5); }
+  .dot-drain { background: var(--amber); }
+  .dot-muted { background: var(--muted); }
+
+  .status-pill {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 3px 10px;
+    padding: 2px 8px;
     border-radius: 999px;
-    font-size: 0.74rem;
-    font-weight: 700;
-    letter-spacing: 0.02em;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
   }
-  .badge-rw { background: rgba(16, 185, 129, 0.16); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.4); }
-  .badge-ro { background: rgba(6, 182, 212, 0.16); color: var(--cyan); border: 1px solid rgba(6, 182, 212, 0.4); }
-  .badge-warn { background: rgba(245, 158, 11, 0.16); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.45); }
-  .badge-err { background: rgba(239, 68, 68, 0.16); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.45); }
-  .pill {
+  .pill-up { background: var(--green-soft); color: var(--green-text); }
+  .pill-down { background: var(--red-soft); color: var(--red-text); }
+  .pill-drain { background: var(--amber-soft); color: var(--amber-text); }
+  .pill-unknown { background: rgba(100, 116, 139, 0.16); color: var(--text-secondary); }
+  .pill-blue { background: var(--unifi-blue-soft); color: var(--blue-text); }
+  .pill-purple { background: var(--purple-soft); color: var(--purple-text); }
+
+  .tag {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    padding: 2px 9px;
-    border-radius: 999px;
-    font-size: 0.74rem;
-    font-weight: 600;
-  }
-  .pill-up { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.35); }
-  .pill-down { background: rgba(239, 68, 68, 0.15); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.35); }
-  .pill-drain { background: rgba(245, 158, 11, 0.15); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.35); }
-  .pill-unknown { background: rgba(156, 163, 175, 0.15); color: var(--muted); border: 1px solid rgba(156, 163, 175, 0.3); }
-  .tag {
-    display: inline-block;
-    background: var(--panel-alt);
+    gap: 4px;
+    background: var(--tag-bg);
     border: 1px solid var(--border);
-    padding: 2px 7px;
-    border-radius: 5px;
+    padding: 1px 6px;
+    border-radius: 4px;
     font-family: monospace;
-    font-size: 0.76rem;
-    margin: 2px;
-    color: #e5e7eb;
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
   }
 
   /* Buttons & Inputs */
   .btn {
-    background: var(--panel-alt);
+    background: var(--bg-elevated);
     color: var(--text);
     border: 1px solid var(--border);
-    padding: 7px 13px;
-    border-radius: 7px;
-    font-size: 0.82rem;
-    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
     gap: 6px;
     transition: all 0.12s;
+    white-space: nowrap;
   }
-  .btn:hover:not(:disabled) { background: var(--panel-hover); border-color: #4b5563; }
-  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
-  .btn-primary { background: rgba(6, 182, 212, 0.18); border-color: var(--cyan); color: #67e8f9; }
-  .btn-primary:hover:not(:disabled) { background: rgba(6, 182, 212, 0.3); }
-  .btn-success { background: rgba(16, 185, 129, 0.18); border-color: var(--green); color: #6ee7b7; }
-  .btn-success:hover:not(:disabled) { background: rgba(16, 185, 129, 0.3); }
-  .btn-amber { background: rgba(245, 158, 11, 0.18); border-color: var(--amber); color: #fcd34d; }
-  .btn-danger { background: rgba(239, 68, 68, 0.16); border-color: var(--red); color: #fca5a5; }
-  .btn-sm { padding: 4px 9px; font-size: 0.75rem; border-radius: 5px; }
+  .btn:hover:not(:disabled) {
+    background: var(--btn-hover-bg);
+    border-color: var(--btn-hover-border);
+  }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary {
+    background: var(--unifi-blue);
+    border-color: var(--unifi-blue);
+    color: #fff;
+    font-weight: 600;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--unifi-blue-hover);
+    border-color: var(--unifi-blue-hover);
+  }
+  .btn-success {
+    background: var(--green);
+    border-color: var(--green);
+    color: #fff;
+    font-weight: 600;
+  }
+  .btn-success:hover:not(:disabled) { filter: brightness(1.08); }
+  .btn-ghost-danger {
+    background: transparent;
+    border-color: transparent;
+    color: var(--muted);
+  }
+  .btn-ghost-danger:hover:not(:disabled) {
+    background: var(--red-soft);
+    border-color: rgba(240, 68, 56, 0.35);
+    color: var(--red-text);
+  }
+  .btn-amber {
+    background: var(--amber-soft);
+    border-color: rgba(247, 144, 9, 0.4);
+    color: var(--amber-text);
+  }
+  .btn-sm { padding: 4px 8px; font-size: 11px; border-radius: 5px; }
 
   input, select, textarea {
-    background: #0b0f19;
+    background: var(--bg-input);
     color: var(--text);
     border: 1px solid var(--border);
-    border-radius: 7px;
-    padding: 8px 11px;
-    font-size: 0.85rem;
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 12.5px;
     outline: none;
+    transition: border-color 0.12s;
   }
-  input:focus, select:focus, textarea:focus { border-color: var(--cyan); }
+  input:focus, select:focus, textarea:focus {
+    border-color: var(--border-focus);
+  }
+  .search-input {
+    width: 220px;
+    padding-left: 10px;
+  }
 
-  /* Cards & Sections */
-  .cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
-    gap: 14px;
-    margin-bottom: 22px;
+  /* Right-Hand Slide-Over Inspector Drawer (UniFi Property Panel) */
+  .inspector-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.35);
+    z-index: 90;
+    display: none;
   }
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 15px 18px;
+  .inspector-backdrop.open { display: block; }
+  .inspector {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 460px;
+    max-width: 92vw;
+    background: var(--bg-elevated);
+    border-left: 1px solid var(--border);
+    z-index: 95;
+    display: flex;
+    flex-direction: column;
+    transform: translateX(100%);
+    transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: var(--drawer-shadow);
   }
-  .card .label { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
-  .card .val { font-size: 1.75rem; font-weight: 700; margin-top: 4px; font-family: monospace; }
-  .card .sub { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
-
-  .section {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    margin-bottom: 22px;
-    overflow: hidden;
+  .inspector.open {
+    transform: translateX(0);
   }
-  .section-header {
-    padding: 13px 18px;
+  .inspector-header {
+    height: 52px;
+    padding: 0 18px;
     border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+  .inspector-title {
+    font-size: 14px;
     font-weight: 600;
-    font-size: 0.92rem;
+    color: var(--text-strong);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .inspector-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .inspector-footer {
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-subtle);
     display: flex;
     justify-content: space-between;
     align-items: center;
-    background: rgba(255,255,255,0.02);
-    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .prop-group {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 14px;
+  }
+  .prop-group:last-child { border-bottom: none; }
+  .prop-group-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  .prop-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px 0;
+    font-size: 12.5px;
+  }
+  .prop-key { color: var(--text-secondary); }
+  .prop-val { font-weight: 500; color: var(--text); }
+  .form-field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-bottom: 11px;
+  }
+  .form-field label {
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+  .form-field .hint {
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .form-grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
     gap: 10px;
   }
-  .section-body { padding: 18px; }
-  .grid-2 {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
-    gap: 18px;
-  }
-  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-  th, td { padding: 11px 16px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle; }
-  th { color: var(--muted); font-weight: 600; font-size: 0.73rem; text-transform: uppercase; letter-spacing: 0.05em; background: rgba(0,0,0,0.2); }
-  tr:last-child td { border-bottom: none; }
-  tr:hover td { background: rgba(255,255,255,0.015); }
-  .empty { padding: 28px; text-align: center; color: var(--muted); font-size: 0.88rem; }
 
-  /* Topology Graph */
-  .topo-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
-    gap: 14px;
-    padding: 16px;
-  }
-  .topo-vip-card {
-    background: #0b101b;
-    border: 1px solid var(--border);
-    border-radius: 9px;
-    padding: 14px;
-  }
-  .topo-vip-head {
+  /* Sub-navigation tabs inside views */
+  .subnav-bar {
     display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding-bottom: 10px;
-    margin-bottom: 10px;
-    border-bottom: 1px dashed var(--border);
+    gap: 20px;
+    padding: 0 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elevated);
   }
-  .topo-svc-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 7px 10px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    margin-bottom: 6px;
-    font-size: 0.81rem;
+  .subnav-btn {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-secondary);
+    padding: 10px 2px;
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .subnav-btn:hover { color: var(--text-strong); }
+  .subnav-btn.active {
+    color: var(--text-strong);
+    border-bottom-color: var(--unifi-blue);
+    font-weight: 600;
   }
 
-  /* Slide-up CLI Drawer */
+  /* Slide-Up CLI Terminal */
   .cli-drawer {
-    background: #05080f;
-    border-top: 2px solid var(--cyan);
-    height: 290px;
+    background: var(--bg-code);
+    border-top: 1px solid var(--unifi-blue);
+    height: 270px;
     display: none;
     flex-direction: column;
     flex-shrink: 0;
   }
   .cli-drawer.open { display: flex; }
   .cli-header {
-    padding: 8px 18px;
-    background: var(--panel);
+    padding: 6px 16px;
+    background: var(--bg-elevated);
     border-bottom: 1px solid var(--border);
     display: flex;
     justify-content: space-between;
     align-items: center;
-    font-size: 0.82rem;
-    font-weight: 600;
+    font-size: 12px;
   }
   .cli-output {
     flex: 1;
-    padding: 12px 18px;
+    padding: 10px 16px;
     overflow-y: auto;
     font-family: monospace;
-    font-size: 0.82rem;
-    color: #d1d5db;
+    font-size: 12px;
+    color: var(--text-code);
     white-space: pre-wrap;
   }
   .cli-input-row {
     display: flex;
     border-top: 1px solid var(--border);
-    background: #090d16;
+    background: var(--bg-input);
     align-items: center;
-    padding: 6px 14px;
-    gap: 10px;
+    padding: 5px 14px;
+    gap: 8px;
   }
-  .cli-prompt { color: var(--cyan); font-family: monospace; font-weight: 700; font-size: 0.85rem; }
+  .cli-prompt { color: var(--unifi-blue); font-family: monospace; font-weight: 700; font-size: 12px; }
   .cli-input-row input {
     flex: 1;
     border: none;
     background: transparent;
     font-family: monospace;
-    font-size: 0.86rem;
-    padding: 6px 4px;
+    font-size: 12.5px;
+    padding: 5px 2px;
   }
 
-  /* Modal */
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.72);
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
-  }
-  .modal-backdrop.open { display: flex; }
-  .modal {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    width: 100%;
-    max-width: 520px;
-    padding: 22px;
-    box-shadow: 0 20px 50px rgba(0,0,0,0.6);
-  }
-  .modal h3 { font-size: 1.08rem; margin-bottom: 6px; }
-  .modal p { font-size: 0.83rem; color: var(--muted); margin-bottom: 16px; }
-  .form-row { margin-bottom: 13px; display: flex; flex-direction: column; gap: 5px; }
-  .form-row label { font-size: 0.78rem; color: var(--muted); font-weight: 600; }
+  /* Toast */
   .toast {
     position: fixed;
-    bottom: 20px;
-    right: 20px;
-    background: var(--panel-alt);
-    border: 1px solid var(--cyan);
-    color: #fff;
-    padding: 11px 16px;
-    border-radius: 8px;
-    font-size: 0.84rem;
+    bottom: 18px;
+    right: 18px;
+    background: var(--toast-bg);
+    border: 1px solid var(--unifi-blue);
+    color: var(--text-strong);
+    padding: 10px 15px;
+    border-radius: 6px;
+    font-size: 12.5px;
     z-index: 200;
     display: none;
-    box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
   }
 </style>
 </head>
 <body>
 
-<!-- Sidebar Navigation -->
-<aside class="sidebar">
-  <div class="brand">
-    <div class="brand-title">
-      <span class="brand-dot"></span>
+<!-- Left Navigation Rail -->
+<aside class="nav-rail">
+  <div class="brand-bar">
+    <div class="brand-logo">
+      <span class="brand-mark">N</span>
       <span>nfty</span>
     </div>
-    <span class="tag">web console</span>
+    <span class="brand-ver">v0.9</span>
   </div>
-  <div class="nav-list">
-    <button class="nav-btn active" onclick="switchTab('overview', this)">
-      <span>1. Overview &amp; Topology</span>
-      <span class="nav-count" id="nav-cnt-overview">live</span>
+
+  <div class="nav-items">
+    <div class="nav-section-label">Network &amp; Proxies</div>
+    <button class="nav-btn active" id="nav-services" onclick="switchTab('services', this)">
+      <span class="nav-btn-left">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="18" r="2"/></svg>
+        <span>Services &amp; Proxies</span>
+      </span>
+      <span class="nav-count" id="nav-cnt-services">0</span>
     </button>
-    <button class="nav-btn" onclick="switchTab('vips', this)">
-      <span>2. VIPs &amp; Services</span>
+
+    <button class="nav-btn" id="nav-vips" onclick="switchTab('vips', this)">
+      <span class="nav-btn-left">
+        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><circle cx="7" cy="7" r="1"/><circle cx="7" cy="17" r="1"/></svg>
+        <span>Virtual IPs (VIPs)</span>
+      </span>
       <span class="nav-count" id="nav-cnt-vips">0</span>
     </button>
-    <button class="nav-btn" onclick="switchTab('gateways', this)">
-      <span>3. WireGuard Gateways</span>
+
+    <button class="nav-btn" id="nav-gateways" onclick="switchTab('gateways', this)">
+      <span class="nav-btn-left">
+        <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 0v20M2 12h20"/></svg>
+        <span>VPN &amp; Gateways</span>
+      </span>
       <span class="nav-count" id="nav-cnt-gws">0</span>
     </button>
-    <button class="nav-btn" onclick="switchTab('dns', this)">
-      <span>4. Programmable DNS</span>
-      <span class="nav-count" id="nav-cnt-dns">53</span>
+
+    <div class="nav-section-label">Routing &amp; Security</div>
+    <button class="nav-btn" id="nav-dns" onclick="switchTab('dns', this)">
+      <span class="nav-btn-left">
+        <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span>DNS &amp; Policy Routes</span>
+      </span>
+      <span class="nav-count" id="nav-cnt-dns">0</span>
     </button>
-    <button class="nav-btn" onclick="switchTab('firewall', this)">
-      <span>5. Allow-List &amp; CF</span>
+
+    <button class="nav-btn" id="nav-firewall" onclick="switchTab('firewall', this)">
+      <span class="nav-btn-left">
+        <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        <span>Firewall &amp; Access</span>
+      </span>
       <span class="nav-count" id="nav-cnt-allow">0</span>
     </button>
-    <button class="nav-btn" onclick="switchTab('flows', this)">
-      <span>6. Conntrack Flows</span>
+
+    <div class="nav-section-label">Insights &amp; System</div>
+    <button class="nav-btn" id="nav-flows" onclick="switchTab('flows', this)">
+      <span class="nav-btn-left">
+        <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        <span>Traffic Flows</span>
+      </span>
       <span class="nav-count" id="nav-cnt-flows">0</span>
     </button>
-    <button class="nav-btn" onclick="switchTab('config', this)">
-      <span>7. Nftyfile &amp; nftables</span>
+
+    <button class="nav-btn" id="nav-config" onclick="switchTab('config', this)">
+      <span class="nav-btn-left">
+        <svg viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+        <span>Nftyfile &amp; Ruleset</span>
+      </span>
       <span class="nav-count">AST</span>
     </button>
   </div>
-  <div class="sidebar-footer">
+
+  <div class="nav-footer">
     <div style="display:flex;justify-content:space-between;align-items:center">
-      <span style="color:var(--muted)">Auth Scope:</span>
-      <span id="auth-scope-badge" class="badge badge-ro">CHECKING</span>
+      <span id="auth-scope-badge" class="status-pill pill-blue">CHECKING</span>
+      <button class="btn btn-sm" onclick="openInspector('auth')">API Key</button>
     </div>
-    <div id="auth-peer-info" style="color:var(--muted);font-family:monospace;font-size:0.74rem"></div>
-    <button class="btn btn-sm" style="width:100%;justify-content:center;margin-top:4px" onclick="openAuthModal()">
-      🔑 Set API Key
-    </button>
+    <div id="auth-peer-info" class="mono" style="color:var(--muted);font-size:11px"></div>
   </div>
 </aside>
 
 <!-- Main Workspace -->
-<div class="main-wrap">
+<div class="workspace">
+  <!-- Compact Top Telemetry Strip (replaces bulky KPI cards) -->
   <header class="topbar">
-    <div class="topbar-left">
-      <span id="kernel-badge" class="badge badge-warn">● NFT STATUS UNKNOWN</span>
-      <span id="diff-badge" class="badge badge-warn" style="display:none">● UNCOMMITTED CANDIDATE CHANGES</span>
-      <span id="last-updated" style="font-size:0.8rem;color:var(--muted)">Connecting...</span>
+    <div class="telemetry-strip">
+      <div class="telemetry-item" id="kernel-status-pill">
+        <span class="status-dot dot-up" id="kernel-dot"></span>
+        <span class="telemetry-label">Dataplane</span>
+        <span class="telemetry-val" id="kernel-text">Active</span>
+      </div>
+      <div class="telemetry-divider"></div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">VIPs</span>
+        <span class="telemetry-val" id="stat-vips">0</span>
+      </div>
+      <div class="telemetry-divider"></div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">Backends</span>
+        <span class="telemetry-val" style="color:var(--green)" id="stat-up">0 UP</span>
+        <span class="telemetry-val" style="color:var(--red);display:none" id="stat-down">0 DOWN</span>
+        <span class="telemetry-val" style="color:var(--amber);display:none" id="stat-drained">0 DRAIN</span>
+      </div>
+      <div class="telemetry-divider"></div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">WG Tunnels</span>
+        <span class="telemetry-val" id="stat-tunnels">0</span>
+      </div>
+      <div class="telemetry-divider"></div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">Active Flows</span>
+        <span class="telemetry-val" id="stat-flows">0</span>
+      </div>
+      <div class="telemetry-divider"></div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">Updated</span>
+        <span class="telemetry-val" id="last-updated" style="color:var(--text-secondary)">--:--:--</span>
+      </div>
     </div>
-    <div class="topbar-right">
-      <button class="btn btn-sm" onclick="triggerProbe()" id="btn-probe">⚡ Probe Health Now</button>
-      <button class="btn btn-sm btn-success" onclick="applyCandidate()" id="btn-apply" style="display:none">✔ Apply Candidate</button>
-      <button class="btn btn-sm btn-primary" onclick="toggleCliDrawer()">⌘ Web CLI (`)</button>
+
+    <div class="topbar-actions">
+      <button class="btn btn-sm" id="theme-toggle-btn" onclick="toggleTheme()" title="Switch between Dark and Light mode">☀ Light</button>
+      <button class="btn btn-sm" onclick="triggerProbe()" title="Run active health probes across all backends and tunnels">↻ Probe Now</button>
+      <button class="btn btn-sm" onclick="toggleCliDrawer()">⌘ CLI (`)</button>
+      <button class="btn btn-sm btn-primary rw-only" onclick="openInspector('new-service')">+ Create Proxy / Service</button>
     </div>
   </header>
 
-  <main class="content">
-    <!-- TAB 1: OVERVIEW & TOPOLOGY -->
-    <div id="tab-overview" class="tab-pane active">
-      <div class="cards">
-        <div class="card">
-          <div class="label">VIPs &amp; Gateways</div>
-          <div class="val" id="stat-vips" style="color:var(--cyan)">0</div>
-          <div class="sub" id="stat-vips-sub">0 services configured</div>
-        </div>
-        <div class="card">
-          <div class="label">Backends / Tunnels UP</div>
-          <div class="val" id="stat-up" style="color:var(--green)">0</div>
-          <div class="sub">Active in kernel verdict map</div>
-        </div>
-        <div class="card">
-          <div class="label">Backends DOWN</div>
-          <div class="val" id="stat-down" style="color:var(--red)">0</div>
-          <div class="sub">Auto-removed from routing</div>
-        </div>
-        <div class="card">
-          <div class="label">Backends DRAINED</div>
-          <div class="val" id="stat-drained" style="color:var(--amber)">0</div>
-          <div class="sub">Maintenance drain active</div>
-        </div>
-        <div class="card">
-          <div class="label">Active Conntrack Flows</div>
-          <div class="val" id="stat-flows" style="color:var(--purple)">0</div>
-          <div class="sub" id="stat-hosts-sub">0 allow-list hosts resolved</div>
-        </div>
-      </div>
+  <!-- Uncommitted Changes Strip -->
+  <div id="candidate-bar" class="candidate-bar">
+    <span><strong>Uncommitted Candidate Changes:</strong> Staging configuration differs from the active kernel state.</span>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-sm" onclick="execCli('load')">Discard</button>
+      <button class="btn btn-sm btn-success rw-only" onclick="applyCandidate()">✔ Apply Changes</button>
+    </div>
+  </div>
 
-      <div class="section">
-        <div class="section-header">
-          <span>Live VIP, Service &amp; WireGuard Gateway Topology</span>
-          <div style="display:flex;gap:8px">
-            <button class="btn btn-sm rw-only" onclick="openAddServiceModal()">+ Add Service / VIP</button>
+  <!-- Views Container -->
+  <div class="view-container">
+
+    <!-- VIEW 1: SERVICES & PROXIES (Unified High-Density Table) -->
+    <div id="tab-services" class="tab-pane active">
+      <div class="view-toolbar">
+        <div class="view-title-group">
+          <span class="view-title">Services &amp; Proxies</span>
+          <span class="view-subtitle">Click any row to inspect backends, health checks, L7 hostnames, or Cloudflare tunnels</span>
+        </div>
+        <div class="toolbar-controls">
+          <div class="chip-group" id="svc-filter-chips">
+            <button class="chip active" onclick="setServiceFilter('all', this)">All</button>
+            <button class="chip" onclick="setServiceFilter('proxy', this)">Proxies &amp; Forwards</button>
+            <button class="chip" onclick="setServiceFilter('vhost', this)">L7 Host / Cloudflare</button>
+            <button class="chip" onclick="setServiceFilter('system', this)">System Listeners</button>
           </div>
-        </div>
-        <div id="topo-wrap" class="topo-grid">
-          <div class="empty">Loading live topology...</div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span>All Services &amp; Gateway Health Matrix</span>
-        </div>
-        <div id="overview-table-wrap">
-          <div class="empty">Loading services...</div>
+          <input type="text" id="svc-search" class="search-input" placeholder="Search VIP, port, backend, host..." oninput="renderServicesView()">
+          <button class="btn btn-primary rw-only" onclick="openInspector('new-service')">+ Create Proxy / Service</button>
         </div>
       </div>
+      <div class="table-wrap" id="services-table-wrap"></div>
     </div>
 
-    <!-- TAB 2: VIPS & SERVICES -->
+    <!-- VIEW 2: VIRTUAL IPs (VIPs) -->
     <div id="tab-vips" class="tab-pane">
-      <div class="section">
-        <div class="section-header">
-          <span>Virtual IPs (VIPs), L4/L7 Services &amp; Backend Controls</span>
-          <div style="display:flex;gap:8px">
-            <button class="btn btn-sm btn-primary rw-only" onclick="openAddServiceModal()">+ Add VIP / Service</button>
-          </div>
+      <div class="view-toolbar">
+        <div class="view-title-group">
+          <span class="view-title">Virtual IP Addresses (VIPs)</span>
+          <span class="view-subtitle">Static IPv4 VIPs, 802.1Q VLAN interfaces, and named DHCP macvlan leases</span>
         </div>
-        <div id="vips-detail-wrap">
-          <div class="empty">Loading VIPs and services...</div>
+        <div class="toolbar-controls">
+          <button class="btn btn-primary rw-only" onclick="openInspector('new-vip')">+ Create VIP</button>
         </div>
       </div>
+      <div class="table-wrap" id="vips-table-wrap"></div>
     </div>
 
-    <!-- TAB 3: WIREGUARD GATEWAYS -->
+    <!-- VIEW 3: VPN & GATEWAYS -->
     <div id="tab-gateways" class="tab-pane">
-      <div class="grid-2">
-        <div class="section">
-          <div class="section-header">
-            <span>Upload / Save WireGuard Profile (<code>/data/wg/*.conf</code>)</span>
-          </div>
-          <div class="section-body">
-            <div class="form-row">
-              <label>Profile Filename (e.g. <code>mullvad-us-sea-001.conf</code>)</label>
-              <input type="text" id="wg-upload-name" placeholder="mullvad-us-sea-001.conf">
-            </div>
-            <div class="form-row">
-              <label>WireGuard Configuration (<code>[Interface]</code> &amp; <code>[Peer]</code>)</label>
-              <textarea id="wg-upload-body" rows="6" class="mono" placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = 10.64.0.1/32&#10;&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = 198.51.100.1:51820&#10;AllowedIPs = 0.0.0.0/0"></textarea>
-            </div>
-            <button class="btn btn-primary rw-only" onclick="uploadWgProfile()">Save WireGuard Profile</button>
-          </div>
+      <div class="view-toolbar">
+        <div class="view-title-group">
+          <span class="view-title">VPN &amp; Egress Gateways</span>
+          <span class="view-subtitle">Multi-tunnel WireGuard ECMP routers, inbound port forwards, and saved tunnel profiles</span>
         </div>
-
-        <div class="section">
-          <div class="section-header">
-            <span>Quick Gateway / Port-Forward Command Builder</span>
-          </div>
-          <div class="section-body">
-            <div class="form-row">
-              <label>Gateway IP or DHCP Name</label>
-              <input type="text" id="gw-quick-ip" placeholder="192.168.1.10">
-            </div>
-            <div class="form-row">
-              <label>Directive (e.g. <code>killswitch on</code>, <code>ssh:22</code>, <code>forward 51413 to 192.168.1.50:51413</code>, <code>tunnel wg0.conf</code>)</label>
-              <input type="text" id="gw-quick-cmd" placeholder="forward 51413 to 192.168.1.50:51413">
-            </div>
-            <button class="btn btn-success rw-only" onclick="runGatewayQuickCmd()">Apply to Gateway</button>
-          </div>
+        <div class="toolbar-controls">
+          <button class="btn rw-only" onclick="openInspector('upload-wg')">↑ Upload WireGuard .conf</button>
+          <button class="btn btn-primary rw-only" onclick="openInspector('new-gateway')">+ Create Gateway</button>
         </div>
       </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span>Configured Virtual Gateways &amp; ECMP WireGuard Tunnels</span>
-        </div>
-        <div id="gateways-table-wrap">
-          <div class="empty">Loading gateways...</div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span>Saved WireGuard Profiles on Disk (<code>/data/wg</code>)</span>
-        </div>
-        <div id="wg-files-wrap">
-          <div class="empty">Loading saved WireGuard configs...</div>
-        </div>
-      </div>
+      <div class="table-wrap" id="gateways-table-wrap"></div>
     </div>
 
-    <!-- TAB 4: PROGRAMMABLE DNS -->
+    <!-- VIEW 4: DNS & POLICY ROUTES -->
     <div id="tab-dns" class="tab-pane">
-      <div class="grid-2">
-        <div class="section">
-          <div class="section-header">
-            <span>Add Authoritative DNS Record / Split-Horizon Rule</span>
-          </div>
-          <div class="section-body">
-            <div class="form-row">
-              <label>DNS Directive Type</label>
-              <select id="dns-cmd-type">
-                <option value="a">A Record (a &lt;fqdn&gt; &lt;ipv4&gt;)</option>
-                <option value="cname">CNAME Alias (cname &lt;alias&gt; &lt;target&gt;)</option>
-                <option value="address">Wildcard Override (address &lt;*.domain&gt; &lt;ip&gt;)</option>
-                <option value="txt">TXT Record (txt &lt;fqdn&gt; "&lt;value&gt;")</option>
-                <option value="route">Policy Route via Gateway (route &lt;domain&gt; via &lt;gw&gt;)</option>
-                <option value="bypass">Bypass Gateway (bypass &lt;domain&gt; from &lt;gw&gt;)</option>
-                <option value="block">Adblock Sinkhole (block &lt;*.domain&gt;)</option>
-                <option value="upstream">Upstream Resolver (upstream &lt;ip&gt;)</option>
-                <option value="forward">Conditional Forward Zone (forward &lt;domain&gt; &lt;ip&gt;)</option>
-              </select>
-            </div>
-            <div class="form-row">
-              <label>Arguments (e.g. <code>nas.lan 192.168.1.50</code> or <code>*.netflix.com via 192.168.1.10</code>)</label>
-              <input type="text" id="dns-cmd-args" placeholder="nas.lan 192.168.1.50">
-            </div>
-            <button class="btn btn-primary rw-only" onclick="addDnsDirective()">Add &amp; Apply DNS Rule</button>
-          </div>
+      <div class="view-toolbar">
+        <div class="view-title-group">
+          <span class="view-title">Programmable DNS &amp; Domain Routing</span>
+          <span class="view-subtitle" id="dns-summary-subtitle">Embedded dnsmasq resolver, authoritative records, nftset gateway routing, and sinkholes</span>
         </div>
-
-        <div class="section">
-          <div class="section-header">
-            <span>Programmable DNS Engine Settings (<code>dnsmasq</code>)</span>
-          </div>
-          <div class="section-body" id="dns-settings-wrap">
-            <div class="empty">Loading DNS settings...</div>
-          </div>
+        <div class="toolbar-controls">
+          <button class="btn rw-only" onclick="openInspector('dns-settings')">⚙ DNS Engine Settings</button>
+          <button class="btn btn-primary rw-only" onclick="openInspector('new-dns-rule')">+ Add DNS / Route Rule</button>
         </div>
       </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span>Configured DNS Records, Policy Routes (<code>nftset</code>) &amp; Adblock Domains</span>
-        </div>
-        <div id="dns-records-wrap">
-          <div class="empty">No custom DNS block configured yet.</div>
-        </div>
-      </div>
+      <div class="table-wrap" id="dns-table-wrap"></div>
     </div>
 
-    <!-- TAB 5: FIREWALL ALLOW-LIST & CLOUDFLARE -->
+    <!-- VIEW 5: FIREWALL & ACCESS (Allow-Lists, Dynamic Hosts, SSH Keys, Cloudflare) -->
     <div id="tab-firewall" class="tab-pane">
-      <div class="grid-2">
-        <div class="section">
-          <div class="section-header">
-            <span>Add Firewall Allow-List Rule (CIDR, Hostname, or Wildcard)</span>
-            <button class="btn btn-sm" onclick="refreshAllowlistDns()">🔄 Refresh DNS Now</button>
-          </div>
-          <div class="section-body">
-            <div class="form-row">
-              <label>Target Scope (leave empty for Global Allow-List, or enter Service Key like <code>192.168.1.4:8000</code>)</label>
-              <input type="text" id="allow-service-key" placeholder="Global (or e.g. 192.168.1.4:8000)">
-            </div>
-            <div class="form-row">
-              <label>Source CIDR / IP Wildcard / Hostname (e.g. <code>192.168.0.0/16</code>, <code>*.office.lan</code>, <code>10.0.0.0/8</code>)</label>
-              <input type="text" id="allow-host-pattern" placeholder="192.168.0.0/16">
-            </div>
-            <button class="btn btn-primary rw-only" onclick="addAllowEntry()">+ Add to Allow-List &amp; Apply</button>
-          </div>
-        </div>
-
-        <div class="section">
-          <div class="section-header">
-            <span>Register Dynamic Host -&gt; IP Mapping</span>
-          </div>
-          <div class="section-body">
-            <div class="form-row">
-              <label>Hostname (e.g. <code>laptop.office.lan</code>)</label>
-              <input type="text" id="reg-host-name" placeholder="laptop.office.lan">
-            </div>
-            <div class="form-row">
-              <label>IPv4 Address(es) (comma or space separated)</label>
-              <input type="text" id="reg-host-ips" placeholder="192.168.1.99">
-            </div>
-            <button class="btn btn-success rw-only" onclick="registerHostMapping()">Register Host IP</button>
-          </div>
-        </div>
+      <div class="subnav-bar">
+        <button class="subnav-btn active" onclick="switchFirewallSubtab('allow', this)">IP &amp; Host Allow-Lists</button>
+        <button class="subnav-btn" onclick="switchFirewallSubtab('ssh', this)">SSH Authorized Keys</button>
+        <button class="subnav-btn" onclick="switchFirewallSubtab('cloudflare', this)">Cloudflare Zero-Trust Tunnel</button>
       </div>
 
-      <div class="section">
-        <div class="section-header">
-          <span>Active Allow-Lists &amp; Resolved Host Table</span>
+      <!-- Subtab 5a: Allow-Lists & Dynamic Host Mappings -->
+      <div id="fw-sub-allow">
+        <div class="view-toolbar">
+          <div class="view-title-group">
+            <span class="view-title">Firewall Allow-Lists &amp; Host Mappings</span>
+            <span class="view-subtitle">Global and per-service source ACLs and registered hostname-to-IPv4 resolutions</span>
+          </div>
+          <div class="toolbar-controls">
+            <button class="btn rw-only" onclick="refreshAllowlistDns()">↻ Re-resolve DNS Hosts</button>
+            <button class="btn rw-only" onclick="openInspector('new-host-map')">+ Register Host IP</button>
+            <button class="btn btn-primary rw-only" onclick="openInspector('new-allow')">+ Add Allow Rule</button>
+          </div>
         </div>
-        <div id="allow-table-wrap">
-          <div class="empty">Loading allow-lists...</div>
+        <div class="table-wrap" id="allow-table-wrap"></div>
+      </div>
+
+      <!-- Subtab 5b: SSH Keys -->
+      <div id="fw-sub-ssh" style="display:none">
+        <div class="view-toolbar">
+          <div class="view-title-group">
+            <span class="view-title">SSH Authorized Public Keys (<code>/data/ssh/*.pub</code>)</span>
+            <span class="view-subtitle">Passwordless Ed25519 / ECDSA / RSA keys accepted by all enabled <code>ssh:22</code> listeners</span>
+          </div>
+          <div class="toolbar-controls">
+            <button class="btn btn-primary rw-only" onclick="openInspector('new-ssh-key')">+ Add SSH Public Key</button>
+          </div>
         </div>
+        <div class="table-wrap" id="ssh-table-wrap"></div>
+      </div>
+
+      <!-- Subtab 5c: Cloudflare Tunnel -->
+      <div id="fw-sub-cloudflare" style="display:none">
+        <div class="view-toolbar">
+          <div class="view-title-group">
+            <span class="view-title">Cloudflare Zero-Trust Tunnel &amp; Automated DNS</span>
+            <span class="view-subtitle" id="cf-status-subtitle">Supervised cloudflared connector and proxied CNAME routes</span>
+          </div>
+          <div class="toolbar-controls">
+            <button class="btn rw-only" onclick="execCli('cf sync')">↻ Sync Tunnel Now</button>
+            <button class="btn btn-primary rw-only" onclick="openInspector('cf-config')">⚙ Configure Cloudflare Token</button>
+          </div>
+        </div>
+        <div class="table-wrap" id="cf-table-wrap"></div>
       </div>
     </div>
 
-    <!-- TAB 6: LIVE CONNTRACK FLOWS -->
+    <!-- VIEW 6: TRAFFIC FLOWS -->
     <div id="tab-flows" class="tab-pane">
-      <div class="section">
-        <div class="section-header">
-          <span>Live Kernel Conntrack Flows (<code>/proc/net/nf_conntrack</code>)</span>
-          <div style="display:flex;gap:10px;align-items:center">
-            <input type="text" id="flow-filter" placeholder="Filter by IP, port, proto, state..." oninput="renderFlowsTable()" style="width:260px">
-            <button class="btn btn-sm" id="btn-pause-flows" onclick="toggleFlowsPause()">⏸ Pause</button>
-          </div>
+      <div class="view-toolbar">
+        <div class="view-title-group">
+          <span class="view-title">Active Conntrack Flows</span>
+          <span class="view-subtitle">Live kernel NAT sessions from <code>/proc/net/nf_conntrack</code></span>
         </div>
-        <div id="flows-table-wrap">
-          <div class="empty">Loading active flows...</div>
+        <div class="toolbar-controls">
+          <input type="text" id="flow-filter" class="search-input" placeholder="Filter IP, port, protocol, state..." oninput="renderFlowsView()">
+          <button class="btn" id="btn-pause-flows" onclick="toggleFlowsPause()">⏸ Pause Live Feed</button>
         </div>
       </div>
+      <div class="table-wrap" id="flows-table-wrap"></div>
     </div>
 
-    <!-- TAB 7: CONFIG & NFTABLES -->
+    <!-- VIEW 7: SYSTEM CONFIG & NFTABLES -->
     <div id="tab-config" class="tab-pane">
-      <div class="grid-2">
-        <div class="section">
-          <div class="section-header">
-            <span>Declarative <code>Nftyfile</code> Configuration</span>
-            <button class="btn btn-sm btn-success rw-only" onclick="saveAndApplyNftyfile()">💾 Save &amp; Apply Nftyfile</button>
+      <div class="subnav-bar">
+        <button class="subnav-btn active" onclick="switchConfigSubtab('nftyfile', this)">Declarative Nftyfile Editor</button>
+        <button class="subnav-btn" onclick="switchConfigSubtab('nft', this)">Compiled Kernel nftables Ruleset</button>
+      </div>
+
+      <div id="cfg-sub-nftyfile" style="display:flex;flex-direction:column;flex:1">
+        <div class="view-toolbar">
+          <div class="view-title-group">
+            <span class="view-title"><code>/data/Nftyfile</code> Configuration</span>
+            <span class="view-subtitle">Edit declarative configuration directly and apply to the kernel</span>
           </div>
-          <div style="padding:12px">
-            <textarea id="nftyfile-editor" rows="24" class="mono" style="width:100%;background:#060911;color:#e5e7eb;font-size:0.82rem;line-height:1.45"></textarea>
+          <div class="toolbar-controls">
+            <button class="btn btn-success rw-only" onclick="saveAndApplyNftyfile()">✔ Save &amp; Apply Nftyfile</button>
           </div>
         </div>
+        <div style="padding:16px;flex:1;display:flex">
+          <textarea id="nftyfile-editor" class="mono" style="width:100%;flex:1;min-height:480px;background:var(--bg-code);color:var(--text-code);font-size:12.5px;line-height:1.55;padding:14px"></textarea>
+        </div>
+      </div>
 
-        <div class="section">
-          <div class="section-header">
-            <span>Compiled Kernel <code>nftables</code> Ruleset (<code>table ip nfty</code>)</span>
+      <div id="cfg-sub-nft" style="display:none;flex-direction:column;flex:1">
+        <div class="view-toolbar">
+          <div class="view-title-group">
+            <span class="view-title">Compiled <code>table ip nfty</code> Ruleset</span>
+            <span class="view-subtitle">Exact atomic batch ruleset generated by the compiler</span>
           </div>
-          <pre id="nft-box" style="padding:16px;overflow:auto;max-height:560px;font-size:0.8rem;background:#060911;color:#a7f3d0"></pre>
+        </div>
+        <div style="padding:16px;flex:1">
+          <pre id="nft-box" class="mono" style="background:var(--bg-code);border:1px solid var(--border);border-radius:6px;padding:14px;overflow:auto;max-height:72vh;color:var(--text-nft);font-size:12px;line-height:1.5"></pre>
         </div>
       </div>
     </div>
-  </main>
+
+  </div>
 
   <!-- Slide-Up Web CLI Drawer -->
   <div id="cli-drawer" class="cli-drawer">
     <div class="cli-header">
-      <span>nfty Interactive Web CLI (executes against <code>POST /api/v1/cli</code>)</span>
-      <div style="display:flex;gap:8px">
+      <span class="mono" style="color:var(--text-secondary)">nfty Interactive CLI Drawer (<code>POST /api/v1/cli</code>)</span>
+      <div style="display:flex;gap:6px">
         <button class="btn btn-sm" onclick="runCliQuick('show')">show</button>
         <button class="btn btn-sm" onclick="runCliQuick('diff')">diff</button>
         <button class="btn btn-sm btn-success" onclick="runCliQuick('apply')">apply</button>
-        <button class="btn btn-sm" onclick="toggleCliDrawer()">✕ Close</button>
+        <button class="btn btn-sm" onclick="toggleCliDrawer()">✕</button>
       </div>
     </div>
-    <div id="cli-output" class="cli-output"># Type any nfty CLI command below (e.g. 'vip 192.168.1.4; web:8000; allow 192.168.0.0/16; apply')</div>
+    <div id="cli-output" class="cli-output"># Press ` at any time to toggle this CLI drawer. Type commands separated by ';' (e.g. 'vip 192.168.1.4; 8085 to 192.168.3.18:5055; apply')</div>
     <div class="cli-input-row">
       <span class="cli-prompt">nfty(config)#</span>
-      <input type="text" id="cli-input" placeholder="vip 192.168.1.4; web:8000; allow 192.168.0.0/16; apply" onkeydown="if(event.key==='Enter')sendCliCommand()">
-      <button class="btn btn-sm btn-primary" onclick="sendCliCommand()">Run</button>
+      <input type="text" id="cli-input" placeholder="vip 192.168.1.4; 8085 to 192.168.3.18:5055; check tcp 5s; apply" onkeydown="if(event.key==='Enter')sendCliCommand()">
+      <button class="btn btn-sm btn-primary" onclick="sendCliCommand()">Execute</button>
     </div>
   </div>
 </div>
 
-<!-- API Key Modal -->
-<div id="auth-modal" class="modal-backdrop">
-  <div class="modal">
-    <h3>nfty Web Console Access</h3>
-    <p>If your IP is in the <code>web:&lt;port&gt;</code> allow-list, no key is required. On keyed listeners, enter an API key (<code>nfty_ro_...</code> / <code>nfty_rw_...</code>).</p>
-    <div class="form-row">
-      <label>API Key</label>
-      <input type="password" id="modal-api-key" placeholder="nfty_rw_... or nfty_ro_...">
-    </div>
-    <div id="modal-auth-err" style="color:var(--red);font-size:0.8rem;margin-bottom:10px"></div>
-    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
-      <button class="btn" onclick="clearSavedAuth()">Use IP Allow-List (Clear Key)</button>
-      <button class="btn" onclick="closeAuthModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="submitAuthModal()">Use Key</button>
-    </div>
+<!-- Right-Hand Slide-Over Inspector Drawer -->
+<div id="inspector-backdrop" class="inspector-backdrop" onclick="closeInspector()"></div>
+<aside id="inspector" class="inspector">
+  <div class="inspector-header">
+    <div class="inspector-title" id="inspector-title">Inspector</div>
+    <button class="btn btn-sm" onclick="closeInspector()">✕</button>
   </div>
-</div>
-
-<!-- Add VIP / Service Modal -->
-<div id="svc-modal" class="modal-backdrop">
-  <div class="modal">
-    <h3>Add or Update VIP Service</h3>
-    <p>Configure a forwarded backend service, local <code>web:8000</code> console, <code>api:9090</code>, <code>ssh:22</code>, or <code>dns:53</code> on a Virtual IP.</p>
-    <div class="form-row">
-      <label>VIP Address or DHCP Name (e.g. <code>192.168.1.4</code> or <code>web-app</code>)</label>
-      <input type="text" id="svc-modal-vip" placeholder="192.168.1.4">
-    </div>
-    <div class="form-row">
-      <label>Service Spec (e.g. <code>80 to 192.168.20.10:5055</code>, <code>web:8000</code>, <code>api:8080</code>, <code>ssh:22</code>)</label>
-      <input type="text" id="svc-modal-spec" placeholder="80 to 192.168.20.10:5055">
-    </div>
-    <div class="form-row">
-      <label>Optional Allow-List CIDR / Hostname (e.g. <code>192.168.0.0/16</code>)</label>
-      <input type="text" id="svc-modal-allow" placeholder="192.168.0.0/16">
-    </div>
-    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
-      <button class="btn" onclick="closeAddServiceModal()">Cancel</button>
-      <button class="btn btn-success" onclick="submitAddServiceModal()">Create &amp; Apply</button>
-    </div>
-  </div>
-</div>
+  <div class="inspector-body" id="inspector-body"></div>
+  <div class="inspector-footer" id="inspector-footer"></div>
+</aside>
 
 <div id="toast" class="toast"></div>
 
 <script>
 let stateData = null;
+let cfData = null;
 let currentScope = 'ro';
 let flowsPaused = false;
 let editorDirty = false;
+let svcFilter = 'all';
+let selectedRowKey = null;
+let activeInspectorState = null;
+
+function applyTheme(theme) {
+  const mode = theme === 'light' ? 'light' : 'dark';
+  if (mode === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+  }
+  const btn = document.getElementById('theme-toggle-btn');
+  if (btn) {
+    btn.textContent = mode === 'light' ? '🌙 Dark' : '☀ Light';
+  }
+  localStorage.setItem('nfty_theme', mode);
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+  applyTheme(current === 'light' ? 'dark' : 'light');
+}
+
+applyTheme(localStorage.getItem('nfty_theme') || 'dark');
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({
@@ -798,9 +1107,23 @@ function escapeHtml(value) {
   })[ch]);
 }
 
+function formatBytes(b) {
+  const n = Number(b) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(2) + ' GB';
+}
+
 function getAuthToken() {
   const params = new URLSearchParams(window.location.search);
-  if (params.get('key')) return params.get('key');
+  if (params.get('key')) {
+    const k = params.get('key');
+    sessionStorage.setItem('nfty_auth_token', k);
+    localStorage.setItem('nfty_auth_token', k);
+    window.history.replaceState({}, document.title, window.location.pathname);
+    return k;
+  }
   return sessionStorage.getItem('nfty_auth_token') || localStorage.getItem('nfty_auth_token') || '';
 }
 
@@ -817,17 +1140,14 @@ function setAuthToken(tok) {
 async function apiFetch(path, options = {}) {
   const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
   const tok = getAuthToken();
-  if (tok) {
-    headers['Authorization'] = 'Bearer ' + tok;
-  }
-  const res = await fetch(path, Object.assign({}, options, { headers }));
-  return res;
+  if (tok) headers['Authorization'] = 'Bearer ' + tok;
+  return fetch(path, Object.assign({}, options, { headers }));
 }
 
 function showToast(msg, isError = false) {
   const el = document.getElementById('toast');
   el.textContent = msg;
-  el.style.borderColor = isError ? 'var(--red)' : 'var(--cyan)';
+  el.style.borderColor = isError ? 'var(--red)' : 'var(--unifi-blue)';
   el.style.display = 'block';
   clearTimeout(window._toastTimer);
   window._toastTimer = setTimeout(() => { el.style.display = 'none'; }, 3500);
@@ -839,20 +1159,44 @@ function switchTab(tabId, btnEl) {
   const target = document.getElementById('tab-' + tabId);
   if (target) target.classList.add('active');
   if (btnEl) btnEl.classList.add('active');
+  if (tabId === 'firewall') fetchCloudflareStatus();
+}
+
+function switchFirewallSubtab(sub, btnEl) {
+  ['allow', 'ssh', 'cloudflare'].forEach(k => {
+    document.getElementById('fw-sub-' + k).style.display = (k === sub) ? 'block' : 'none';
+  });
+  btnEl.parentElement.querySelectorAll('.subnav-btn').forEach(b => b.classList.remove('active'));
+  btnEl.classList.add('active');
+  if (sub === 'cloudflare') fetchCloudflareStatus();
+}
+
+function switchConfigSubtab(sub, btnEl) {
+  document.getElementById('cfg-sub-nftyfile').style.display = (sub === 'nftyfile') ? 'flex' : 'none';
+  document.getElementById('cfg-sub-nft').style.display = (sub === 'nft') ? 'flex' : 'none';
+  btnEl.parentElement.querySelectorAll('.subnav-btn').forEach(b => b.classList.remove('active'));
+  btnEl.classList.add('active');
+}
+
+function setServiceFilter(mode, btnEl) {
+  svcFilter = mode;
+  document.querySelectorAll('#svc-filter-chips .chip').forEach(c => c.classList.remove('active'));
+  if (btnEl) btnEl.classList.add('active');
+  renderServicesView();
 }
 
 function toggleCliDrawer() {
   const d = document.getElementById('cli-drawer');
   d.classList.toggle('open');
-  if (d.classList.contains('open')) {
-    document.getElementById('cli-input').focus();
-  }
+  if (d.classList.contains('open')) document.getElementById('cli-input').focus();
 }
 
 document.addEventListener('keydown', (e) => {
   if (e.key === '`' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) {
     e.preventDefault();
     toggleCliDrawer();
+  } else if (e.key === 'Escape') {
+    closeInspector();
   }
 });
 
@@ -860,14 +1204,13 @@ function updateScopeUI(scope, mode, peerIp) {
   currentScope = scope || 'ro';
   const badge = document.getElementById('auth-scope-badge');
   if (currentScope === 'rw') {
-    badge.className = 'badge badge-rw';
-    badge.textContent = mode === 'allowlist' ? 'READ-WRITE (ALLOWLIST)' : 'READ-WRITE (RW)';
+    badge.className = 'status-pill pill-up';
+    badge.textContent = mode === 'allowlist' ? '● RW (ALLOW-LIST)' : '● RW (API KEY)';
   } else {
-    badge.className = 'badge badge-ro';
-    badge.textContent = 'READ-ONLY (RO)';
+    badge.className = 'status-pill pill-blue';
+    badge.textContent = '● READ-ONLY';
   }
-  const peerEl = document.getElementById('auth-peer-info');
-  peerEl.textContent = peerIp ? `Client IP: ${peerIp}` : '';
+  document.getElementById('auth-peer-info').textContent = peerIp ? `Client: ${peerIp}` : '';
   document.querySelectorAll('.rw-only').forEach(btn => {
     btn.disabled = (currentScope !== 'rw');
     btn.title = (currentScope !== 'rw') ? 'Requires Read-Write (rw) access' : '';
@@ -882,77 +1225,14 @@ async function checkWhoami() {
       updateScopeUI(info.scope, info.mode, info.peer_ip);
       return true;
     } else if (res.status === 401) {
-      openAuthModal();
+      openInspector('auth');
       return false;
     }
   } catch (e) {}
   return false;
 }
 
-function openAuthModal() {
-  document.getElementById('modal-auth-err').textContent = '';
-  document.getElementById('modal-api-key').value = getAuthToken();
-  document.getElementById('auth-modal').classList.add('open');
-}
-
-function closeAuthModal() {
-  document.getElementById('auth-modal').classList.remove('open');
-}
-
-function clearSavedAuth() {
-  setAuthToken('');
-  closeAuthModal();
-  refreshDashboard();
-}
-
-async function submitAuthModal() {
-  const key = document.getElementById('modal-api-key').value.trim();
-  if (!key) {
-    document.getElementById('modal-auth-err').textContent = 'Enter an API key';
-    return;
-  }
-  const previous = getAuthToken();
-  setAuthToken(key);
-  try {
-    const res = await apiFetch('/api/v1/auth/whoami');
-    const data = await res.json();
-    if (!res.ok || !data.ok) {
-      setAuthToken(previous);
-      document.getElementById('modal-auth-err').textContent = data.error || 'Invalid API key';
-      return;
-    }
-    closeAuthModal();
-    showToast(`Using ${data.scope.toUpperCase()} API key`);
-    refreshDashboard();
-  } catch (e) {
-    setAuthToken(previous);
-    document.getElementById('modal-auth-err').textContent = e.message;
-  }
-}
-
-function openAddServiceModal(defaultVip = '') {
-  if (defaultVip) document.getElementById('svc-modal-vip').value = defaultVip;
-  document.getElementById('svc-modal').classList.add('open');
-}
-function closeAddServiceModal() {
-  document.getElementById('svc-modal').classList.remove('open');
-}
-async function submitAddServiceModal() {
-  const vip = document.getElementById('svc-modal-vip').value.trim();
-  const spec = document.getElementById('svc-modal-spec').value.trim();
-  const allow = document.getElementById('svc-modal-allow').value.trim();
-  if (!vip || !spec) {
-    showToast('VIP and Service Spec are required', true);
-    return;
-  }
-  let cmd = `vip ${vip}; ${spec}`;
-  if (allow) cmd += `; allow ${allow}`;
-  cmd += `; apply`;
-  await execCli(cmd);
-  closeAddServiceModal();
-}
-
-async function execCli(command) {
+async function execCli(command, silent = false) {
   try {
     const res = await apiFetch('/api/v1/cli', {
       method: 'POST',
@@ -963,9 +1243,9 @@ async function execCli(command) {
       showToast(data.error || 'Command failed', true);
       return null;
     }
-    showToast('Applied: ' + command);
+    if (!silent) showToast('Applied: ' + command);
     const out = document.getElementById('cli-output');
-    out.textContent += `\nnfty(config)# ${command}\n✔ OK (applied)\n`;
+    out.textContent += `\nnfty(config)# ${command}\n✔ OK\n`;
     out.scrollTop = out.scrollHeight;
     editorDirty = false;
     await refreshDashboard();
@@ -997,11 +1277,11 @@ async function runCliQuick(cmd) {
 async function triggerProbe() {
   const res = await apiFetch('/api/v1/probe', { method: 'POST', body: '{}' });
   if (res.ok) {
-    showToast('Active health probes completed');
+    showToast('Health probes completed');
     refreshDashboard();
   } else {
     const d = await res.json().catch(() => ({}));
-    showToast(d.error || 'Probe requires RW scope', true);
+    showToast(d.error || 'Probe requires RW access', true);
   }
 }
 
@@ -1009,11 +1289,11 @@ async function applyCandidate() {
   const res = await apiFetch('/api/v1/apply', { method: 'POST', body: '{}' });
   const d = await res.json().catch(() => ({}));
   if (res.ok) {
-    showToast('Candidate configuration committed to kernel');
+    showToast('Candidate committed to kernel');
     editorDirty = false;
     refreshDashboard();
   } else {
-    showToast(d.error || 'Failed to apply candidate', true);
+    showToast(d.error || 'Apply failed', true);
   }
 }
 
@@ -1024,11 +1304,14 @@ async function toggleBackendDrain(ep, currentlyDrained) {
     body: JSON.stringify({ backend: ep })
   });
   if (res.ok) {
-    showToast(`${currentlyDrained ? 'Enabled' : 'Drained'} backend ${ep}`);
-    refreshDashboard();
+    showToast(`${currentlyDrained ? 'Enabled' : 'Drained'} ${ep}`);
+    await refreshDashboard();
+    if (activeInspectorState && activeInspectorState.mode === 'service') {
+      openInspector('service', activeInspectorState.key);
+    }
   } else {
     const d = await res.json().catch(() => ({}));
-    showToast(d.error || 'Operation failed', true);
+    showToast(d.error || 'Failed to update drain state', true);
   }
 }
 
@@ -1036,79 +1319,11 @@ async function deleteService(svcKey) {
   const res = await apiFetch('/api/v1/services/' + encodeURIComponent(svcKey), { method: 'DELETE' });
   if (res.ok) {
     showToast(`Deleted service ${svcKey}`);
+    closeInspector();
     refreshDashboard();
   } else {
     const d = await res.json().catch(() => ({}));
     showToast(d.error || 'Delete failed', true);
-  }
-}
-
-async function generateServiceKey(vipKey, svcDisplay, scope) {
-  await execCli(`vip ${vipKey}; ${svcDisplay}; key new ${scope}; apply`);
-}
-
-async function uploadWgProfile() {
-  const name = document.getElementById('wg-upload-name').value.trim();
-  const config = document.getElementById('wg-upload-body').value.trim();
-  if (!name || !config) {
-    showToast('Profile name and config content required', true);
-    return;
-  }
-  const res = await apiFetch('/api/v1/wg', {
-    method: 'POST',
-    body: JSON.stringify({ name, config })
-  });
-  const d = await res.json().catch(() => ({}));
-  if (res.ok && d.ok) {
-    showToast(`Saved WireGuard profile ${d.filename}`);
-    document.getElementById('wg-upload-body').value = '';
-    refreshDashboard();
-  } else {
-    showToast(d.error || 'Failed to save WireGuard profile', true);
-  }
-}
-
-async function runGatewayQuickCmd() {
-  const gw = document.getElementById('gw-quick-ip').value.trim();
-  const cmd = document.getElementById('gw-quick-cmd').value.trim();
-  if (!gw || !cmd) {
-    showToast('Gateway and directive required', true);
-    return;
-  }
-  await execCli(`gateway ${gw}; ${cmd}; apply`);
-}
-
-async function addDnsDirective() {
-  const t = document.getElementById('dns-cmd-type').value;
-  const args = document.getElementById('dns-cmd-args').value.trim();
-  if (!args) {
-    showToast('DNS rule arguments required', true);
-    return;
-  }
-  await execCli(`dns; ${t} ${args}; apply`);
-  document.getElementById('dns-cmd-args').value = '';
-}
-
-async function addAllowEntry() {
-  const svc = document.getElementById('allow-service-key').value.trim();
-  const host = document.getElementById('allow-host-pattern').value.trim();
-  if (!host) {
-    showToast('CIDR or host pattern required', true);
-    return;
-  }
-  const payload = { hosts: host.split(/[\s,]+/).filter(Boolean), apply: true };
-  if (svc) payload.service = svc;
-  const res = await apiFetch('/api/v1/allow', {
-    method: 'POST',
-    body: JSON.stringify(payload)
-  });
-  const d = await res.json().catch(() => ({}));
-  if (res.ok && d.ok) {
-    showToast(`Added ${host} to allow-list`);
-    document.getElementById('allow-host-pattern').value = '';
-    refreshDashboard();
-  } else {
-    showToast(d.error || 'Failed to update allow-list', true);
   }
 }
 
@@ -1121,60 +1336,1212 @@ async function removeAllowEntry(svcKey, entry) {
   });
   if (res.ok) {
     showToast(`Removed ${entry} from allow-list`);
-    refreshDashboard();
-  }
-}
-
-async function registerHostMapping() {
-  const host = document.getElementById('reg-host-name').value.trim();
-  const ips = document.getElementById('reg-host-ips').value.trim().split(/[\s,]+/).filter(Boolean);
-  if (!host || !ips.length) {
-    showToast('Hostname and at least one IPv4 address required', true);
-    return;
-  }
-  const res = await apiFetch('/api/v1/allow/hosts', {
-    method: 'POST',
-    body: JSON.stringify({ host, ips })
-  });
-  const d = await res.json().catch(() => ({}));
-  if (res.ok && d.ok) {
-    showToast(`Registered ${host} -> ${ips.join(', ')}`);
-    refreshDashboard();
-  } else {
-    showToast(d.error || 'Failed to register host', true);
+    await refreshDashboard();
+    if (activeInspectorState && activeInspectorState.mode === 'service') {
+      openInspector('service', activeInspectorState.key);
+    }
   }
 }
 
 async function refreshAllowlistDns() {
   const res = await apiFetch('/api/v1/allow/refresh', { method: 'POST', body: '{}' });
   if (res.ok) {
-    showToast('Allow-list hostnames resolved & synced to kernel sets');
+    showToast('Resolved allow-list hostnames');
     refreshDashboard();
   }
 }
 
 function toggleFlowsPause() {
   flowsPaused = !flowsPaused;
-  document.getElementById('btn-pause-flows').textContent = flowsPaused ? '▶ Resume' : '⏸ Pause';
+  document.getElementById('btn-pause-flows').textContent = flowsPaused ? '▶ Resume Live Feed' : '⏸ Pause Live Feed';
 }
 
 async function saveAndApplyNftyfile() {
   const body = document.getElementById('nftyfile-editor').value;
-  const res = await apiFetch('/api/v1/config', {
-    method: 'PUT',
-    body
-  });
+  const res = await apiFetch('/api/v1/config', { method: 'PUT', body });
   const d = await res.json().catch(() => ({}));
   if (res.ok && d.ok) {
     editorDirty = false;
-    showToast('Saved & applied Nftyfile configuration');
+    showToast('Saved & applied Nftyfile');
     refreshDashboard();
   } else {
-    showToast(d.error || 'Failed to parse or apply Nftyfile', true);
+    showToast(d.error || 'Failed to apply Nftyfile', true);
   }
 }
 
-function renderFlowsTable() {
+/* =========================================================================
+   RIGHT-HAND INSPECTOR & GUIDED FORMS (UniFi Property Panel UX)
+   ========================================================================= */
+function closeInspector() {
+  activeInspectorState = null;
+  selectedRowKey = null;
+  document.getElementById('inspector').classList.remove('open');
+  document.getElementById('inspector-backdrop').classList.remove('open');
+  document.querySelectorAll('tbody tr.selected').forEach(r => r.classList.remove('selected'));
+}
+
+function openInspector(mode, key = null) {
+  activeInspectorState = { mode, key };
+  selectedRowKey = key;
+  const titleEl = document.getElementById('inspector-title');
+  const bodyEl = document.getElementById('inspector-body');
+  const footEl = document.getElementById('inspector-footer');
+  footEl.innerHTML = '';
+
+  const cfg = (stateData && stateData.active_config) || { vips: {}, services: {}, gateways: {}, global_allow: [] };
+  const allVipKeys = getAllVipKeys(cfg);
+
+  if (mode === 'auth') {
+    titleEl.textContent = 'API Key Authentication';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="prop-group-title">Listener Access</div>
+        <p style="color:var(--text-secondary);font-size:12px;margin-bottom:12px">
+          Unkeyed <code>web:&lt;port&gt;</code> listeners grant Read-Write access to any IP matching their allow-list. On keyed listeners, enter a scoped <code>nfty_rw_...</code> or <code>nfty_ro_...</code> key.
+        </p>
+        <div class="form-field">
+          <label>Scoped API Key</label>
+          <input type="password" id="insp-api-key" value="${escapeHtml(getAuthToken())}" placeholder="nfty_rw_... or nfty_ro_...">
+        </div>
+        <div id="insp-auth-err" style="color:var(--red);font-size:12px"></div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="setAuthToken('');closeInspector();checkWhoami();refreshDashboard()">Clear Key (Use IP Allow-List)</button>
+      <button class="btn btn-primary" onclick="submitInspectorAuth()">Save &amp; Verify Key</button>`;
+  }
+
+  else if (mode === 'new-service') {
+    const defaultVip = key || (allVipKeys[0] || '192.168.1.4');
+    const vipOptions = allVipKeys.map(v => `<option value="${escapeHtml(v)}" ${v === defaultVip ? 'selected' : ''}>${escapeHtml(v)}</option>`).join('');
+    titleEl.textContent = 'Create Proxy or VIP Service';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="prop-group-title">1. Virtual IP Binding</div>
+        <div class="form-field">
+          <label>Target VIP Address or DHCP Name</label>
+          <input type="text" id="ns-vip" list="ns-vip-list" value="${escapeHtml(defaultVip)}" placeholder="192.168.1.4">
+          <datalist id="ns-vip-list">${vipOptions}</datalist>
+          <span class="hint">Pick an existing VIP or type a new IPv4 / DHCP name</span>
+        </div>
+        <div class="form-field">
+          <label>Service Type</label>
+          <select id="ns-kind" onchange="toggleNewServiceFields()">
+            <option value="proxy">Reverse Proxy / Port Forward (L4 / L7)</option>
+            <option value="http-proxy">HTTP/HTTPS Forward Proxy (proxy:8118)</option>
+            <option value="ssh">Appliance SSH Server (ssh:22)</option>
+            <option value="dns">Programmable DNS Listener (dns:53)</option>
+            <option value="web">Web Console Listener (web:8000)</option>
+            <option value="api">Headless JSON API Listener (api:8080)</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="ns-proxy-fields" class="prop-group">
+        <div class="prop-group-title">2. Listen Port &amp; Backend Target</div>
+        <div class="form-grid-2">
+          <div class="form-field">
+            <label>External VIP Port</label>
+            <input type="number" id="ns-port" placeholder="e.g. 80 or 5055" min="1" max="65535">
+          </div>
+          <div class="form-field">
+            <label>Protocol</label>
+            <select id="ns-proto">
+              <option value="tcp">TCP</option>
+              <option value="udp">UDP</option>
+              <option value="both">TCP + UDP (both)</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-field">
+          <label>Backend Host/IP &amp; Port</label>
+          <input type="text" id="ns-backend" placeholder="e.g. seer:5055 or 192.168.3.18:5055">
+          <span class="hint">If the VIP port matches the backend port, e.g. <code>seer:5055</code>, nfty names the service automatically</span>
+        </div>
+        <div class="form-grid-2">
+          <div class="form-field">
+            <label>Load Balancing</label>
+            <select id="ns-balance">
+              <option value="round-robin">Round-Robin</option>
+              <option value="sticky">Source-IP Sticky</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label>Health Probe</label>
+            <select id="ns-check">
+              <option value="tcp 5s">TCP Handshake (5s)</option>
+              <option value="http / 5s">HTTP GET / (5s)</option>
+              <option value="ping 5s">ICMP Ping (5s)</option>
+              <option value="">None</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-field">
+          <label>Optional mDNS / L7 Virtual-Host Name (<code>hostname</code>)</label>
+          <input type="text" id="ns-hostname" placeholder="e.g. seer.local">
+        </div>
+        <div class="form-field">
+          <label>Optional Public Cloudflare Tunnel FQDN (<code>cloudflare-dns</code>)</label>
+          <input type="text" id="ns-cf" placeholder="e.g. seer.smith.gr">
+        </div>
+      </div>
+
+      <div class="prop-group">
+        <div class="prop-group-title">Access Control</div>
+        <div class="form-field">
+          <label>Source Allow-List CIDR / Wildcard (Required for web: and api:)</label>
+          <input type="text" id="ns-allow" placeholder="e.g. 192.168.0.0/16">
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="closeInspector()">Cancel</button>
+      <button class="btn btn-primary rw-only" onclick="submitNewService()">Create &amp; Apply</button>`;
+  }
+
+  else if (mode === 'service' && key) {
+    const svc = (cfg.services || {})[key];
+    if (!svc) return closeInspector();
+    const runtime = (stateData && stateData.runtime) || {};
+    const activeEps = ((stateData && stateData.active_backends) || {})[svc.key] || [];
+    const vipKey = svc.vip_id || svc.listen_ip || 'standalone';
+    const isWebOrApi = svc.name && (svc.name.startsWith('web:') || svc.name.startsWith('api:'));
+
+    const backendRows = (svc.backends || []).map(b => {
+      const ep = b.host ? `${b.host}(${b.ip}):${b.port}` : `${b.ip}:${b.port}`;
+      const isLocal = b.ip === '127.0.0.1';
+      const rt = runtime[ep] || { health: isLocal ? 'UP' : 'UNKNOWN', drained: false, packets: 0, bytes: 0 };
+      const pill = rt.drained
+        ? `<span class="status-pill pill-drain">DRAINED</span>`
+        : (rt.health === 'UP' || isLocal
+            ? `<span class="status-pill pill-up">UP ${rt.latency_ms != null ? rt.latency_ms.toFixed(1) + 'ms' : ''}</span>`
+            : `<span class="status-pill pill-down">${escapeHtml(rt.health || 'DOWN')}</span>`);
+      return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;margin-bottom:6px">
+        <div>
+          <div class="mono" style="font-weight:600">${escapeHtml(isLocal ? '127.0.0.1:' + svc.port + ' (appliance)' : ep)}</div>
+          <div style="font-size:11px;color:var(--muted)">weight ${b.weight || 1}${b.backup ? ' • backup' : ''} • ${escapeHtml(rt.packets || 0)} pkts (${formatBytes(rt.bytes || 0)})</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px">
+          ${pill}
+          ${!isLocal && currentScope === 'rw' ? `
+            <button class="btn btn-sm ${rt.drained ? 'btn-success' : 'btn-amber'}" data-ep="${escapeHtml(ep)}" data-dr="${rt.drained ? '1' : '0'}" onclick="toggleBackendDrain(this.dataset.ep, this.dataset.dr==='1')">${rt.drained ? 'Enable' : 'Drain'}</button>
+            <button class="btn btn-sm btn-ghost-danger" data-target="${escapeHtml(b.host ? b.host + ':' + b.port : b.ip + ':' + b.port)}" onclick="removeBackendFromSvc('${escapeHtml(svc.key)}', this.dataset.target)">✕</button>
+          ` : ''}
+        </div>
+      </div>`;
+    }).join('');
+
+    const allowTags = (svc.allow || []).map(a => `<span class="tag">${escapeHtml(a)} <a href="#" data-svc="${escapeHtml(svc.key)}" data-entry="${escapeHtml(a)}" onclick="removeAllowEntry(this.dataset.svc,this.dataset.entry);return false" style="color:var(--red);text-decoration:none;margin-left:4px">×</a></span>`).join(' ');
+
+    const apiKeySection = isWebOrApi ? `
+      <div class="prop-group">
+        <div class="prop-group-title">Scoped API Keys (${escapeHtml(svc.name)})</div>
+        <div style="margin-bottom:8px">
+          ${(svc.api_keys || []).map(k => `<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 8px;background:var(--bg);border:1px solid var(--border);border-radius:5px;margin-bottom:4px">
+            <code style="font-size:11.5px">${escapeHtml(k.key)}</code>
+            <span class="status-pill ${k.scope === 'rw' ? 'pill-up' : 'pill-blue'}">${escapeHtml(k.scope.toUpperCase())}</span>
+          </div>`).join('') || '<div style="font-size:12px;color:var(--muted)">No API keys configured (IP allow-list grants RW)</div>'}
+        </div>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-sm rw-only" onclick="execCli('vip ${escapeHtml(vipKey)}; ${escapeHtml(svc.name)}; key new ro; apply')">+ Generate RO Key</button>
+          <button class="btn btn-sm rw-only" onclick="execCli('vip ${escapeHtml(vipKey)}; ${escapeHtml(svc.name)}; key new rw; apply')">+ Generate RW Key</button>
+        </div>
+      </div>` : '';
+
+    titleEl.innerHTML = `<span class="status-dot ${activeEps.length || isWebOrApi ? 'dot-up' : 'dot-down'}"></span> <span>${escapeHtml(svc.name || svc.key)}</span>`;
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="prop-group-title">Service Summary</div>
+        <div class="prop-row"><span class="prop-key">Service Key</span><span class="prop-val mono">${escapeHtml(svc.key)}</span></div>
+        <div class="prop-row"><span class="prop-key">Virtual IP</span><span class="prop-val mono">${escapeHtml(vipKey)} (${svc.vip ? escapeHtml(svc.vip.interface + '/' + svc.vip.prefix_len) : 'any'})</span></div>
+        <div class="prop-row"><span class="prop-key">Listen Port / Proto</span><span class="prop-val mono">:${escapeHtml(svc.port)} / ${escapeHtml(svc.proto)}</span></div>
+        <div class="prop-row"><span class="prop-key">Balance / Mode</span><span class="prop-val">${escapeHtml(svc.balance)} (${escapeHtml(svc.mode)})</span></div>
+      </div>
+
+      <div class="prop-group">
+        <div class="prop-group-title">Backend Pool (${(svc.backends || []).length})</div>
+        ${backendRows || '<div style="color:var(--muted);font-size:12px">No backends configured</div>'}
+        ${!isWebOrApi && currentScope === 'rw' ? `
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <input type="text" id="insp-add-backend" placeholder="Add backend ip:port [weight N] [backup]" style="flex:1">
+          <button class="btn btn-sm btn-primary" onclick="addBackendToSvc('${escapeHtml(svc.key)}')">+ Add</button>
+        </div>` : ''}
+      </div>
+
+      ${!isWebOrApi ? `
+      <div class="prop-group">
+        <div class="prop-group-title">L7 Hostname, Cloudflare &amp; Probing</div>
+        <div class="form-field">
+          <label>mDNS / HTTP Host / TLS SNI Hostname</label>
+          <input type="text" id="insp-svc-hostname" value="${escapeHtml(svc.hostname || '')}" placeholder="e.g. app.local">
+        </div>
+        <div class="form-field">
+          <label>Cloudflare Tunnel Public FQDN (<code>cloudflare-dns</code>)</label>
+          <input type="text" id="insp-svc-cf" value="${escapeHtml(svc.cloudflare || '')}" placeholder="e.g. app.smith.gr">
+        </div>
+        <div class="form-grid-2">
+          <div class="form-field">
+            <label>Balance Strategy</label>
+            <select id="insp-svc-balance">
+              <option value="round-robin" ${svc.balance === 'round-robin' ? 'selected' : ''}>round-robin</option>
+              <option value="sticky" ${svc.balance === 'sticky' ? 'selected' : ''}>sticky</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label>Health Check</label>
+            <input type="text" id="insp-svc-check" value="${svc.check ? escapeHtml((svc.check.kind === 'http' ? 'http ' + svc.check.http_path : svc.check.kind) + ' ' + svc.check.interval_secs + 's') : ''}" placeholder="tcp 5s">
+          </div>
+        </div>
+        <button class="btn btn-sm btn-primary rw-only" onclick="saveServiceProps('${escapeHtml(svc.key)}')">Update Service Settings</button>
+      </div>` : ''}
+
+      ${apiKeySection}
+
+      <div class="prop-group">
+        <div class="prop-group-title">Service Source Allow-List</div>
+        <div style="margin-bottom:8px">${allowTags || '<span style="color:var(--muted);font-size:12px">Inherits global allow-list</span>'}</div>
+        <div style="display:flex;gap:6px">
+          <input type="text" id="insp-svc-allow-add" placeholder="Add CIDR or hostname (e.g. 192.168.0.0/16)" style="flex:1">
+          <button class="btn btn-sm rw-only" onclick="addAllowFromInspector('${escapeHtml(svc.key)}')">+ Allow</button>
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn btn-ghost-danger rw-only" onclick="deleteService('${escapeHtml(svc.key)}')">Delete Service</button>
+      <button class="btn" onclick="closeInspector()">Close</button>`;
+  }
+
+  else if (mode === 'new-vip') {
+    titleEl.textContent = 'Create Virtual IP (VIP)';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="prop-group-title">VIP Addressing</div>
+        <div class="form-field">
+          <label>IPv4 Address/CIDR or DHCP Hostname</label>
+          <input type="text" id="nv-ip" placeholder="e.g. 192.168.1.5/21 or sonarr">
+          <span class="hint">Enter an IPv4 address for a static VIP, or a hostname for a DHCP macvlan VIP</span>
+        </div>
+        <div class="form-grid-2">
+          <div class="form-field">
+            <label>Interface / Prefix</label>
+            <input type="text" id="nv-iface" value="eth0/24" placeholder="eth0/24">
+          </div>
+          <div class="form-field">
+            <label>Optional 802.1Q VLAN ID</label>
+            <input type="number" id="nv-vlan" placeholder="1-4094" min="1" max="4094">
+          </div>
+        </div>
+        <div class="form-field">
+          <label>Enable Local SSH (<code>ssh:22</code>) on this VIP?</label>
+          <select id="nv-ssh">
+            <option value="yes">Yes (enable ssh:22)</option>
+            <option value="no">No</option>
+          </select>
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="closeInspector()">Cancel</button>
+      <button class="btn btn-primary rw-only" onclick="submitNewVip()">Create VIP &amp; Apply</button>`;
+  }
+
+  else if (mode === 'gateway' && key) {
+    const gw = (cfg.gateways || {})[key];
+    if (!gw) return closeInspector();
+    const wgFiles = Object.keys((stateData && stateData.wg_configs) || {});
+    const tunnelRows = (gw.tunnels || []).map(t => `<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;margin-bottom:5px">
+      <div><strong>${escapeHtml(t.iface)}</strong> <code style="color:var(--text-secondary)">${escapeHtml(t.name)}</code> <span class="tag">w=${escapeHtml(t.weight || 1)}</span></div>
+      <button class="btn btn-sm btn-ghost-danger rw-only" onclick="execCli('gateway ${escapeHtml(gw.key)}; no tunnel ${escapeHtml(t.name)}; apply')">Remove</button>
+    </div>`).join('');
+
+    const fwdRows = (gw.forwards || []).map(f => `<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;margin-bottom:5px">
+      <div class="mono">:${escapeHtml(f.listen_port)}/${escapeHtml(f.proto)} → ${escapeHtml(f.backend.host || f.backend.ip)}:${escapeHtml(f.backend.port)}</div>
+      <button class="btn btn-sm btn-ghost-danger rw-only" onclick="execCli('gateway ${escapeHtml(gw.key)}; no forward ${escapeHtml(f.listen_port)}; apply')">✕</button>
+    </div>`).join('');
+
+    const gwSvcs = gw.services || [];
+    const hasGwSvc = (k) => gwSvcs.some(s => s.kind === k);
+
+    titleEl.textContent = `Gateway ${gw.key}`;
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="prop-group-title">Gateway Routing Policy</div>
+        <div class="form-grid-2">
+          <div class="form-field">
+            <label>ECMP Balance Mode</label>
+            <select id="igw-balance" onchange="execCli('gateway ${escapeHtml(gw.key)}; balance ' + this.value + '; apply')">
+              <option value="round-robin" ${gw.balance === 'round-robin' ? 'selected' : ''}>round-robin</option>
+              <option value="sticky" ${gw.balance === 'sticky' ? 'selected' : ''}>sticky</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label>WAN Leak Killswitch</label>
+            <select id="igw-ks" onchange="execCli('gateway ${escapeHtml(gw.key)}; killswitch ' + this.value + '; apply')">
+              <option value="on" ${gw.killswitch ? 'selected' : ''}>ON (Fail-Closed)</option>
+              <option value="off" ${!gw.killswitch ? 'selected' : ''}>OFF</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="prop-group">
+        <div class="prop-group-title">Gateway Listeners (SSH, DNS, HTTP/HTTPS Proxy)</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn btn-sm ${hasGwSvc('proxy') ? 'btn-primary' : ''} rw-only" onclick="execCli('gateway ${escapeHtml(gw.key)}; ${hasGwSvc('proxy') ? 'no proxy' : 'proxy:8118'}; apply');openInspector('gateway','${escapeHtml(gw.key)}')">${hasGwSvc('proxy') ? '✔ proxy:8118 Enabled' : '+ Enable proxy:8118'}</button>
+          <button class="btn btn-sm ${hasGwSvc('dns') ? 'btn-primary' : ''} rw-only" onclick="execCli('gateway ${escapeHtml(gw.key)}; ${hasGwSvc('dns') ? 'no dns' : 'dns:53'}; apply');openInspector('gateway','${escapeHtml(gw.key)}')">${hasGwSvc('dns') ? '✔ dns:53 Enabled' : '+ Enable dns:53'}</button>
+          <button class="btn btn-sm ${hasGwSvc('ssh') ? 'btn-primary' : ''} rw-only" onclick="execCli('gateway ${escapeHtml(gw.key)}; ${hasGwSvc('ssh') ? 'no ssh' : 'ssh:22'}; apply');openInspector('gateway','${escapeHtml(gw.key)}')">${hasGwSvc('ssh') ? '✔ ssh:22 Enabled' : '+ Enable ssh:22'}</button>
+        </div>
+      </div>
+
+      <div class="prop-group">
+        <div class="prop-group-title">Attached WireGuard Tunnels (${(gw.tunnels || []).length})</div>
+        ${tunnelRows || '<div style="color:var(--muted);font-size:12px;margin-bottom:8px">No tunnels attached (Direct Internet NAT Gateway)</div>'}
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <input type="text" id="igw-add-tun" list="igw-wg-list" placeholder="Profile name (e.g. wg0.conf)" style="flex:1">
+          <datalist id="igw-wg-list">${wgFiles.map(f => `<option value="${escapeHtml(f)}">`).join('')}</datalist>
+          <button class="btn btn-sm btn-primary rw-only" onclick="const v=document.getElementById('igw-add-tun').value.trim();if(v)execCli('gateway ${escapeHtml(gw.key)}; tunnel '+v+'; apply')">+ Attach</button>
+        </div>
+      </div>
+
+      <div class="prop-group">
+        <div class="prop-group-title">Inbound Port Forwards (${(gw.forwards || []).length})</div>
+        ${fwdRows || '<div style="color:var(--muted);font-size:12px;margin-bottom:8px">No inbound port forwards</div>'}
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <input type="number" id="igw-fwd-port" placeholder="Port (e.g. 51413)" style="width:120px">
+          <input type="text" id="igw-fwd-target" placeholder="Target (e.g. qbittorrent:51413)" style="flex:1">
+          <button class="btn btn-sm btn-primary rw-only" onclick="const p=document.getElementById('igw-fwd-port').value.trim(),t=document.getElementById('igw-fwd-target').value.trim();if(p&&t)execCli('gateway ${escapeHtml(gw.key)}; forward '+p+' to '+t+'; apply')">+ Forward</button>
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn btn-ghost-danger rw-only" onclick="execCli('no gateway ${escapeHtml(gw.key)}; apply');closeInspector()">Delete Gateway</button>
+      <button class="btn" onclick="closeInspector()">Close</button>`;
+  }
+
+  else if (mode === 'new-gateway') {
+    titleEl.textContent = 'Create Virtual Gateway';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="prop-group-title">Gateway VIP &amp; Mode</div>
+        <div class="form-field">
+          <label>Gateway IPv4/CIDR or DHCP Name</label>
+          <input type="text" id="ngw-ip" placeholder="e.g. 192.168.1.10/21">
+        </div>
+        <div class="form-grid-2">
+          <div class="form-field">
+            <label>Balance Mode</label>
+            <select id="ngw-balance">
+              <option value="round-robin">round-robin</option>
+              <option value="sticky">sticky</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label>Killswitch</label>
+            <select id="ngw-ks">
+              <option value="on">on</option>
+              <option value="off">off</option>
+            </select>
+          </div>
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="closeInspector()">Cancel</button>
+      <button class="btn btn-primary rw-only" onclick="const ip=document.getElementById('ngw-ip').value.trim(),b=document.getElementById('ngw-balance').value,k=document.getElementById('ngw-ks').value;if(ip){execCli('gateway '+ip+'; balance '+b+'; killswitch '+k+'; check ping 5s; apply');closeInspector();}">Create Gateway</button>`;
+  }
+
+  else if (mode === 'upload-wg') {
+    titleEl.textContent = 'Upload WireGuard Profile (/data/wg)';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="form-field">
+          <label>Profile Filename</label>
+          <input type="text" id="uwg-name" placeholder="mullvad-us-sea-001.conf">
+        </div>
+        <div class="form-field">
+          <label>WireGuard .conf Content (<code>[Interface]</code> &amp; <code>[Peer]</code>)</label>
+          <textarea id="uwg-body" rows="10" class="mono" placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = 10.64.0.1/32&#10;&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = 198.51.100.1:51820&#10;AllowedIPs = 0.0.0.0/0"></textarea>
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="closeInspector()">Cancel</button>
+      <button class="btn btn-primary rw-only" onclick="submitUploadWg()">Save Profile</button>`;
+  }
+
+  else if (mode === 'new-dns-rule') {
+    titleEl.textContent = 'Add DNS Record or Policy Route';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="form-field">
+          <label>Rule Type</label>
+          <select id="ndns-type">
+            <option value="a">Authoritative A Record (a &lt;fqdn&gt; &lt;ipv4&gt;)</option>
+            <option value="cname">CNAME Alias (cname &lt;alias&gt; &lt;target&gt;)</option>
+            <option value="address">Wildcard Override (address &lt;*.domain&gt; &lt;ipv4&gt;)</option>
+            <option value="txt">TXT Record (txt &lt;fqdn&gt; "&lt;text&gt;")</option>
+            <option value="route">Gateway Policy Route (route &lt;domain&gt; via &lt;gw_ip&gt;)</option>
+            <option value="bypass">Gateway Bypass Rule (bypass &lt;domain&gt; from &lt;gw_ip&gt;)</option>
+            <option value="block">Adblock Sinkhole (block &lt;domain&gt;)</option>
+            <option value="forward">Split-Horizon Forward Zone (forward &lt;domain&gt; to &lt;dns_ip&gt;)</option>
+            <option value="upstream">Upstream Resolver (upstream &lt;dns_ip&gt;)</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label>Rule Arguments</label>
+          <input type="text" id="ndns-args" placeholder="e.g. nas.lan 192.168.1.50 or ipinfo.io via 192.168.1.10">
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="closeInspector()">Cancel</button>
+      <button class="btn btn-primary rw-only" onclick="const t=document.getElementById('ndns-type').value,a=document.getElementById('ndns-args').value.trim();if(a){execCli('dns; '+t+' '+a+'; apply');closeInspector();}">Add &amp; Apply</button>`;
+  }
+
+  else if (mode === 'dns-settings') {
+    const dns = cfg.dns || { domain: 'lan', cache_size: 10000, auto_vips: true, auto_hosts: true, health_aware: true, upstreams: ['1.1.1.1', '9.9.9.9'] };
+    titleEl.textContent = 'DNS Engine Settings (dnsmasq)';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="form-grid-2">
+          <div class="form-field">
+            <label>Local Search Domain</label>
+            <input type="text" id="ds-domain" value="${escapeHtml(dns.domain || 'lan')}">
+          </div>
+          <div class="form-field">
+            <label>Cache Size</label>
+            <input type="number" id="ds-cache" value="${escapeHtml(dns.cache_size || 10000)}">
+          </div>
+        </div>
+        <div class="form-grid-2">
+          <div class="form-field">
+            <label>Auto-Synthesize VIPs</label>
+            <select id="ds-av"><option value="on" ${dns.auto_vips ? 'selected' : ''}>on</option><option value="off" ${!dns.auto_vips ? 'selected' : ''}>off</option></select>
+          </div>
+          <div class="form-field">
+            <label>Health-Aware DNS</label>
+            <select id="ds-ha"><option value="on" ${dns.health_aware ? 'selected' : ''}>on</option><option value="off" ${!dns.health_aware ? 'selected' : ''}>off</option></select>
+          </div>
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="closeInspector()">Cancel</button>
+      <button class="btn btn-primary rw-only" onclick="const d=document.getElementById('ds-domain').value.trim()||'lan',c=document.getElementById('ds-cache').value||10000,av=document.getElementById('ds-av').value,ha=document.getElementById('ds-ha').value;execCli('dns; domain '+d+'; cache-size '+c+'; auto-vips '+av+'; health-aware '+ha+'; apply');closeInspector()">Save DNS Settings</button>`;
+  }
+
+  else if (mode === 'new-allow') {
+    titleEl.textContent = 'Add Firewall Allow-List Rule';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="form-field">
+          <label>Scope (Leave empty for Global Allow-List, or enter Service Key)</label>
+          <input type="text" id="na-svc" placeholder="Global (or e.g. 192.168.1.4:8000)">
+        </div>
+        <div class="form-field">
+          <label>Source CIDR, IPv4 Wildcard, or Hostname</label>
+          <input type="text" id="na-hosts" placeholder="e.g. 192.168.0.0/16 or *.office.lan">
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="closeInspector()">Cancel</button>
+      <button class="btn btn-primary rw-only" onclick="submitNewAllow()">Add &amp; Apply</button>`;
+  }
+
+  else if (mode === 'new-host-map') {
+    titleEl.textContent = 'Register Dynamic Hostname → IPv4';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="form-field">
+          <label>Concrete Hostname</label>
+          <input type="text" id="nh-name" placeholder="laptop.office.lan">
+        </div>
+        <div class="form-field">
+          <label>IPv4 Address(es)</label>
+          <input type="text" id="nh-ips" placeholder="192.168.1.99">
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="closeInspector()">Cancel</button>
+      <button class="btn btn-primary rw-only" onclick="submitNewHostMap()">Register Host</button>`;
+  }
+
+  else if (mode === 'new-ssh-key') {
+    titleEl.textContent = 'Add SSH Authorized Public Key';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="form-field">
+          <label>Key Name</label>
+          <input type="text" id="nssh-name" placeholder="workstation">
+        </div>
+        <div class="form-field">
+          <label>OpenSSH Public Key Line (<code>ssh-ed25519</code>, <code>ecdsa-*</code>, <code>ssh-rsa</code>)</label>
+          <textarea id="nssh-key" rows="4" class="mono" placeholder="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@host"></textarea>
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="closeInspector()">Cancel</button>
+      <button class="btn btn-primary rw-only" onclick="submitNewSshKey()">Save SSH Key</button>`;
+  }
+
+  else if (mode === 'cf-config') {
+    titleEl.textContent = 'Configure Cloudflare Zero-Trust Credentials';
+    bodyEl.innerHTML = `
+      <div class="prop-group">
+        <div class="form-field">
+          <label>Cloudflare API Token (Zone:Edit, DNS:Edit, Tunnel:Edit)</label>
+          <input type="password" id="cf-api-token" placeholder="cfat_...">
+        </div>
+        <div class="form-field">
+          <label>Optional Account ID (auto-discovered if omitted)</label>
+          <input type="text" id="cf-account-id" value="${escapeHtml((cfData && cfData.account_id) || '')}" placeholder="Auto-discover">
+        </div>
+        <div class="form-field">
+          <label>Tunnel Name</label>
+          <input type="text" id="cf-tunnel-name" value="${escapeHtml((cfData && cfData.tunnel_name) || 'nfty-appliance')}">
+        </div>
+      </div>`;
+    footEl.innerHTML = `
+      <button class="btn" onclick="closeInspector()">Cancel</button>
+      <button class="btn btn-primary rw-only" onclick="submitCfConfig()">Save &amp; Sync Tunnel</button>`;
+  }
+
+  document.getElementById('inspector-backdrop').classList.add('open');
+  document.getElementById('inspector').classList.add('open');
+}
+
+function toggleNewServiceFields() {
+  const kind = document.getElementById('ns-kind').value;
+  document.getElementById('ns-proxy-fields').style.display = (kind === 'proxy') ? 'block' : 'none';
+}
+
+async function submitInspectorAuth() {
+  const key = document.getElementById('insp-api-key').value.trim();
+  if (!key) {
+    document.getElementById('insp-auth-err').textContent = 'Enter an API key';
+    return;
+  }
+  const prev = getAuthToken();
+  setAuthToken(key);
+  try {
+    const res = await apiFetch('/api/v1/auth/whoami');
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      setAuthToken(prev);
+      document.getElementById('insp-auth-err').textContent = data.error || 'Invalid API key';
+      return;
+    }
+    closeInspector();
+    showToast(`Authenticated with ${data.scope.toUpperCase()} key`);
+    checkWhoami();
+    refreshDashboard();
+  } catch (e) {
+    setAuthToken(prev);
+    document.getElementById('insp-auth-err').textContent = e.message;
+  }
+}
+
+async function submitNewService() {
+  const vip = document.getElementById('ns-vip').value.trim();
+  const kind = document.getElementById('ns-kind').value;
+  const allow = document.getElementById('ns-allow').value.trim();
+  if (!vip) return showToast('Target VIP is required', true);
+
+  let cmds = [`vip ${vip}`];
+  if (kind === 'proxy') {
+    const port = document.getElementById('ns-port').value.trim();
+    const proto = document.getElementById('ns-proto').value;
+    const backend = document.getElementById('ns-backend').value.trim();
+    const balance = document.getElementById('ns-balance').value;
+    const check = document.getElementById('ns-check').value;
+    const hostname = document.getElementById('ns-hostname').value.trim();
+    const cf = document.getElementById('ns-cf').value.trim();
+    if (!backend) return showToast('Backend host:port is required', true);
+
+    const bPort = backend.includes(':') ? backend.split(':').pop() : '';
+    const listenSpec = port ? (proto !== 'tcp' ? `${port}/${proto}` : `${port}`) : (bPort || '');
+    if (!listenSpec) return showToast('Specify an external port or host:port', true);
+
+    if (port && port !== bPort) {
+      cmds.push(`${listenSpec} to ${backend}`);
+      cmds.push(`service ${vip}:${listenSpec}`);
+    } else if (backend.includes(':')) {
+      cmds.push(`${backend}`);
+    } else {
+      cmds.push(`${listenSpec} to ${backend}:${port}`);
+      cmds.push(`service ${vip}:${listenSpec}`);
+    }
+    if (balance && balance !== 'round-robin') cmds.push(`balance ${balance}`);
+    if (check) cmds.push(`check ${check}`);
+    if (hostname) cmds.push(`hostname ${hostname}`);
+    if (cf) cmds.push(`cloudflare-dns ${cf}`);
+    if (allow) cmds.push(`allow ${allow}`);
+  } else {
+    const specMap = { 'http-proxy': 'proxy:8118', ssh: 'ssh:22', dns: 'dns:53', web: 'web:8000', api: 'api:8080' };
+    cmds.push(specMap[kind]);
+    if (allow) cmds.push(`allow ${allow}`);
+  }
+  cmds.push('apply');
+  const res = await execCli(cmds.join('; '));
+  if (res) closeInspector();
+}
+
+async function addBackendToSvc(svcKey) {
+  const val = document.getElementById('insp-add-backend').value.trim();
+  if (!val) return;
+  await execCli(`service ${svcKey}; to ${val}; apply`);
+  openInspector('service', svcKey);
+}
+
+async function removeBackendFromSvc(svcKey, target) {
+  await execCli(`service ${svcKey}; no to ${target}; apply`);
+  openInspector('service', svcKey);
+}
+
+async function saveServiceProps(svcKey) {
+  const h = document.getElementById('insp-svc-hostname').value.trim();
+  const cf = document.getElementById('insp-svc-cf').value.trim();
+  const bal = document.getElementById('insp-svc-balance').value;
+  const chk = document.getElementById('insp-svc-check').value.trim();
+  const cmds = [`service ${svcKey}`, `balance ${bal}`];
+  cmds.push(h ? `hostname ${h}` : 'no hostname');
+  cmds.push(cf ? `cloudflare-dns ${cf}` : 'no cloudflare-dns');
+  cmds.push(chk ? `check ${chk}` : 'no check');
+  cmds.push('apply');
+  await execCli(cmds.join('; '));
+  openInspector('service', svcKey);
+}
+
+async function addAllowFromInspector(svcKey) {
+  const val = document.getElementById('insp-svc-allow-add').value.trim();
+  if (!val) return;
+  const res = await apiFetch('/api/v1/allow', {
+    method: 'POST',
+    body: JSON.stringify({ service: svcKey, hosts: val.split(/[\s,]+/).filter(Boolean), apply: true })
+  });
+  if (res.ok) {
+    showToast(`Added ${val} to ${svcKey}`);
+    await refreshDashboard();
+    openInspector('service', svcKey);
+  } else {
+    const d = await res.json().catch(() => ({}));
+    showToast(d.error || 'Failed to add allow rule', true);
+  }
+}
+
+async function submitNewVip() {
+  const ip = document.getElementById('nv-ip').value.trim();
+  const iface = document.getElementById('nv-iface').value.trim();
+  const vlan = document.getElementById('nv-vlan').value.trim();
+  const ssh = document.getElementById('nv-ssh').value;
+  if (!ip) return showToast('VIP address or name required', true);
+  const cmds = [`vip ${ip}`];
+  if (iface) cmds.push(`interface ${iface}`);
+  if (vlan) cmds.push(`vlan ${vlan}`);
+  if (ssh === 'yes') cmds.push('ssh:22');
+  cmds.push('apply');
+  const ok = await execCli(cmds.join('; '));
+  if (ok) closeInspector();
+}
+
+async function submitUploadWg() {
+  const name = document.getElementById('uwg-name').value.trim();
+  const config = document.getElementById('uwg-body').value.trim();
+  if (!name || !config) return showToast('Filename and config required', true);
+  const res = await apiFetch('/api/v1/wg', {
+    method: 'POST',
+    body: JSON.stringify({ name, config })
+  });
+  const d = await res.json().catch(() => ({}));
+  if (res.ok && d.ok) {
+    showToast(`Saved /data/wg/${d.filename}`);
+    closeInspector();
+    refreshDashboard();
+  } else {
+    showToast(d.error || 'Invalid WireGuard config', true);
+  }
+}
+
+async function submitNewAllow() {
+  const svc = document.getElementById('na-svc').value.trim();
+  const hosts = document.getElementById('na-hosts').value.trim().split(/[\s,]+/).filter(Boolean);
+  if (!hosts.length) return showToast('Enter at least one CIDR or hostname', true);
+  const payload = { hosts, apply: true };
+  if (svc) payload.service = svc;
+  const res = await apiFetch('/api/v1/allow', { method: 'POST', body: JSON.stringify(payload) });
+  const d = await res.json().catch(() => ({}));
+  if (res.ok && d.ok) {
+    showToast('Updated allow-list');
+    closeInspector();
+    refreshDashboard();
+  } else {
+    showToast(d.error || 'Failed to update allow-list', true);
+  }
+}
+
+async function submitNewHostMap() {
+  const host = document.getElementById('nh-name').value.trim();
+  const ips = document.getElementById('nh-ips').value.trim().split(/[\s,]+/).filter(Boolean);
+  if (!host || !ips.length) return showToast('Hostname and IPv4 required', true);
+  const res = await apiFetch('/api/v1/allow/hosts', { method: 'POST', body: JSON.stringify({ host, ips }) });
+  const d = await res.json().catch(() => ({}));
+  if (res.ok && d.ok) {
+    showToast(`Mapped ${host} -> ${ips.join(', ')}`);
+    closeInspector();
+    refreshDashboard();
+  } else {
+    showToast(d.error || 'Failed to register host', true);
+  }
+}
+
+async function submitNewSshKey() {
+  const name = document.getElementById('nssh-name').value.trim();
+  const key = document.getElementById('nssh-key').value.trim();
+  if (!name || !key) return showToast('Key name and public key required', true);
+  const res = await apiFetch('/api/v1/ssh', { method: 'POST', body: JSON.stringify({ name, key }) });
+  const d = await res.json().catch(() => ({}));
+  if (res.ok && d.ok) {
+    showToast(`Saved SSH key ${d.filename}`);
+    closeInspector();
+    refreshDashboard();
+  } else {
+    showToast(d.error || 'Invalid OpenSSH public key', true);
+  }
+}
+
+async function deleteSshKey(name) {
+  const res = await apiFetch('/api/v1/ssh', { method: 'DELETE', body: JSON.stringify({ name }) });
+  if (res.ok) {
+    showToast(`Deleted SSH key ${name}`);
+    refreshDashboard();
+  }
+}
+
+async function fetchCloudflareStatus() {
+  try {
+    const res = await apiFetch('/api/v1/cloudflare');
+    if (res.ok) {
+      cfData = await res.json();
+      renderCloudflareView();
+    }
+  } catch (e) {}
+}
+
+async function submitCfConfig() {
+  const api_token = document.getElementById('cf-api-token').value.trim();
+  const account_id = document.getElementById('cf-account-id').value.trim();
+  const tunnel_name = document.getElementById('cf-tunnel-name').value.trim();
+  const payload = {};
+  if (api_token) payload.api_token = api_token;
+  if (account_id) payload.account_id = account_id;
+  if (tunnel_name) payload.tunnel_name = tunnel_name;
+  const res = await apiFetch('/api/v1/cloudflare', { method: 'POST', body: JSON.stringify(payload) });
+  const d = await res.json().catch(() => ({}));
+  if (res.ok && d.ok) {
+    showToast('Cloudflare tunnel synced');
+    closeInspector();
+    fetchCloudflareStatus();
+  } else {
+    showToast(d.error || 'Cloudflare sync failed', true);
+  }
+}
+
+/* =========================================================================
+   TABLE RENDERERS (High-Density UniFi Table Views)
+   ========================================================================= */
+function getAllVipKeys(cfg) {
+  const set = new Set(Object.keys(cfg.vips || {}));
+  Object.values(cfg.services || {}).forEach(s => {
+    if (s.vip_id) set.add(s.vip_id);
+    else if (s.listen_ip) set.add(s.listen_ip);
+  });
+  return Array.from(set);
+}
+
+function renderServicesView() {
+  if (!stateData) return;
+  const cfg = stateData.active_config || { vips: {}, services: {}, gateways: {}, global_allow: [] };
+  const services = Object.values(cfg.services || {});
+  const runtime = stateData.runtime || {};
+  const activeMap = stateData.active_backends || {};
+  const q = (document.getElementById('svc-search').value || '').toLowerCase().trim();
+
+  const filtered = services.filter(svc => {
+    const name = svc.name || '';
+    const isSys = name.startsWith('ssh:') || name.startsWith('dns:') || name.startsWith('web:') || name.startsWith('api:') || name.startsWith('proxy:');
+    const hasVhost = Boolean(svc.hostname || svc.cloudflare);
+    if (svcFilter === 'proxy' && isSys) return false;
+    if (svcFilter === 'vhost' && !hasVhost) return false;
+    if (svcFilter === 'system' && !isSys) return false;
+    if (!q) return true;
+    const backendsStr = (svc.backends || []).map(b => `${b.host || ''} ${b.ip}:${b.port}`).join(' ');
+    const hay = `${svc.key} ${name} ${svc.vip_id || ''} ${svc.listen_ip || ''} ${svc.hostname || ''} ${svc.cloudflare || ''} ${backendsStr}`.toLowerCase();
+    return hay.includes(q);
+  });
+
+  const wrap = document.getElementById('services-table-wrap');
+  if (!filtered.length) {
+    wrap.innerHTML = `<div class="empty-state">No matching services or proxies. Click <strong>+ Create Proxy / Service</strong> to add one.</div>`;
+    return;
+  }
+
+  let rowsHtml = '';
+  for (const svc of filtered) {
+    const vipKey = svc.vip_id || svc.listen_ip || 'any';
+    const ifaceStr = svc.vip ? `${svc.vip.interface}/${svc.vip.prefix_len}` : 'eth0/24';
+    const name = svc.name || `:${svc.port}`;
+    const isWeb = name.startsWith('web:');
+    const isApi = name.startsWith('api:');
+    const isSsh = name.startsWith('ssh:');
+    const isDns = name.startsWith('dns:');
+    const isHttpProxy = name.startsWith('proxy:');
+    const typePill = isWeb ? `<span class="status-pill pill-blue">Web Console</span>`
+      : isApi ? `<span class="status-pill pill-purple">Control API</span>`
+      : isHttpProxy ? `<span class="status-pill pill-purple">HTTP Proxy :${escapeHtml(svc.port)}</span>`
+      : isSsh ? `<span class="tag">SSH :${escapeHtml(svc.port)}</span>`
+      : isDns ? `<span class="tag">DNS :${escapeHtml(svc.port)}</span>`
+      : `<span class="status-pill pill-up">L4/L7 Proxy</span>`;
+
+    const backends = svc.backends || [];
+    let totalPkts = 0, totalBytes = 0, bestLat = null;
+    let upCount = 0, drainCount = 0, downCount = 0;
+
+    const backendSummary = backends.map(b => {
+      const ep = b.host ? `${b.host}(${b.ip}):${b.port}` : `${b.ip}:${b.port}`;
+      const isLocal = b.ip === '127.0.0.1';
+      const rt = runtime[ep] || { health: isLocal ? 'UP' : 'UNKNOWN', drained: false, packets: 0, bytes: 0 };
+      totalPkts += (rt.packets || 0);
+      totalBytes += (rt.bytes || 0);
+      if (rt.latency_ms != null && (bestLat === null || rt.latency_ms < bestLat)) bestLat = rt.latency_ms;
+      if (rt.drained) drainCount++;
+      else if (rt.health === 'UP' || isLocal) upCount++;
+      else if (rt.health === 'DOWN') downCount++;
+      else upCount++;
+      return isLocal ? `local:${svc.port}` : (b.host ? `${b.host}:${b.port} (${b.ip})` : `${b.ip}:${b.port}`);
+    }).join(', ');
+
+    let statusDot = 'dot-up', statusText = 'Active';
+    if (downCount > 0 && upCount === 0) { statusDot = 'dot-down'; statusText = 'Down'; }
+    else if (drainCount > 0 && upCount === 0) { statusDot = 'dot-drain'; statusText = 'Drained'; }
+    else if (downCount > 0) { statusDot = 'dot-drain'; statusText = `${upCount}/${backends.length} Up`; }
+
+    const hostBadges = [
+      svc.hostname ? `<span class="tag" title="mDNS &amp; L7 Host/SNI">🌐 ${escapeHtml(svc.hostname)}</span>` : '',
+      svc.cloudflare ? `<span class="tag" style="border-color:rgba(247,144,9,0.4);color:var(--amber-text)" title="Cloudflare Tunnel">☁ ${escapeHtml(svc.cloudflare)}</span>` : ''
+    ].filter(Boolean).join(' ');
+
+    const allowList = [...(cfg.global_allow || []), ...(svc.allow || [])];
+    const allowCell = allowList.length
+      ? allowList.slice(0, 2).map(a => `<span class="tag">${escapeHtml(a)}</span>`).join(' ') + (allowList.length > 2 ? ` <span class="tag">+${allowList.length - 2}</span>` : '')
+      : `<span style="color:var(--muted)">Any</span>`;
+
+    rowsHtml += `<tr class="clickable ${selectedRowKey === svc.key ? 'selected' : ''}" data-key="${escapeHtml(svc.key)}" onclick="openInspector('service', this.dataset.key)">
+      <td>
+        <div style="display:flex;align-items:center;gap:9px">
+          <span class="status-dot ${statusDot}"></span>
+          <div>
+            <div style="font-weight:600;color:var(--text-strong)">${escapeHtml(name)}</div>
+            <div class="mono" style="font-size:11px;color:var(--muted)">${escapeHtml(svc.key)}</div>
+          </div>
+        </div>
+      </td>
+      <td>${typePill}</td>
+      <td>
+        <span class="mono" style="color:var(--text)">${escapeHtml(vipKey)}</span>
+        <span class="tag" style="margin-left:4px">${escapeHtml(ifaceStr)}</span>
+      </td>
+      <td class="mono">:${escapeHtml(svc.port)}/${escapeHtml(svc.proto)}</td>
+      <td class="mono" style="color:var(--text-secondary)">${escapeHtml(backendSummary || '-')}</td>
+      <td>${hostBadges || '<span style="color:var(--muted)">—</span>'}</td>
+      <td>${allowCell}</td>
+      <td class="mono">${bestLat != null ? bestLat.toFixed(1) + ' ms' : '<span style="color:var(--muted)">—</span>'}</td>
+      <td class="mono" style="color:var(--text-secondary)">${totalPkts} pkts <span style="color:var(--muted)">(${formatBytes(totalBytes)})</span></td>
+      <td style="text-align:right" onclick="event.stopPropagation()">
+        <button class="btn btn-sm" data-key="${escapeHtml(svc.key)}" onclick="openInspector('service', this.dataset.key)">Inspect</button>
+      </td>
+    </tr>`;
+  }
+
+  wrap.innerHTML = `<table>
+    <thead>
+      <tr>
+        <th>Service</th>
+        <th>Role</th>
+        <th>Virtual IP</th>
+        <th>Listen</th>
+        <th>Target Backend(s)</th>
+        <th>Hostname / Cloudflare</th>
+        <th>Access ACL</th>
+        <th>Latency</th>
+        <th>Traffic</th>
+        <th style="text-align:right">Actions</th>
+      </tr>
+    </thead>
+    <tbody>${rowsHtml}</tbody>
+  </table>`;
+}
+
+function renderVipsView() {
+  if (!stateData) return;
+  const cfg = stateData.active_config || { vips: {}, services: {}, gateways: {} };
+  const services = Object.values(cfg.services || {});
+  const allVipKeys = getAllVipKeys(cfg);
+  const wrap = document.getElementById('vips-table-wrap');
+
+  if (!allVipKeys.length) {
+    wrap.innerHTML = `<div class="empty-state">No Virtual IPs configured. Click <strong>+ Create VIP</strong> to bind one.</div>`;
+    return;
+  }
+
+  const rows = allVipKeys.map(vipKey => {
+    const v = (cfg.vips || {})[vipKey] || { interface: 'eth0', prefix_len: 24, dhcp: false, vlan: null };
+    const attached = services.filter(s => s.vip_id === vipKey || s.listen_ip === vipKey);
+    const svcsTags = attached.map(s => `<span class="tag clickable" data-key="${escapeHtml(s.key)}" onclick="openInspector('service', this.dataset.key)">${escapeHtml(s.name || (':' + s.port))}</span>`).join(' ');
+    return `<tr>
+      <td>
+        <div style="display:flex;align-items:center;gap:9px">
+          <span class="status-dot dot-up"></span>
+          <strong class="mono" style="color:var(--text-strong);font-size:13.5px">${escapeHtml(vipKey)}</strong>
+          ${v.leased_ip ? `<span class="tag">${escapeHtml(v.leased_ip)}</span>` : ''}
+        </div>
+      </td>
+      <td><span class="status-pill ${v.dhcp ? 'pill-purple' : 'pill-blue'}">${v.dhcp ? 'DHCP macvlan' : 'Static IPv4'}</span></td>
+      <td class="mono">${escapeHtml(v.interface || 'eth0')}/${escapeHtml(v.prefix_len || 24)}</td>
+      <td>${v.vlan ? `<span class="tag">VLAN ${escapeHtml(v.vlan)}</span>` : '<span style="color:var(--muted)">Untagged</span>'}</td>
+      <td>${svcsTags || '<span style="color:var(--muted)">No services</span>'}</td>
+      <td style="text-align:right">
+        <button class="btn btn-sm rw-only" data-vip="${escapeHtml(vipKey)}" onclick="openInspector('new-service', this.dataset.vip)">+ Add Proxy / Service</button>
+        <button class="btn btn-sm btn-ghost-danger rw-only" data-vip="${escapeHtml(vipKey)}" onclick="execCli('no vip ' + this.dataset.vip + '; apply')">Delete VIP</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  wrap.innerHTML = `<table>
+    <thead>
+      <tr>
+        <th>VIP Address / Name</th>
+        <th>Mode</th>
+        <th>Interface / CIDR</th>
+        <th>802.1Q VLAN</th>
+        <th>Attached Services &amp; Listeners</th>
+        <th style="text-align:right">Actions</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderGatewaysView() {
+  if (!stateData) return;
+  const cfg = stateData.active_config || { gateways: {} };
+  const gateways = Object.values(cfg.gateways || {});
+  const runtime = stateData.runtime || {};
+  const wgConfigs = stateData.wg_configs || {};
+  const wrap = document.getElementById('gateways-table-wrap');
+
+  let html = '';
+  for (const gw of gateways) {
+    const ifaceStr = gw.vip ? `${gw.vip.interface}/${gw.vip.prefix_len}` : 'eth0/24';
+    const fwds = (gw.forwards || []).map(f => `<span class="tag">:${escapeHtml(f.listen_port)} → ${escapeHtml(f.backend.host || f.backend.ip)}:${escapeHtml(f.backend.port)}</span>`).join(' ');
+    html += `<tr class="group-row">
+      <td colspan="6">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span class="status-dot dot-up"></span>
+            <span style="color:var(--text-strong);font-size:13px;text-transform:none">Gateway ${escapeHtml(gw.key)} (${escapeHtml(ifaceStr)})</span>
+            <span class="status-pill ${gw.killswitch ? 'pill-up' : 'pill-drain'}">Killswitch: ${gw.killswitch ? 'ON' : 'OFF'}</span>
+            <span class="tag">Balance: ${escapeHtml(gw.balance)}</span>
+            ${fwds}
+          </div>
+          <button class="btn btn-sm" data-gw="${escapeHtml(gw.key)}" onclick="openInspector('gateway', this.dataset.gw)">Configure Gateway</button>
+        </div>
+      </td>
+    </tr>`;
+
+    const tunnels = gw.tunnels || [];
+    if (!tunnels.length) {
+      html += `<tr><td colspan="6" style="color:var(--muted);padding-left:32px">Direct Internet NAT Gateway (no WireGuard tunnels attached)</td></tr>`;
+    } else {
+      for (const t of tunnels) {
+        const ep = `wg:${t.name}(${t.iface})`;
+        const rt = runtime[ep] || {};
+        const isUp = rt.health === 'UP';
+        const parsed = (wgConfigs[t.name] && wgConfigs[t.name].Ok) || {};
+        html += `<tr class="clickable" data-gw="${escapeHtml(gw.key)}" onclick="openInspector('gateway', this.dataset.gw)">
+          <td style="padding-left:32px">
+            <div style="display:flex;align-items:center;gap:8px">
+              <span class="status-dot ${isUp ? 'dot-up' : 'dot-down'}"></span>
+              <strong class="mono">${escapeHtml(t.iface)}</strong>
+            </div>
+          </td>
+          <td class="mono">${escapeHtml(t.name)}</td>
+          <td class="mono">${escapeHtml(parsed.address || t.address || '—')}</td>
+          <td class="mono">${escapeHtml(parsed.endpoint || t.endpoint || '—')}</td>
+          <td class="mono">${rt.latency_ms != null ? rt.latency_ms.toFixed(1) + ' ms' : '—'} <span class="tag">w=${escapeHtml(t.weight || 1)}</span></td>
+          <td class="mono">${escapeHtml(rt.packets || 0)} pkts <span style="color:var(--muted)">(${formatBytes(rt.bytes || 0)})</span></td>
+        </tr>`;
+      }
+    }
+  }
+
+  const wgEntries = Object.entries(wgConfigs);
+  if (wgEntries.length) {
+    html += `<tr class="group-row"><td colspan="6">Saved WireGuard Profiles on Disk (/data/wg/*.conf)</td></tr>`;
+    for (const [name, res] of wgEntries) {
+      const w = res.Ok || {};
+      html += `<tr>
+        <td style="padding-left:32px"><strong class="mono">${escapeHtml(name)}</strong></td>
+        <td><span class="tag">Saved Profile</span></td>
+        <td class="mono">${escapeHtml(w.address || '—')}</td>
+        <td class="mono">${escapeHtml(w.endpoint || '—')}</td>
+        <td class="mono">keepalive ${escapeHtml(w.keepalive || 25)}s</td>
+        <td style="text-align:right">
+          ${currentScope === 'rw' ? `<button class="btn btn-sm btn-ghost-danger" data-name="${escapeHtml(name)}" onclick="execCli('wg rm ' + this.dataset.name)">Delete File</button>` : ''}
+        </td>
+      </tr>`;
+    }
+  }
+
+  wrap.innerHTML = html
+    ? `<table><thead><tr><th>Interface / Profile</th><th>Config Name</th><th>Tunnel Address</th><th>Remote Endpoint</th><th>RTT / Weight</th><th>Traffic / Actions</th></tr></thead><tbody>${html}</tbody></table>`
+    : `<div class="empty-state">No VPN Gateways or WireGuard profiles configured.</div>`;
+}
+
+function renderDnsView() {
+  if (!stateData) return;
+  const dns = (stateData.active_config || {}).dns;
+  const wrap = document.getElementById('dns-table-wrap');
+  const sub = document.getElementById('dns-summary-subtitle');
+
+  if (!dns) {
+    sub.textContent = 'DNS block not currently enabled in Nftyfile';
+    wrap.innerHTML = `<div class="empty-state">Programmable DNS is not enabled yet. Click <strong>+ Add DNS / Route Rule</strong> or <strong>⚙ DNS Engine Settings</strong> to initialize it.</div>`;
+    return;
+  }
+
+  sub.textContent = `Domain: ${dns.domain || 'lan'} • Cache: ${dns.cache_size} • Auto-VIPs: ${dns.auto_vips ? 'ON' : 'OFF'} • Health-Aware: ${dns.health_aware ? 'ON' : 'OFF'} • Upstreams: ${(dns.upstreams || []).join(', ') || 'none'}`;
+
+  let rows = '';
+  for (const u of (dns.upstreams || [])) {
+    rows += `<tr>
+      <td><span class="status-pill pill-blue">UPSTREAM</span></td>
+      <td class="mono">${escapeHtml(u)}</td>
+      <td>Recursive Upstream Resolver</td>
+      <td style="text-align:right"><button class="btn btn-sm btn-ghost-danger rw-only" data-u="${escapeHtml(u)}" onclick="execCli('dns; no upstream ' + this.dataset.u + '; apply')">✕</button></td>
+    </tr>`;
+  }
+  for (const fz of (dns.forward_zones || [])) {
+    rows += `<tr>
+      <td><span class="status-pill pill-purple">FORWARD ZONE</span></td>
+      <td class="mono">${escapeHtml(fz.domain)}</td>
+      <td class="mono">→ ${escapeHtml((fz.servers || []).join(', '))}${fz.via_gateway ? ' via ' + escapeHtml(fz.via_gateway) : ''}</td>
+      <td style="text-align:right"><button class="btn btn-sm btn-ghost-danger rw-only" data-d="${escapeHtml(fz.domain)}" onclick="execCli('dns; no forward ' + this.dataset.d + '; apply')">✕</button></td>
+    </tr>`;
+  }
+  for (const r of (dns.records || [])) {
+    const kind = (r.type || 'a').toUpperCase();
+    const name = r.name || r.domain || r.alias || r.service || r.ip || '';
+    const target = r.ips ? r.ips.join(', ') : (r.ip || r.target || r.text || '');
+    rows += `<tr>
+      <td><span class="status-pill pill-up">${escapeHtml(kind)} RECORD</span></td>
+      <td class="mono">${escapeHtml(name)}</td>
+      <td class="mono">${escapeHtml(target)}</td>
+      <td style="text-align:right"><button class="btn btn-sm btn-ghost-danger rw-only" data-k="${escapeHtml(kind.toLowerCase())}" data-n="${escapeHtml(name)}" onclick="execCli('dns; no ' + this.dataset.k + ' ' + this.dataset.n + '; apply')">✕</button></td>
+    </tr>`;
+  }
+  for (const nr of (dns.nft_rules || [])) {
+    const isBypass = nr.action === 'bypass';
+    const doms = (nr.domains || []).join(' ');
+    rows += `<tr>
+      <td><span class="status-pill ${isBypass ? 'pill-drain' : 'pill-blue'}">${isBypass ? 'NFTSET BYPASS' : 'NFTSET ROUTE'}</span></td>
+      <td class="mono">${escapeHtml(doms)}</td>
+      <td class="mono">${isBypass ? 'bypass from ' : 'route via '} ${escapeHtml(nr.gateway)}</td>
+      <td style="text-align:right"><button class="btn btn-sm btn-ghost-danger rw-only" data-act="${isBypass ? 'bypass' : 'route'}" data-gw="${escapeHtml(nr.gateway)}" onclick="execCli('dns; no ' + this.dataset.act + ' ' + this.dataset.gw + '; apply')">✕</button></td>
+    </tr>`;
+  }
+  for (const b of (dns.blocks || [])) {
+    rows += `<tr>
+      <td><span class="status-pill pill-down">SINKHOLE</span></td>
+      <td class="mono">${escapeHtml(b)}</td>
+      <td class="mono">0.0.0.0 / ::</td>
+      <td style="text-align:right"><button class="btn btn-sm btn-ghost-danger rw-only" data-b="${escapeHtml(b)}" onclick="execCli('dns; no block ' + this.dataset.b + '; apply')">✕</button></td>
+    </tr>`;
+  }
+
+  wrap.innerHTML = rows
+    ? `<table><thead><tr><th>Rule Type</th><th>Domain / Match</th><th>Target / Action</th><th style="text-align:right">Remove</th></tr></thead><tbody>${rows}</tbody></table>`
+    : `<div class="empty-state">DNS engine active with automatic VIP &amp; service hostname synthesis.</div>`;
+}
+
+function renderFirewallView() {
+  if (!stateData) return;
+  const cfg = stateData.active_config || { global_allow: [], services: {} };
+  const resolvedHosts = stateData.resolved_hosts || {};
+  const sshKeys = stateData.ssh_keys || {};
+
+  // 5a. Allow-Lists Table
+  let allowRows = '';
+  for (const g of (cfg.global_allow || [])) {
+    allowRows += `<tr>
+      <td><span class="status-pill pill-blue">Global Allow</span></td>
+      <td class="mono">All Services &amp; Gateways</td>
+      <td class="mono">${escapeHtml(g)}</td>
+      <td style="text-align:right"><button class="btn btn-sm btn-ghost-danger rw-only" data-e="${escapeHtml(g)}" onclick="removeAllowEntry(null, this.dataset.e)">✕</button></td>
+    </tr>`;
+  }
+  for (const svc of Object.values(cfg.services || {})) {
+    for (const a of (svc.allow || [])) {
+      allowRows += `<tr>
+        <td><span class="status-pill pill-up">Service ACL</span></td>
+        <td class="mono">${escapeHtml(svc.key)} ${svc.name ? `<span class="tag">${escapeHtml(svc.name)}</span>` : ''}</td>
+        <td class="mono">${escapeHtml(a)}</td>
+        <td style="text-align:right"><button class="btn btn-sm btn-ghost-danger rw-only" data-s="${escapeHtml(svc.key)}" data-e="${escapeHtml(a)}" onclick="removeAllowEntry(this.dataset.s, this.dataset.e)">✕</button></td>
+      </tr>`;
+    }
+  }
+  for (const [host, ips] of Object.entries(resolvedHosts)) {
+    allowRows += `<tr>
+      <td><span class="status-pill pill-purple">Host Mapping</span></td>
+      <td class="mono">${escapeHtml(host)}</td>
+      <td class="mono">${escapeHtml((ips || []).join(', '))}</td>
+      <td style="text-align:right"></td>
+    </tr>`;
+  }
+  document.getElementById('allow-table-wrap').innerHTML = allowRows
+    ? `<table><thead><tr><th>Type</th><th>Scope / Hostname</th><th>Allowed Source / Resolved IPv4</th><th style="text-align:right">Actions</th></tr></thead><tbody>${allowRows}</tbody></table>`
+    : `<div class="empty-state">No global or service allow-list entries configured.</div>`;
+
+  // 5b. SSH Keys Table
+  const sshEntries = Object.entries(sshKeys);
+  document.getElementById('ssh-table-wrap').innerHTML = sshEntries.length
+    ? `<table><thead><tr><th>Key File</th><th>Algorithm</th><th>Fingerprint</th><th>Comment</th><th style="text-align:right">Actions</th></tr></thead><tbody>${
+        sshEntries.map(([name, res]) => {
+          const k = res.Ok || {};
+          return `<tr>
+            <td class="mono"><strong>${escapeHtml(name)}</strong></td>
+            <td><span class="tag">${escapeHtml(k.algorithm || 'invalid')}</span></td>
+            <td class="mono">${escapeHtml(k.fingerprint || res.Err || '')}</td>
+            <td>${escapeHtml(k.comment || '—')}</td>
+            <td style="text-align:right"><button class="btn btn-sm btn-ghost-danger rw-only" data-n="${escapeHtml(name)}" onclick="deleteSshKey(this.dataset.n)">Delete</button></td>
+          </tr>`;
+        }).join('')
+      }</tbody></table>`
+    : `<div class="empty-state">No SSH public keys stored in <code>/data/ssh/</code>. Click <strong>+ Add SSH Public Key</strong> to add one.</div>`;
+}
+
+function renderCloudflareView() {
+  const wrap = document.getElementById('cf-table-wrap');
+  const sub = document.getElementById('cf-status-subtitle');
+  if (!cfData) {
+    wrap.innerHTML = `<div class="empty-state">Loading Cloudflare tunnel status...</div>`;
+    return;
+  }
+  sub.textContent = `Connector: ${cfData.daemon_running ? 'RUNNING (PID ' + cfData.daemon_pid + ')' : 'STOPPED'} • Tunnel: ${cfData.tunnel_name || '-'} (${cfData.tunnel_id || 'not provisioned'}) • API Token: ${cfData.api_token_configured ? 'Configured' : 'Not Set'}`;
+
+  const routes = cfData.routes || [];
+  wrap.innerHTML = routes.length
+    ? `<table><thead><tr><th>Service Key</th><th>Public Cloudflare Hostname</th><th>Local Upstream Target</th></tr></thead><tbody>${
+        routes.map(r => `<tr>
+          <td class="mono"><strong>${escapeHtml(r[0])}</strong></td>
+          <td><a href="https://${escapeHtml(r[1])}" target="_blank" rel="noopener" class="mono" style="color:var(--blue-text);text-decoration:none">https://${escapeHtml(r[1])} ↗</a></td>
+          <td class="mono">${escapeHtml(r[2])}</td>
+        </tr>`).join('')
+      }</tbody></table>`
+    : `<div class="empty-state">No services have <code>cloudflare-dns &lt;fqdn&gt;</code> configured yet. Click any service in <strong>Services &amp; Proxies</strong> to add a public Cloudflare hostname.</div>`;
+}
+
+function renderFlowsView() {
   if (!stateData) return;
   const flows = stateData.flows || [];
   const q = (document.getElementById('flow-filter').value || '').toLowerCase().trim();
@@ -1183,28 +2550,28 @@ function renderFlowsTable() {
     : flows;
 
   const wrap = document.getElementById('flows-table-wrap');
-  if (filtered.length === 0) {
-    wrap.innerHTML = `<div class="empty">No matching active conntrack flows.</div>`;
+  if (!filtered.length) {
+    wrap.innerHTML = `<div class="empty-state">No matching active conntrack flows.</div>`;
     return;
   }
-  const rows = filtered.slice(0, 100).map(f => `<tr>
+  const rows = filtered.slice(0, 150).map(f => `<tr>
     <td><span class="tag">${escapeHtml(f.proto)}</span></td>
-    <td><span class="pill ${f.state === 'ESTABLISHED' ? 'pill-up' : 'pill-unknown'}">${escapeHtml(f.state)}</span></td>
-    <td><code>${escapeHtml(f.src)}:${escapeHtml(f.sport)}</code></td>
-    <td><strong>${escapeHtml(f.dst)}:${escapeHtml(f.dport)}</strong></td>
-    <td><code style="color:var(--green)">${escapeHtml(f.nat_target || 'local / direct')}</code></td>
-    <td><code>${escapeHtml(f.mark && f.mark !== '0' ? '0x' + f.mark : '-')}</code></td>
-    <td><code>${escapeHtml(f.packets)} pkts / ${escapeHtml(f.bytes)} B</code></td>
+    <td><span class="status-pill ${f.state === 'ESTABLISHED' ? 'pill-up' : 'pill-unknown'}">${escapeHtml(f.state)}</span></td>
+    <td class="mono">${escapeHtml(f.src)}:${escapeHtml(f.sport)}</td>
+    <td class="mono" style="color:var(--text-strong);font-weight:600">${escapeHtml(f.dst)}:${escapeHtml(f.dport)}</td>
+    <td class="mono" style="color:var(--green-text)">${escapeHtml(f.nat_target || 'local / direct')}</td>
+    <td class="mono">${escapeHtml(f.mark && f.mark !== '0' ? '0x' + f.mark : '—')}</td>
+    <td class="mono">${escapeHtml(f.packets)} pkts <span style="color:var(--muted)">(${formatBytes(f.bytes)})</span></td>
   </tr>`).join('');
   wrap.innerHTML = `<table>
     <thead>
       <tr>
-        <th>Proto</th>
+        <th>Protocol</th>
         <th>State</th>
-        <th>Client (Source)</th>
+        <th>Source Client</th>
         <th>VIP / Destination</th>
-        <th>NAT Target / Tunnel</th>
-        <th>FW Mark</th>
+        <th>Translated Target / Tunnel</th>
+        <th>Conn Mark</th>
         <th>Traffic</th>
       </tr>
     </thead>
@@ -1212,315 +2579,98 @@ function renderFlowsTable() {
   </table>`;
 }
 
-function setKernelBadge(applied) {
-  const badge = document.getElementById('kernel-badge');
-  badge.textContent = applied === true ? '● NFT APPLY REPORTED'
-    : applied === false ? '● NO NFT APPLY REPORTED' : '● NFT STATUS UNKNOWN';
-  badge.className = applied === true ? 'badge badge-rw' : 'badge badge-warn';
-  badge.title = 'Controller-reported apply state; current kernel state is not independently verified.';
-}
-
 async function refreshDashboard() {
   try {
     const res = await apiFetch('/api/v1/status');
     if (!res.ok) {
-      setKernelBadge(null);
-      document.getElementById('last-updated').textContent = 'Status unavailable';
-      if (res.status === 401) openAuthModal();
+      document.getElementById('kernel-dot').className = 'status-dot dot-down';
+      document.getElementById('kernel-text').textContent = 'Auth Required';
+      if (res.status === 401) openInspector('auth');
       return;
     }
     const data = await res.json();
     stateData = data;
-    setKernelBadge(data.kernel_applied);
+
+    // Top telemetry strip
+    const kDot = document.getElementById('kernel-dot');
+    const kTxt = document.getElementById('kernel-text');
+    if (data.kernel_applied) {
+      kDot.className = 'status-dot dot-up';
+      kTxt.textContent = 'Applied';
+    } else {
+      kDot.className = 'status-dot dot-drain';
+      kTxt.textContent = 'Pending';
+    }
 
     const cfg = data.active_config || { vips: {}, services: {}, gateways: {}, global_allow: [] };
     const services = Object.values(cfg.services || {});
     const gateways = Object.values(cfg.gateways || {});
-    const vipsMap = cfg.vips || {};
     const runtime = data.runtime || {};
-    const activeMap = data.active_backends || {};
     const resolvedHosts = data.resolved_hosts || {};
     const flows = data.flows || [];
-    const wgConfigs = data.wg_configs || {};
+    const allVipKeys = getAllVipKeys(cfg);
 
-    // Check candidate vs running diff
-    const hasDiff = JSON.stringify(data.running) !== JSON.stringify(data.candidate);
-    document.getElementById('diff-badge').style.display = hasDiff ? 'inline-flex' : 'none';
-    document.getElementById('btn-apply').style.display = (hasDiff && currentScope === 'rw') ? 'inline-flex' : 'none';
-
-    // Sidebar counts
-    const allVipKeys = new Set(Object.keys(vipsMap));
-    services.forEach(s => { if (s.vip_id) allVipKeys.add(s.vip_id); else if (s.listen_ip) allVipKeys.add(s.listen_ip); });
-    document.getElementById('nav-cnt-vips').textContent = `${allVipKeys.size}/${services.length}`;
-    document.getElementById('nav-cnt-gws').textContent = gateways.length;
-    document.getElementById('nav-cnt-allow').textContent = (cfg.global_allow || []).length + Object.keys(resolvedHosts).length;
-    document.getElementById('nav-cnt-flows').textContent = flows.length;
-
-    // 1. Overview & Health Matrix
-    let up = 0, down = 0, drained = 0;
-    let matrixRows = '';
-
+    let up = 0, down = 0, drained = 0, wgTotal = 0, wgUp = 0;
     for (const svc of services) {
-      const activeEps = activeMap[svc.key] || [];
-      const vipStr = svc.vip ? `${svc.vip.interface}/${svc.vip.prefix_len}` : 'any';
-      const isWeb = svc.name && svc.name.startsWith('web:');
-      const isApi = svc.name && svc.name.startsWith('api:');
-      const typeBadge = isWeb
-        ? `<span class="tag" style="border-color:var(--cyan);color:var(--cyan)">WEB UI</span>`
-        : (isApi ? `<span class="tag" style="border-color:var(--purple);color:var(--purple)">CONTROL API</span>` : `<span class="tag">${escapeHtml(svc.proto)}</span>`);
-      const allowRules = [...(cfg.global_allow || []), ...(svc.allow || [])];
-      const allowTags = allowRules.length
-        ? allowRules.map(a => `<span class="tag">${escapeHtml(a)}</span>`).join('')
-        : '<span style="color:var(--muted)">any</span>';
-
-      const backends = svc.backends || [];
-      backends.forEach((b, idx) => {
+      for (const b of (svc.backends || [])) {
         const ep = b.host ? `${b.host}(${b.ip}):${b.port}` : `${b.ip}:${b.port}`;
         const isLocal = b.ip === '127.0.0.1';
-        const rt = runtime[ep] || { health: isLocal ? 'UP' : 'UNKNOWN', drained: false, packets: 0, bytes: 0, pps: 0 };
-        const isRouting = isLocal || activeEps.includes(ep);
-
-        let pill = '';
-        if (rt.drained) {
-          drained++;
-          pill = `<span class="pill pill-drain">● DRAINED</span>`;
-        } else if (rt.health === 'UP' || isLocal) {
-          up++;
-          const lat = rt.latency_ms != null ? ` (${rt.latency_ms.toFixed(1)}ms)` : '';
-          pill = `<span class="pill pill-up">● UP${lat}</span>`;
-        } else if (rt.health === 'DOWN') {
-          down++;
-          pill = `<span class="pill pill-down">● DOWN</span>`;
-        } else {
-          pill = `<span class="pill pill-unknown">● UNCHECKED</span>`;
-        }
-
-        const actionBtn = (!isLocal && currentScope === 'rw')
-          ? `<button class="btn btn-sm ${rt.drained ? 'btn-success' : 'btn-amber'}" data-endpoint="${escapeHtml(ep)}" data-drained="${rt.drained ? 'true' : 'false'}" onclick="toggleBackendDrain(this.dataset.endpoint, this.dataset.drained === 'true')">${rt.drained ? 'Enable' : 'Drain'}</button>`
-          : '';
-
-        matrixRows += `<tr>
-          <td>${idx === 0 ? `<strong>${escapeHtml(svc.key)}</strong> ${typeBadge} ${svc.name ? `<span class="tag">${escapeHtml(svc.name)}</span>` : ''}` : ''}</td>
-          <td>${idx === 0 ? `<span class="tag">${escapeHtml(vipStr)}</span>` : ''}</td>
-          <td>${idx === 0 ? allowTags : ''}</td>
-          <td><code>${escapeHtml(isLocal ? 'local appliance (' + svc.port + ')' : ep)}</code></td>
-          <td>${pill}</td>
-          <td>${isRouting ? '<span class="tag" style="color:var(--green);border-color:var(--green)">ROUTING</span>' : '<span class="tag">EXCLUDED</span>'}</td>
-          <td><code>${escapeHtml(rt.packets || 0)} pkts / ${escapeHtml(rt.bytes || 0)} B</code></td>
-          <td>${actionBtn}</td>
-        </tr>`;
-      });
-    }
-
-    for (const gw of gateways) {
-      const vipStr = gw.vip ? `${gw.vip.interface}/${gw.vip.prefix_len}` : 'any';
-      const tunnels = gw.tunnels || [];
-      tunnels.forEach((t, idx) => {
-        const ep = `wg:${t.name}(${t.iface})`;
-        const rt = runtime[ep] || { health: 'UNKNOWN', packets: 0, bytes: 0 };
-        if (rt.health === 'UP') up++; else if (rt.health === 'DOWN') down++;
-        const lat = rt.latency_ms != null ? ` (${rt.latency_ms.toFixed(1)}ms)` : '';
-        const pill = rt.health === 'UP'
-          ? `<span class="pill pill-up">● UP${lat}</span>`
-          : (rt.health === 'DOWN' ? `<span class="pill pill-down">● DOWN</span>` : `<span class="pill pill-unknown">● READY</span>`);
-        matrixRows += `<tr>
-          <td>${idx === 0 ? `<strong>gw:${escapeHtml(gw.key)}</strong> <span class="tag">wg-ecmp</span>` : ''}</td>
-          <td>${idx === 0 ? `<span class="tag">${escapeHtml(vipStr)}</span>` : ''}</td>
-          <td>${idx === 0 ? '<span class="tag">LAN</span>' : ''}</td>
-          <td><code>${escapeHtml(ep)}</code></td>
-          <td>${pill}</td>
-          <td><span class="tag" style="color:var(--cyan)">ECMP TUNNEL</span></td>
-          <td><code>${escapeHtml(rt.packets || 0)} pkts / ${escapeHtml(rt.bytes || 0)} B</code></td>
-          <td></td>
-        </tr>`;
-      });
-    }
-
-    document.getElementById('stat-vips').textContent = allVipKeys.size + gateways.length;
-    document.getElementById('stat-vips-sub').textContent = `${services.length} services, ${gateways.length} gateways`;
-    document.getElementById('stat-up').textContent = up;
-    document.getElementById('stat-down').textContent = down;
-    document.getElementById('stat-drained').textContent = drained;
-    document.getElementById('stat-flows').textContent = flows.length;
-    document.getElementById('stat-hosts-sub').textContent = `${Object.keys(resolvedHosts).length} allow-list hosts resolved`;
-
-    document.getElementById('overview-table-wrap').innerHTML = matrixRows
-      ? `<table><thead><tr><th>Service / Gateway</th><th>Interface</th><th>Allow-List</th><th>Backend / Target</th><th>Health</th><th>Verdict</th><th>Traffic</th><th>Action</th></tr></thead><tbody>${matrixRows}</tbody></table>`
-      : `<div class="empty">No services configured yet.</div>`;
-
-    // Render Topology Cards
-    let topoHtml = '';
-    for (const vipKey of allVipKeys) {
-      const vipSvcs = services.filter(s => s.vip_id === vipKey || s.listen_ip === vipKey);
-      const svcsList = vipSvcs.map(s => {
-        const bStr = (s.backends || []).map(b => b.ip === '127.0.0.1' ? 'local' : (b.host ? `${b.host}:${b.port}` : `${b.ip}:${b.port}`)).join(', ');
-        const allowCount = (s.allow || []).length;
-        return `<div class="topo-svc-row">
-          <div><strong>${escapeHtml(s.name || (':' + s.port))}</strong> <span class="tag">:${escapeHtml(s.port)}</span></div>
-          <div style="color:var(--muted);font-family:monospace;font-size:0.76rem">→ ${escapeHtml(bStr)} ${allowCount ? `<span class="tag" style="color:var(--cyan)">allow:${allowCount}</span>` : ''}</div>
-        </div>`;
-      }).join('');
-      topoHtml += `<div class="topo-vip-card">
-        <div class="topo-vip-head">
-          <div><strong style="color:var(--cyan);font-size:0.95rem">VIP ${escapeHtml(vipKey)}</strong></div>
-          <button class="btn btn-sm" data-vip="${escapeHtml(vipKey)}" onclick="openAddServiceModal(this.dataset.vip)">+ Service</button>
-        </div>
-        ${svcsList || '<div style="color:var(--muted);font-size:0.8rem">No services attached</div>'}
-      </div>`;
-    }
-    for (const gw of gateways) {
-      const tList = (gw.tunnels || []).map(t => `<div class="topo-svc-row">
-        <div><strong>${escapeHtml(t.iface)}</strong> <span class="tag">${escapeHtml(t.name)}</span></div>
-        <div style="color:var(--green);font-family:monospace;font-size:0.75rem">ECMP w=${escapeHtml(t.weight || 1)}</div>
-      </div>`).join('');
-      const fList = (gw.forwards || []).map(f => `<div class="topo-svc-row">
-        <div><strong>fwd :${escapeHtml(f.listen_port)}</strong></div>
-        <div style="font-family:monospace;font-size:0.75rem">→ ${escapeHtml(f.backend.host || f.backend.ip)}:${escapeHtml(f.backend.port)}</div>
-      </div>`).join('');
-      topoHtml += `<div class="topo-vip-card" style="border-color:rgba(139,92,246,0.45)">
-        <div class="topo-vip-head">
-          <div><strong style="color:var(--purple);font-size:0.95rem">Gateway ${escapeHtml(gw.key)}</strong></div>
-          <span class="tag">${gw.killswitch ? 'killswitch:on' : 'killswitch:off'}</span>
-        </div>
-        ${fList}${tList}
-      </div>`;
-    }
-    document.getElementById('topo-wrap').innerHTML = topoHtml || `<div class="empty">No VIPs or Gateways configured.</div>`;
-
-    // 2. Render VIPs & Services Detail Tab
-    let vipsDetailHtml = '';
-    for (const vipKey of allVipKeys) {
-      const vipSvcs = services.filter(s => s.vip_id === vipKey || s.listen_ip === vipKey);
-      const rows = vipSvcs.map(s => {
-        const disp = s.name || `${s.port}`;
-        const allowBadges = (s.allow || []).map(a => `<span class="tag">${escapeHtml(a)} <a href="#" data-service="${escapeHtml(s.key)}" data-entry="${escapeHtml(a)}" onclick="removeAllowEntry(this.dataset.service,this.dataset.entry);return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ');
-        const keysBadges = (s.api_keys || []).map(k => `<span class="tag"><code>${escapeHtml(k.key)}</code> (${escapeHtml(k.scope)})</span>`).join(' ');
-        const isApiOrWeb = disp.startsWith('api:') || disp.startsWith('web:');
-        const keyBtns = (isApiOrWeb && currentScope === 'rw')
-          ? `<button class="btn btn-sm" data-vip="${escapeHtml(vipKey)}" data-service="${escapeHtml(disp)}" onclick="generateServiceKey(this.dataset.vip,this.dataset.service,'ro')">+ RO Key</button>
-             <button class="btn btn-sm" data-vip="${escapeHtml(vipKey)}" data-service="${escapeHtml(disp)}" onclick="generateServiceKey(this.dataset.vip,this.dataset.service,'rw')">+ RW Key</button>`
-          : '';
-        return `<tr>
-          <td><strong>${escapeHtml(disp)}</strong> <span class="tag">${escapeHtml(s.key)}</span></td>
-          <td><code>:${escapeHtml(s.port)}/${escapeHtml(s.proto)}</code></td>
-          <td>${(s.backends || []).map(b => `<code>${escapeHtml(b.host ? b.host + '(' + b.ip + ')' : b.ip)}:${escapeHtml(b.port)}</code>`).join(', ')}</td>
-          <td>${allowBadges || '<span style="color:var(--muted)">none</span>'}</td>
-          <td>${keysBadges || '<span style="color:var(--muted)">none (allow-list auth)</span>'}</td>
-          <td style="display:flex;gap:6px;flex-wrap:wrap">
-            ${keyBtns}
-            ${currentScope === 'rw' ? `<button class="btn btn-sm btn-danger" data-service="${escapeHtml(s.key)}" onclick="deleteService(this.dataset.service)">Delete</button>` : ''}
-          </td>
-        </tr>`;
-      }).join('');
-      vipsDetailHtml += `<div style="padding:14px 18px;border-bottom:1px solid var(--border);background:rgba(6,182,212,0.05);display:flex;justify-content:space-between;align-items:center">
-        <strong>VIP ${escapeHtml(vipKey)}</strong>
-        <button class="btn btn-sm btn-primary" data-vip="${escapeHtml(vipKey)}" onclick="openAddServiceModal(this.dataset.vip)">+ Add Service on ${escapeHtml(vipKey)}</button>
-      </div>
-      <table>
-        <thead><tr><th>Service</th><th>Listen</th><th>Backends</th><th>Allow-List</th><th>API / Web Keys</th><th>Actions</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="6" class="empty">No services on this VIP</td></tr>'}</tbody>
-      </table>`;
-    }
-    document.getElementById('vips-detail-wrap').innerHTML = vipsDetailHtml || `<div class="empty">No VIPs configured.</div>`;
-
-    // 3. Render Gateways & WireGuard Tab
-    let gwHtml = '';
-    for (const gw of gateways) {
-      const svcs = (gw.services || []).map(s => `<span class="tag">${escapeHtml(s.kind)}:${escapeHtml(s.port)}</span>`).join(' ');
-      const fwds = (gw.forwards || []).map(f => `<span class="tag">:${escapeHtml(f.listen_port)} → ${escapeHtml(f.backend.host || f.backend.ip)}:${escapeHtml(f.backend.port)}</span>`).join(' ');
-      const tRows = (gw.tunnels || []).map(t => {
-        const ep = `wg:${t.name}(${t.iface})`;
         const rt = runtime[ep] || {};
-        return `<tr>
-          <td><strong>${escapeHtml(t.iface)}</strong></td>
-          <td><code>${escapeHtml(t.name)}</code></td>
-          <td><span class="tag">weight ${escapeHtml(t.weight || 1)}</span></td>
-          <td><span class="pill ${rt.health === 'UP' ? 'pill-up' : 'pill-unknown'}">● ${escapeHtml(rt.health || 'READY')} ${rt.latency_ms != null ? '(' + rt.latency_ms.toFixed(1) + 'ms)' : ''}</span></td>
-          <td><code>${escapeHtml(rt.packets || 0)} pkts / ${escapeHtml(rt.bytes || 0)} B</code></td>
-        </tr>`;
-      }).join('');
-      gwHtml += `<div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
-        <div><strong>Gateway ${escapeHtml(gw.key)}</strong> ${svcs} ${fwds}</div>
-        <span class="badge ${gw.killswitch ? 'badge-rw' : 'badge-warn'}">Killswitch: ${gw.killswitch ? 'ON' : 'OFF'}</span>
-      </div>
-      <table>
-        <thead><tr><th>Interface</th><th>Profile</th><th>Weight</th><th>Tunnel Health</th><th>Traffic</th></tr></thead>
-        <tbody>${tRows || '<tr><td colspan="5" class="empty">Direct Gateway (no WireGuard tunnels attached)</td></tr>'}</tbody>
-      </table>`;
+        if (rt.drained) drained++;
+        else if (rt.health === 'UP' || isLocal) up++;
+        else if (rt.health === 'DOWN') down++;
+      }
     }
-    document.getElementById('gateways-table-wrap').innerHTML = gwHtml || `<div class="empty">No WireGuard gateways configured.</div>`;
-
-    const wgEntries = Object.entries(wgConfigs);
-    document.getElementById('wg-files-wrap').innerHTML = wgEntries.length
-      ? `<table><thead><tr><th>Filename</th><th>Interface Address</th><th>Endpoint</th><th>Private Key</th></tr></thead><tbody>${
-          wgEntries.map(([name, res]) => {
-            const w = res.Ok || {};
-            return `<tr><td><strong>${escapeHtml(name)}</strong></td><td><code>${escapeHtml(w.address || '-')}</code></td><td><code>${escapeHtml(w.endpoint || '-')}</code></td><td><code>${escapeHtml(w.private_key ? w.private_key.slice(0, 10) + '...' : '<redacted>')}</code></td></tr>`;
-          }).join('')
-        }</tbody></table>`
-      : `<div class="empty">No WireGuard .conf files found in /data/wg</div>`;
-
-    // 4. Programmable DNS Tab
-    const dns = cfg.dns;
-    if (dns) {
-      document.getElementById('dns-settings-wrap').innerHTML = `
-        <div style="display:flex;flex-wrap:wrap;gap:10px">
-          <span class="tag">Domain: <strong>${escapeHtml(dns.domain || 'none')}</strong></span>
-          <span class="tag">Cache: <strong>${escapeHtml(dns.cache_size)}</strong></span>
-          <span class="tag">Auto-VIPs: <strong>${dns.auto_vips ? 'on' : 'off'}</strong></span>
-          <span class="tag">Auto-Hosts: <strong>${dns.auto_hosts ? 'on' : 'off'}</strong></span>
-          <span class="tag">Health-Aware: <strong>${dns.health_aware ? 'on' : 'off'}</strong></span>
-          <span class="tag">Upstreams: <strong>${escapeHtml((dns.upstreams || []).join(', '))}</strong></span>
-        </div>`;
-      const recRows = [
-        ...(dns.records || []).map(r => `<tr><td><span class="tag">RECORD</span></td><td><code>${escapeHtml(JSON.stringify(r))}</code></td></tr>`),
-        ...(dns.nft_rules || []).map(r => `<tr><td><span class="tag" style="color:var(--cyan)">${r.action === 'bypass' ? 'BYPASS' : 'NFTSET ROUTE'}</span></td><td><code>${escapeHtml((r.domains || []).join(', '))} → ${escapeHtml(r.gateway)}</code></td></tr>`),
-        ...(dns.blocks || []).map(d => `<tr><td><span class="tag" style="color:var(--red)">ADBLOCK</span></td><td><code>${escapeHtml(d)} → 0.0.0.0</code></td></tr>`)
-      ].join('');
-      document.getElementById('dns-records-wrap').innerHTML = recRows
-        ? `<table><thead><tr><th>Type</th><th>Rule / Record</th></tr></thead><tbody>${recRows}</tbody></table>`
-        : `<div class="empty">DNS engine enabled with auto-VIP &amp; auto-host synthesis.</div>`;
-    } else {
-      document.getElementById('dns-settings-wrap').innerHTML = `<div class="empty">DNS block not yet enabled. Add a rule on the left or run <code>dns; apply</code> in Web CLI.</div>`;
+    for (const gw of gateways) {
+      for (const t of (gw.tunnels || [])) {
+        wgTotal++;
+        const ep = `wg:${t.name}(${t.iface})`;
+        if ((runtime[ep] || {}).health === 'UP') wgUp++;
+      }
     }
 
-    // 5. Firewall Allow-List Tab
-    const globalAllow = (cfg.global_allow || []).map(a => `<span class="tag">${escapeHtml(a)} <a href="#" data-entry="${escapeHtml(a)}" onclick="removeAllowEntry(null,this.dataset.entry);return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ');
-    const svcAllowRows = services.filter(s => (s.allow || []).length > 0).map(s => `<tr>
-      <td><strong>${escapeHtml(s.key)}</strong> ${s.name ? `<span class="tag">${escapeHtml(s.name)}</span>` : ''}</td>
-      <td>${s.allow.map(a => `<span class="tag">${escapeHtml(a)} <a href="#" data-service="${escapeHtml(s.key)}" data-entry="${escapeHtml(a)}" onclick="removeAllowEntry(this.dataset.service,this.dataset.entry);return false" style="color:var(--red);text-decoration:none">×</a></span>`).join(' ')}</td>
-    </tr>`).join('');
-    const hostRows = Object.entries(resolvedHosts).map(([h, ips]) => `<tr>
-      <td><strong>${escapeHtml(h)}</strong></td>
-      <td><code>${escapeHtml((ips || []).join(', '))}</code></td>
-    </tr>`).join('');
-    document.getElementById('allow-table-wrap').innerHTML = `
-      <div style="padding:14px 18px;border-bottom:1px solid var(--border)">
-        <strong>Global Allow-List:</strong> ${globalAllow || '<span style="color:var(--muted)">none (per-service allow-lists active)</span>'}
-      </div>
-      <table>
-        <thead><tr><th>Service / Hostname</th><th>Allowed CIDRs / Resolved IPv4s</th></tr></thead>
-        <tbody>
-          ${svcAllowRows}
-          ${hostRows}
-        </tbody>
-      </table>`;
+    document.getElementById('stat-vips').textContent = allVipKeys.length;
+    document.getElementById('stat-up').textContent = `${up} UP`;
+    const downEl = document.getElementById('stat-down');
+    downEl.style.display = down > 0 ? 'inline' : 'none';
+    downEl.textContent = `• ${down} DOWN`;
+    const drEl = document.getElementById('stat-drained');
+    drEl.style.display = drained > 0 ? 'inline' : 'none';
+    drEl.textContent = `• ${drained} DRAIN`;
+    document.getElementById('stat-tunnels').textContent = wgTotal ? `${wgUp}/${wgTotal} UP` : '0';
+    document.getElementById('stat-flows').textContent = flows.length;
+    document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
 
-    // 6. Conntrack Flows Tab
-    if (!flowsPaused) {
-      renderFlowsTable();
-    }
+    // Candidate diff bar
+    const hasDiff = JSON.stringify(data.running) !== JSON.stringify(data.candidate);
+    document.getElementById('candidate-bar').classList.toggle('visible', hasDiff);
 
-    // 8. Nftyfile & nftables Tab
+    // Nav rail badges
+    document.getElementById('nav-cnt-services').textContent = services.length;
+    document.getElementById('nav-cnt-vips').textContent = allVipKeys.length;
+    document.getElementById('nav-cnt-gws').textContent = gateways.length;
+    const dnsCount = cfg.dns ? ((cfg.dns.records || []).length + (cfg.dns.nft_rules || []).length + (cfg.dns.blocks || []).length + (cfg.dns.forward_zones || []).length) : 0;
+    document.getElementById('nav-cnt-dns').textContent = cfg.dns ? (dnsCount || 'ON') : 'OFF';
+    document.getElementById('nav-cnt-allow').textContent = (cfg.global_allow || []).length + Object.keys(resolvedHosts).length + Object.keys(data.ssh_keys || {}).length;
+    document.getElementById('nav-cnt-flows').textContent = flows.length;
+
+    // Render all views
+    renderServicesView();
+    renderVipsView();
+    renderGatewaysView();
+    renderDnsView();
+    renderFirewallView();
+    if (!flowsPaused) renderFlowsView();
+
+    // Config & nftables editors
     const ed = document.getElementById('nftyfile-editor');
     if (!editorDirty && document.activeElement !== ed) {
       ed.value = data.nftyfile || '# Empty Nftyfile';
     }
     document.getElementById('nft-box').textContent = data.nft_ruleset || '';
-    document.getElementById('last-updated').textContent = 'Live • ' + new Date().toLocaleTimeString();
   } catch (e) {
-    setKernelBadge(null);
-    document.getElementById('last-updated').textContent = 'Reconnecting...';
+    document.getElementById('kernel-dot').className = 'status-dot dot-down';
+    document.getElementById('kernel-text').textContent = 'Offline';
   }
 }
 

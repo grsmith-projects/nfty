@@ -131,46 +131,52 @@ flowchart LR
 
 ## 5. View Specifications
 
-### 5.1 Top Bar & Uncommitted Changes Banner
-- **Status Indicator**: Shows whether the controller reports an nftables apply, no reported apply, or unknown status. It does not independently verify the current kernel state.
-- **Uncommitted Changes Banner** (shown when `candidate != running` in `rw` mode):
-  - **`Apply Candidate`** (`POST /api/v1/apply`)
-  - Confirmed apply, discard, and rollback commands are available through the
-    Web CLI (`POST /api/v1/cli`), rather than dedicated banner buttons.
-    Confirmed apply is limited to the long-running controller and uses a
-    process-local timer.
+The Web Console uses a **cardless, table-first layout with Light / Dark mode support (`nfty_theme` in `localStorage`) and a right-hand slide-over Property & Creation Drawer (`#inspector`)**:
 
-### 5.2 Tab 1: Overview & Topology
-- **Summary Cards**: Active VIP count, L4/L7 services count, healthy/drained/down backend counts, WireGuard gateway/tunnel status, and active conntrack flow count.
-- **VIP, Service, and Gateway Cards**: Displays each VIP and Gateway with its attached services, backends, health state (`UP`, `DOWN`, `DRAIN`), probe RTT (`ms`), and traffic counters.
-- **Backend Health Matrix**: Tabular view of all backends with 1-click **`Drain`** / **`Enable`** actions (`rw` mode) and a **`Probe All`** button (`POST /api/v1/probe`).
+### 5.1 Top Telemetry Header Bar & Candidate Banner
+- **Inline Telemetry Strip**: Displays real-time system health in the top bar without dashboard cards:
+  - **Dataplane status**: Reports whether `nftables` has been applied, not applied, or is unknown.
+  - **VIPs**: Count of configured Virtual IPs.
+  - **Backends**: Healthy / Down / Drained backend counts.
+  - **WG Tunnels**: Healthy / total WireGuard tunnel count.
+  - **Active Flows**: Live conntrack flow count.
+  - **Light / Dark Theme Switcher (`#theme-toggle-btn`)**: Toggles between dark and light palettes and persists the preference in `localStorage`.
+- **Uncommitted Candidate Banner** (shown when `candidate != running` in `rw` mode):
+  - **`Apply Now`** (`POST /api/v1/apply`) and **`Discard`** (`POST /api/v1/cli` `discard`) directly in the banner.
+- **Right-Hand Slide-Over Inspector Drawer (`#inspector`)**:
+  - Opens whenever an operator clicks a Service row, Gateway row, or any **`+ Create ...`** button.
+  - Provides guided form controls (dropdowns, toggles, structured fields) for creating and editing resources without manually typing raw CLI commands.
 
-### 5.3 Tab 2: VIPs & Services
-- **Service Table & Creation (`rw` mode)**:
-  - Add new services (`+ Add Service` modal supporting VIP, port/proto, backend `ip:port`, `balance`, `check`, `hostname`, `cloudflare-dns`, and `allow`).
-  - Drain or enable individual backends (`POST /api/v1/drain` and `/api/v1/enable`) or delete services (`DELETE /api/v1/services/<key>`).
-- **API & Web Key Manager (`rw` mode)**:
-  - Generate new `rw` or `ro` keys (`key new rw`, `key new ro`) or revoke keys on any `api:<port>` or `web:<port>` listener.
+### 5.2 View 1: Services & Proxies
+- **Filterable Full-Bleed Table**:
+  - Filter chips (`All`, `Proxies & Forwards`, `L7 Host / Cloudflare`, `System Listeners`) and instant text search across service name, VIP, port, backend `ip:port`, and hostname.
+  - Columns: Status dot, Service Name, Listen VIP & Port/Proto, Type / Balance badge, Backends (with inline health state, RTT `ms`, traffic counters, and 1-click **`Drain`** / **`Enable`** buttons), Hostname / Tunnel / Rate Limit tags, and row actions.
+- **Slide-Over Service Inspector & Guided Creator (`rw` mode)**:
+  - **Guided Creation (`+ Create Proxy / Service`)**: Select or enter a VIP, choose Service Mode (`Reverse Proxy / Port Forward`, `HTTP/HTTPS Forward Proxy (proxy:8118)`, or `System Listener` for `ssh`, `dns`, `web`, `api`), configure Listen Port/Proto, Load Balancing (`round-robin`, `sticky`), Health Check (`tcp`, `http`, `ping`), Backends, mDNS `.local` Hostname, Cloudflare Zero-Trust FQDN, and IP Allow-List.
+  - **Service Inspector (click any row)**: View/toggle individual backend drain states, add a new backend target, update `hostname` / `cloudflare-dns` / `check` / `limit` / `allow` settings, generate or revoke scoped `ro`/`rw` API keys (on `web:` and `api:` listeners), or delete the service (`DELETE /api/v1/services/<key>`).
 
-### 5.4 Tab 3: WireGuard Gateways
-- **Gateway Status Cards**: Displays gateway IP/interface, `balance` mode, `killswitch` state, local service listeners (`dns:53`, `ssh:22`, `web:8000`), inbound port forwards, and per-tunnel health/latency/traffic counters.
-- **WireGuard `.conf` Uploader (`rw` mode)**: Upload `.conf` files (`POST /api/v1/wg`) into `/data/wg/` and inspect saved profiles (with `PrivateKey` redacted in `ro` mode).
+### 5.3 View 2: Virtual IPs (VIPs)
+- **VIP Inventory Table**: Lists every declared Virtual IP, its interface (`eth0`), attached service count, healthy/total backend counts, quick service badges (clickable to open the Service Inspector), and actions to add a service on that VIP or remove the VIP.
 
-### 5.5 Tab 4: Programmable DNS
-- **DNS Settings & Quick Add (`rw` mode)**: Add `A`, `CNAME`, wildcard `address`, `route <domain> via <gw>`, `bypass <domain> from <gw>`, and `block <domain>` rules via `/api/v1/cli`.
-- **Records & Policy Tables**: Displays configured authoritative records, `nftset` domain routing rules, split-horizon `forward` zones, and blocked domains.
+### 5.4 View 3: VPN & Gateways
+- **WireGuard Gateways Table**: Lists each `gateway <ip>` with status, interface, load-balancing mode (`round-robin` / `sticky`), `killswitch` state (`ON` / `OFF`), attached `.conf` tunnels with health/latency/RX/TX counters, local listeners (`proxy:8118`, `dns:53`, `ssh:22`), and inbound port forwards.
+- **Gateway Inspector (click any gateway row)**: Toggle `killswitch` or `balance` mode, enable/disable gateway listeners (`proxy:8118`, `dns:53`, `ssh:22`), attach tunnels, add inbound port forwards (`port/proto -> target_ip:port`), and manage gateway allow-lists.
+- **Saved WireGuard Profiles Table (`/data/wg/*.conf`)**: Upload `.conf` files (`POST /api/v1/wg`), inspect configurations (with `PrivateKey` redacted in `ro` mode), or delete unused profiles.
 
-### 5.6 Tab 5: Allow-Lists & Cloudflare
-- **Allow-List Manager (`GET/POST/DELETE /api/v1/allow`)**: Manage global and per-service allow-lists, register dynamic `hostname -> IP` mappings (`POST /api/v1/allow/hosts`), trigger `POST /api/v1/allow/refresh`, and inspect expanded kernel `nftables` set elements.
-- **Cloudflare Tunnel Panel (`GET/POST /api/v1/cloudflare`)**: View `cloudflared` tunnel status and configure Cloudflare API Token, Account ID, and Tunnel Name.
+### 5.5 View 4: DNS & Policy Routes
+- **Unified DNS Rules Table**: Filterable by `All Rules`, `A / CNAME / Wildcard`, `Gateway Policy Routes`, `Forward Zones`, and `Ad / Domain Blocks`, with 1-click delete on every rule and a guided **`+ Add DNS Rule`** slide-over form (`A`, `CNAME`, wildcard `address`, `route <domain> via <gw>`, `bypass <domain> from <gw>`, `forward <domain> to <ip>`, `block <domain>`, plus `listen-on`, `upstream`, `local-domain`, and `rebind-protection` settings).
 
-### 5.7 Tab 6: Conntrack Flows
-- Real-time table of `/proc/net/nf_conntrack` entries (`GET /api/v1/flows`) with instant text filtering by protocol, state, source IP, destination VIP, or backend target.
+### 5.6 View 5: Firewall & Access
+Organized into three sub-tabs:
+1. **IP Allow-Lists (`/api/v1/allow`)**: Filterable table of global and per-service allow-list rules with expanded kernel `nftables` set elements, dynamic `hostname -> IP` registration (`POST /api/v1/allow/hosts`), and **`Refresh DNS Sets`** (`POST /api/v1/allow/refresh`).
+2. **SSH Authorized Keys (`/api/v1/ssh`)**: Manage `/data/authorized_keys` (`ssh-ed25519` / `ssh-rsa` / `ecdsa-*`) with key fingerprint preview, comment, add drawer, and 1-click revoke.
+3. **Cloudflare Zero-Trust Tunnel (`/api/v1/cloudflare`)**: View `cloudflared` daemon status, configure Cloudflare API Token / Account ID / Tunnel Name, and inspect all services with active `cloudflare-dns` ingress bindings.
 
-### 5.8 Tab 7: `Nftyfile` & `nftables`
-- **Left Pane (`Nftyfile` Editor)**: View and edit `/data/Nftyfile` with **`Save & Apply (`PUT /api/v1/config`)`** (`rw` mode).
-- **Right Pane (`nftables` Ruleset)**: Live read-only output of `GET /api/v1/nft` (`table ip nfty`).
-- **Slide-Up Web CLI Drawer (`` ` ``)**: Interactive command runner backed by `POST /api/v1/cli`.
+### 5.7 View 6: Traffic Flows
+- Real-time table of `/proc/net/nf_conntrack` entries (`GET /api/v1/flows`) with protocol filter chips (`All`, `TCP`, `UDP`, `ICMP`, `DNAT`) and instant text search across source IP, destination VIP, and translated backend target.
+
+### 5.8 View 7: `Nftyfile` & Ruleset
+- Sub-tabbed full-height code view switching cleanly between the editable `/data/Nftyfile` configuration (`PUT /api/v1/config` & `POST /api/v1/cli` `test`) and the live kernel `nftables` ruleset (`GET /api/v1/nft`), plus a slide-up **CLI Terminal** (`POST /api/v1/cli`) accessible from the top bar or with the `` ` `` shortcut.
 
 ---
 

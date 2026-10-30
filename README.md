@@ -19,7 +19,7 @@
 - **Internet NAT, WireGuard Egress, and WireGuard Ingress Gateways**:
   - Binds static or DHCP virtual gateway IPs (`gateway 169.254.10.20` or `gateway lan-exit dhcp eth0`) that LAN machines or containers can use as their default IPv4 gateway (`ip route replace default via ...`).
   - **Direct Internet Gateway Mode**: When configured without WireGuard tunnels, `nfty` masquerades forwarded LAN traffic directly out the primary WAN/LAN interface (`eth0`) and enforces optional source `allow` ACLs.
-  - **WireGuard Multi-Tunnel Egress Mode**: Aggregates one or more WireGuard `.conf` tunnels under the gateway IP using kernel `fwmark` policy routing (`ip rule` + per-tunnel routing tables), `ct mark` connection pinning, `killswitch on`, and inbound tunnel port forwarding (`forward <port> to <host:port>`).
+  - **WireGuard Multi-Tunnel Egress Mode**: Aggregates one or more WireGuard `.conf` tunnels under the gateway IP using kernel `fwmark` policy routing (`ip rule` + per-tunnel routing tables), `ct mark` connection pinning, `killswitch on`, inbound tunnel port forwarding (`forward <port> to <host:port>`), and an optional native Rust Privoxy-compatible HTTP/HTTPS (`CONNECT`) forward proxy (`proxy:8118` or `proxy:<port>`, also available on `vip` blocks) with header sanitization, `dns.blocks` adblock enforcement, and in-tunnel UDP DNS resolution.
   - **WireGuard Ingress Server Mode (`wg-in:<port>`)**: Turns any gateway into a WireGuard VPN server (`ig0..igN`) supporting both **split-tunnel LAN access** (`split-tunnel lan`) and **full-tunnel exit routing** (`split-tunnel full`, chaining remote clients into direct WAN NAT or the gateway's outbound WireGuard `tunnels` pool). Includes built-in Curve25519 keypair + PSK generation, automatic `/32` client IP allocation, copy/paste client `.conf` output, and scannable terminal UTF-8 half-block QR codes (`peer add <name>`, `peer show <name>`, `peer qr <name>`).
 - **Programmable DNS Endpoint (`dnsmasq` + `nftset`)**:
   - Supervises a native `dnsmasq` endpoint (`dns:53` on VIPs/gateways or global `dns { ... }`) that synthesizes records from configured VIPs, gateways, and registered or resolved hosts, and dynamically removes unhealthy backends from DNS responses (`health-aware on`).
@@ -199,6 +199,7 @@ gateway 192.168.10.20 {
     balance round-robin
     killswitch on
     check ping 5s
+    proxy:8118
     forward 51413 to 192.168.20.15:51413
     tunnels {
         wg-exit-01.conf weight 2
@@ -477,12 +478,12 @@ zcat dist/rk3588s/nfty-rk3588s.img.gz | sudo dd of=/dev/sdX bs=4M status=progres
 
 ---
 
-## Upgrading to 0.9.0
+## Upgrading to 1.0.0
 
-0.9.0 removes features to shrink the attack surface. Delete these from `/data/Nftyfile` before upgrading; otherwise the appliance boots with an empty config and saves the original as `/data/Nftyfile.invalid`:
+0.9.0 / 1.0.0 removes legacy aliases to shrink the attack surface. Delete these from `/data/Nftyfile` before upgrading; otherwise the appliance boots with an empty config and saves the original as `/data/Nftyfile.invalid`:
 
 - Service `auth` / `basic-auth` (use `allow` lists, or `cloudflare-auth` for tunnel hostnames).
-- Gateway `privoxy:<port>` and `socks5:<port>`.
+- Legacy gateway `privoxy:<port>` and `socks5:<port>` directives (use `proxy:8118` or `proxy:<port>` on any `vip` or `gateway` block for the native Privoxy-compatible HTTP/HTTPS forward proxy).
 - Directive aliases: use `key` (not `api-key`), `hostname` (not `host`/`domain`/`mdns`), `cloudflare-dns`/`cloudflare-auth` (not `cloudflare`/`cf`/`cf-auth`/`tunnel-*`), `wg-in` (not `wg-server`/`wireguard`), `web` (not `ui`/`webui`), `dns` (not `dnsmasq`), `service` (not `services`/`local`), `interface`/`vip` (not `dev`), and `no` (not `delete`/`remove`).
 
 Also removed: the `watch` TUI, `scan`/`adopt`, the web username/password login (`/api/v1/auth/login`; use API keys), the `--api-bind` flag, the `wg`/`ssh` built-in editors (`add` now pastes), shell aliases such as `conf`, `commit`, `passwd`, and `validate` (use `test`; the `nfty validate` subcommand is unchanged), and the `/status` and `/api/v1/cf` routes. Loopback clients no longer bypass web/API allow-lists.
@@ -504,6 +505,7 @@ src/
 │   ├── mod.rs               # Background daemon supervisor and module re-exports
 │   ├── dns.rs               # dnsmasq config/hosts compiler, supervisor, nftset & DNS CLI
 │   ├── wireguard.rs         # WireGuard config parser, kernel wg/ip-rule sync, wg CLI
+│   ├── gateway_proxy.rs     # Native Privoxy-style HTTP/HTTPS (CONNECT) forward proxy
 │   ├── vhost_mdns.rs        # Multicast mDNS responder and L7 Host/SNI reverse proxy
 │   ├── cloudflare.rs        # cloudflared supervisor, Cloudflare API and Access sync
 │   └── flows.rs             # Kernel conntrack (/proc/net/nf_conntrack) flow viewer
